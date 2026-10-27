@@ -28,6 +28,7 @@ import {
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 import { invariant } from '../core/contracts.js';
+import { undoMethods, type UndoAction, type UndoResult } from '../core/undo.js';
 
 const log = new Log('ObjectBrowser');
 import type { CatalogSnapshot, CatalogRegistrySource } from './object-catalog.js';
@@ -191,6 +192,7 @@ export class ObjectBrowser extends Abject {
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
+            ...undoMethods('your last delete made in this browser (AbjectStore keeps the deleted object)'),
           ],
         },
         tags: ['system', 'ui'],
@@ -270,6 +272,25 @@ Pane 4: Detail view with signature, status, source, send-message form,
 
     this.on('getState', async () => {
       return { visible: this.windowId !== undefined };
+    });
+
+    // A delete here is a Factory kill, which the workspace's AbjectStore
+    // records for this browser: undo asks the stores for the step back.
+    this.on('undo', async () => this.undoThroughStores('undo'));
+    this.on('redo', async () => this.undoThroughStores('redo'));
+    this.on('getUndoState', async () => {
+      const states = await Promise.all((await this.abjectStoreIds()).map(id =>
+        this.request<{ canUndo: boolean; canRedo: boolean; undoAt?: number; redoAt?: number; undoLabel?: string; redoLabel?: string }>(
+          request(this.id, id, 'getUndoState', {}), 5000).catch(() => undefined)));
+      const newest = (key: 'undoAt' | 'redoAt', can: 'canUndo' | 'canRedo') =>
+        states.filter(s => s?.[can]).sort((a, b) => (b?.[key] ?? 0) - (a?.[key] ?? 0))[0];
+      const u = newest('undoAt', 'canUndo');
+      const r = newest('redoAt', 'canRedo');
+      return {
+        canUndo: !!u, canRedo: !!r,
+        ...(u ? { undoLabel: u.undoLabel, undoAt: u.undoAt } : {}),
+        ...(r ? { redoLabel: r.redoLabel, redoAt: r.redoAt } : {}),
+      };
     });
 
     this.on('browseKind', async (msg: AbjectMessage) => {
@@ -2258,20 +2279,26 @@ Pane 4: Detail view with signature, status, source, send-message form,
     if (regs.length === 0) return;
 
     const objectName = regs[0].name || state.selectedKind;
-    const confirmed = await this.confirm({
-      title: 'Delete Abject',
-      message: `Delete "${objectName}"? This cannot be undone.`,
-      confirmLabel: 'Delete',
-      destructive: true,
-    });
-    if (!confirmed) return;
-
     const targetId = regs[0].id as AbjectId;
+
+    // A kept object is set aside when killed and undo brings it back, so it
+    // goes at once. Anything else is gone for good and is asked about first.
+    const kept = await this.isKept(targetId);
+    if (!kept) {
+      const confirmed = await this.confirm({
+        title: 'Delete Abject',
+        message: `Delete "${objectName}"? This cannot be undone.`,
+        confirmLabel: 'Delete',
+        destructive: true,
+      });
+      if (!confirmed) return;
+    }
 
     try {
       await this.request(request(this.id, this.factoryId, 'kill', { objectId: targetId }));
       await this.showFeedback('Deleted');
       this.windowEffect('flash', '$accent');
+      if (kept) await this.notify(`Deleted ${objectName}. Ctrl+Z to undo`, 'success');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.showFeedback(`Error: ${msg.slice(0, 50)}`);
@@ -2283,6 +2310,42 @@ Pane 4: Detail view with signature, status, source, send-message form,
     await this.rebuildPane2();
     await this.rebuildPane3();
     await this.rebuildPane4();
+  }
+
+  /** The AbjectStores of the local workspaces this browser shows, where its deletes are recorded. */
+  private async abjectStoreIds(): Promise<AbjectId[]> {
+    const ids = new Set<AbjectId>();
+    for (const [key, source] of this.registrySources) {
+      if (source.kind !== 'local-workspace') continue;
+      const store = (this.registryObjects.get(key) ?? []).find(r => r.manifest.name === 'AbjectStore');
+      if (store) ids.add(store.id as AbjectId);
+    }
+    const own = await this.discoverDep('AbjectStore');
+    if (own) ids.add(own);
+    return [...ids];
+  }
+
+  /** Whether a workspace's AbjectStore keeps this object, so deleting it can be undone. */
+  private async isKept(objectId: AbjectId): Promise<boolean> {
+    for (const storeId of await this.abjectStoreIds()) {
+      try {
+        const entries = await this.request<Array<{ objectId?: string }>>(request(this.id, storeId, 'list', {}), 5000);
+        if (entries.some(e => e.objectId === objectId)) return true;
+      } catch { /* that workspace's store is busy or gone */ }
+    }
+    return false;
+  }
+
+  /** Undo or redo this browser's last delete, then show the catalog as it is now. */
+  private async undoThroughStores(action: UndoAction): Promise<UndoResult> {
+    const result = await this.forwardUndo(await this.abjectStoreIds(), action);
+    if (result.ok && this.windowId) {
+      await this.readCatalogSnapshot();
+      await this.rebuildPane2();
+      await this.rebuildPane3();
+      await this.rebuildPane4();
+    }
+    return result;
   }
 
   // ── Clone ──

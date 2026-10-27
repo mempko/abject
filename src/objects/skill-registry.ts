@@ -4,16 +4,25 @@
  * Scans $ABJECTS_DATA_DIR/skills/ for SKILL.md files (compatible with Claude Code and
  * OpenClaw formats), manages enable/disable state, and provides enabled skill
  * summaries for AgentAbject to inject into LLM prompts.
+ *
+ * Uninstalling sets a skill's folder aside in `skills-trash/` (beside the
+ * skills directory) for the session and at least three days, so its caller
+ * can undo it; enable and disable are undoable too. Config holds credentials
+ * and is never kept in undo history: it stays in storage under the skill's
+ * name, so a skill brought back finds it there.
  */
 
 import * as fs from 'fs';
 import * as fsPromises from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
-import { require as contractRequire } from '../core/contracts.js';
+import { request, event } from '../core/message.js';
+import { require as contractRequire, invariant } from '../core/contracts.js';
+import { UndoHistories, UndoRefused, undoMethods, UNDO_EVENTS } from '../core/undo.js';
+import type { UndoAction, UndoHistoryJSON, UndoStep } from '../core/undo.js';
 import { parseSkillMd, ParsedSkill } from '../core/skill-parser.js';
 import { discoverHostMcpServers, synthesizeHostSkillMd } from '../core/host-mcp-import.js';
 import { sanitiseSkillName } from '../core/skill-synth.js';
@@ -39,7 +48,29 @@ interface SkillEntry {
   parsed: ParsedSkill;
   enabled: boolean;
   error?: string;
+  /** The skill's folder under the skills directory. */
+  dirName: string;
 }
+
+/** An uninstalled skill's folder, kept in the trash under its id. */
+interface SkillTrashItem {
+  id: string;
+  name: string;
+  dirName: string;
+  removedAt: number;
+  bytes: number;
+}
+
+/** One undoable change. Config is never part of one: it holds credentials. */
+type SkillStep =
+  | { kind: 'uninstall'; name: string; dirName: string; enabled: boolean; contentHash: string; trashId?: string }
+  | { kind: 'enable'; name: string; before: boolean; after: boolean };
+
+/** What is set aside stays this long past the session it was set aside in. */
+const TRASH_KEEP_MS = 3 * 24 * 60 * 60_000;
+const TRASH_MAX_ITEMS = 200;
+const TRASH_MAX_BYTES = 512 * 1024 * 1024;
+const TRASH_PURGE_MS = 60 * 60_000;
 
 export class SkillRegistry extends Abject {
   private skills = new Map<string, SkillEntry>();
@@ -57,6 +88,14 @@ export class SkillRegistry extends Abject {
   }>();
   /** Callers of enableSkill / setSkillConfig waiting for a bridge to settle, keyed by skill name. */
   private bridgeWaiters = new Map<string, Array<() => void>>();
+  /** Uninstalled skills' folders (beside the skills directory) and the trash index and undo file in it. */
+  private readonly trashDir: string;
+  private trash = new Map<string, SkillTrashItem>();
+  /** Each caller's changes; uninstall steps are kept on disk with the trash. */
+  private undo = new UndoHistories<SkillStep>();
+  private readonly sessionStartedAt = Date.now();
+  /** Uninstalls, undo and purges run one at a time. */
+  private lock: Promise<unknown> = Promise.resolve();
 
   constructor(skillsDir?: string) {
     super({
@@ -149,7 +188,7 @@ export class SkillRegistry extends Abject {
             },
             {
               name: 'uninstallSkill',
-              description: 'Remove a skill from disk',
+              description: 'Uninstall a skill: stops its MCP server and sets its folder aside for a few days, so undo brings it back (with its enabled state; its config stays stored)',
               parameters: [
                 { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Skill name' },
               ],
@@ -219,8 +258,10 @@ export class SkillRegistry extends Abject {
                 path: { kind: 'primitive', primitive: 'string' },
               }},
             },
+            ...undoMethods('your last uninstall, enable or disable of a skill (config changes are not undoable)'),
           ],
           events: [
+            ...UNDO_EVENTS,
             {
               name: 'skillsChanged',
               description: 'Emitted when skills are scanned, enabled, disabled, installed, or uninstalled',
@@ -235,7 +276,13 @@ export class SkillRegistry extends Abject {
     });
 
     this.skillsDir = skillsDir ?? path.resolve(process.env.ABJECTS_DATA_DIR ?? '.abjects', 'skills');
+    this.trashDir = path.join(path.dirname(path.resolve(this.skillsDir)), 'skills-trash');
     this.setupHandlers();
+  }
+
+  protected override checkInvariants(): void {
+    super.checkInvariants();
+    for (const [id, item] of this.trash) invariant(item.id === id, 'SkillRegistry: a trash item is kept under its own id');
   }
 
   protected override async onInit(): Promise<void> {
@@ -243,6 +290,11 @@ export class SkillRegistry extends Abject {
 
     // Ensure skills directory exists
     fs.mkdirSync(this.skillsDir, { recursive: true });
+    fs.mkdirSync(this.trashDir, { recursive: true });
+    await this.loadTrash();
+    await this.exclusive(() => this.purgeTrash());
+    this.setRecurringTimer(() => this.exclusive(() => this.purgeTrash()).catch(err =>
+      log.warn(`Skill trash purge failed: ${err instanceof Error ? err.message : String(err)}`)), TRASH_PURGE_MS);
 
     // Scan for skills
     await this.doScan();
@@ -360,6 +412,15 @@ prints it, or it can be read from wherever the vendor installer put it) and
 pass that text to \`installSkill\`, then \`enableSkill\`. Call \`listSkills\` or
 \`getSkill\` afterwards to confirm it landed.
 
+### Undo an uninstall, enable or disable
+
+  await call(await dep('SkillRegistry'), 'undo', {});   // { ok, label, reason }
+  await call(await dep('SkillRegistry'), 'redo', {});
+
+Each caller undoes its own changes. \`uninstallSkill\` sets the skill's folder
+aside for a few days, so undo brings it back with its enabled state (its stored
+config was never removed). Config changes (setSkillConfig) are not undoable.
+
 ### Get enabled skill summaries (for prompt injection)
 
   const summaries = await call(await dep('SkillRegistry'), 'getEnabledSkills', {});
@@ -449,9 +510,11 @@ whenever the skill set changes.
       const entry = match?.entry;
       if (!entry) throw new Error(`Skill "${name}" not found`);
       const key = match!.key;
+      const wasEnabled = entry.enabled;
       entry.enabled = true;
       await this.persistStates();
       await this.pushEnvToShell();
+      if (!wasEnabled) await this.recordStep(msg.routing.from, `Enable ${key}`, { kind: 'enable', name: key, before: false, after: true });
 
       // If this is an MCP server, spawn a bridge
       let warning: string | undefined;
@@ -538,9 +601,11 @@ whenever the skill set changes.
       const match = this.findSkillEntry(name);
       const entry = match?.entry;
       if (!entry) throw new Error(`Skill "${name}" not found`);
+      const wasEnabled = entry.enabled;
       entry.enabled = false;
       await this.persistStates();
       await this.pushEnvToShell();
+      if (wasEnabled) await this.recordStep(msg.routing.from, `Disable ${match!.key}`, { kind: 'enable', name: match!.key, before: true, after: false });
 
       // If this is an MCP server, stop its bridge
       if (entry.parsed.mcpServer) {
@@ -649,23 +714,19 @@ whenever the skill set changes.
       const { name } = msg.payload as { name: string };
       contractRequire(typeof name === 'string' && name.length > 0, 'name must be non-empty');
 
-      const match = this.findSkillEntry(name);
-      const entry = match?.entry;
-      if (!entry) throw new Error(`Skill "${name}" not found`);
-
-      // Stop the subprocess before the files go away. Uninstall used to leave
-      // a running MCP server orphaned: still connected, still holding the
-      // skill's credentials, with nothing left on disk to explain it.
-      await this.stopMCPBridge(match!.key);
-
-      const skillDir = path.join(this.skillsDir, name);
-      await fsPromises.rm(skillDir, { recursive: true, force: true });
-      this.skills.delete(match!.key);
-      await this.persistStates();
-      this.changed('skillsChanged', { reason: 'uninstalled' });
-      log.info(`Uninstalled skill: ${name}`);
-      return { success: true };
+      return this.exclusive(async () => {
+        const match = this.findSkillEntry(name);
+        if (!match) throw new Error(`Skill "${name}" not found`);
+        const step = await this.setSkillAside(match.key, match.entry);
+        if (step) await this.recordStep(msg.routing.from, `Uninstall ${match.key}`, step);
+        log.info(`Uninstalled skill: ${match.key}`);
+        return { success: true };
+      });
     });
+
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg.routing.from, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg.routing.from, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) => this.undo.state(await this.undoCallerKey(msg.routing.from)));
 
     this.on('getEnabledSkills', async () => {
       return this.getEnabledSummaries();
@@ -911,6 +972,7 @@ whenever the skill set changes.
         this.skills.set(parsed.name, {
           parsed,
           enabled: previousEnabled.get(parsed.name) ?? false,
+          dirName,
         });
 
         // Fill any unset env keys from the file's defaults.
@@ -924,6 +986,7 @@ whenever the skill set changes.
         this.skills.set(dirName, {
           parsed: { frontmatter: {}, name: dirName, description: '', instructions: '', source: 'unknown' },
           enabled: false,
+          dirName,
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -989,7 +1052,7 @@ whenever the skill set changes.
       }
 
       const parsed = parseSkillMd(content, dirName);
-      this.skills.set(parsed.name, { parsed, enabled: false });
+      this.skills.set(parsed.name, { parsed, enabled: false, dirName });
 
       // Seed host env into skill config (kept out of the SKILL.md file).
       if (Object.keys(server.env).length > 0 && !this.skillConfigs.get(parsed.name)?.env) {
@@ -1304,6 +1367,209 @@ whenever the skill set changes.
     return summaries;
   }
 
+  // ─── Uninstalled skills, kept for undo ─────────────────────────
+
+  /** Run an uninstall, undo or purge after the ones before it. */
+  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.lock.then(fn, fn);
+    this.lock = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * Uninstall a skill but keep its folder: stop its MCP server (an orphaned
+   * one would keep running with the skill's credentials), move the folder
+   * into the trash, and forget the skill. The undo step, or null when the
+   * skill had no folder to keep.
+   */
+  private async setSkillAside(key: string, entry: SkillEntry): Promise<SkillStep | null> {
+    await this.stopMCPBridge(key);
+    const skillDir = path.join(this.skillsDir, entry.dirName);
+    const contentHash = await this.skillMdHash(entry.dirName);
+    let trashId: string | undefined;
+    if (fs.existsSync(skillDir)) {
+      trashId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const bytes = await dirSize(skillDir);
+      await moveDir(skillDir, path.join(this.trashDir, trashId));
+      this.trash.set(trashId, { id: trashId, name: key, dirName: entry.dirName, removedAt: Date.now(), bytes });
+      await this.persistTrash();
+    }
+    this.skills.delete(key);
+    await this.persistStates();
+    await this.pushEnvToShell();
+    this.changed('skillsChanged', { reason: 'uninstalled' });
+    return trashId ? { kind: 'uninstall', name: key, dirName: entry.dirName, enabled: entry.enabled, contentHash, trashId } : null;
+  }
+
+  /**
+   * Bring an uninstalled skill back with its enabled state. When the same
+   * skill is installed again meanwhile (a host MCP server imported again,
+   * a reinstall of the same SKILL.md), that one stays and only the state is
+   * restored, so no duplicate appears; a different skill under the name or
+   * in the folder refuses.
+   */
+  private async restoreSkill(d: Extract<SkillStep, { kind: 'uninstall' }>): Promise<void> {
+    const trashId = d.trashId;
+    if (!trashId || !this.trash.has(trashId)) throw new UndoRefused(`'${d.name}' is no longer kept`);
+    const existing = this.findSkillEntry(d.name);
+    const target = path.join(this.skillsDir, d.dirName);
+    if (existing || fs.existsSync(target)) {
+      const same = existing && await this.skillMdHash(existing.entry.dirName) === d.contentHash;
+      if (!same) throw new UndoRefused(`A different skill named '${d.name}' is installed now`);
+      await fsPromises.rm(path.join(this.trashDir, trashId), { recursive: true, force: true });
+    } else {
+      await moveDir(path.join(this.trashDir, trashId), target);
+      await this.doScan();
+    }
+    this.trash.delete(trashId);
+    delete d.trashId;
+    await this.persistTrash();
+    const match = this.findSkillEntry(d.name);
+    if (!match) throw new Error(`'${d.name}' came back but its SKILL.md did not load`);
+    await this.applyEnabled(match.key, match.entry, d.enabled, 'installed');
+  }
+
+  /**
+   * Set a skill's enabled flag as undo and redo do: persisted and pushed to
+   * the shell like enable/disable. A bridge starts in the background, so
+   * the reply does not wait on a server's start or sign-in.
+   */
+  private async applyEnabled(key: string, entry: SkillEntry, enabled: boolean, reason: string): Promise<void> {
+    entry.enabled = enabled;
+    await this.persistStates();
+    await this.pushEnvToShell();
+    if (entry.parsed.mcpServer) {
+      if (!enabled) await this.stopMCPBridge(key);
+      else void this.spawnMCPBridge(key, entry).catch((err) =>
+        log.warn(`MCP bridge '${key}' failed to start: ${err instanceof Error ? err.message : String(err)}`));
+    }
+    this.changed('skillsChanged', { reason });
+  }
+
+  /** A skill folder's SKILL.md by content, '' when it has none. */
+  private async skillMdHash(dirName: string): Promise<string> {
+    try {
+      const content = await fsPromises.readFile(path.join(this.skillsDir, dirName, 'SKILL.md'));
+      return createHash('sha256').update(content).digest('hex');
+    } catch {
+      return '';
+    }
+  }
+
+  private async recordStep(callerId: AbjectId, label: string, step: SkillStep): Promise<void> {
+    const caller = await this.undoCallerKey(callerId);
+    this.undo.for(caller).record(label, step);
+    // An uninstall holds the lock; its new step may drop redo steps whose folders go too.
+    if (step.kind === 'uninstall') await this.purgeTrash();
+    await this.persistUndo();
+    this.send(event(this.id, callerId, 'undoStateChanged', this.undo.state(caller)));
+  }
+
+  private async undoFor(callerId: AbjectId, action: UndoAction): Promise<unknown> {
+    const caller = await this.undoCallerKey(callerId);
+    return this.exclusive(async () => {
+      const history = this.undo.get(caller);
+      if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+      const result = await history[action](step => this.applyStep(step, action));
+      await this.purgeTrash();
+      await this.persistUndo();
+      this.send(event(this.id, callerId, 'undoStateChanged', this.undo.state(caller)));
+      return result;
+    });
+  }
+
+  /** Take a step back (undo) or forward again (redo). */
+  private async applyStep(step: UndoStep<SkillStep>, action: UndoAction): Promise<unknown> {
+    const d = step.data;
+    if (d.kind === 'enable') {
+      const match = this.findSkillEntry(d.name);
+      if (!match) throw new UndoRefused(`'${d.name}' is not installed`);
+      const [from, to] = action === 'undo' ? [d.after, d.before] : [d.before, d.after];
+      if (match.entry.enabled !== from) throw new UndoRefused(`'${d.name}' was ${from ? 'disabled' : 'enabled'} since`);
+      await this.applyEnabled(match.key, match.entry, to, to ? 'enabled' : 'disabled');
+      return { name: match.key };
+    }
+    if (action === 'undo') {
+      await this.restoreSkill(d);
+      return { name: d.name };
+    }
+    const match = this.findSkillEntry(d.name);
+    if (!match) throw new UndoRefused(`'${d.name}' is gone already`);
+    if (await this.skillMdHash(match.entry.dirName) !== d.contentHash) throw new UndoRefused(`'${d.name}' changed since`);
+    const again = await this.setSkillAside(match.key, match.entry);
+    if (!again || again.kind !== 'uninstall') throw new UndoRefused(`'${d.name}' has no folder to set aside`);
+    Object.assign(d, { dirName: again.dirName, enabled: again.enabled, trashId: again.trashId });
+    return { name: d.name };
+  }
+
+  private async loadTrash(): Promise<void> {
+    try {
+      const items = JSON.parse(await fsPromises.readFile(path.join(this.trashDir, 'index.json'), 'utf-8')) as SkillTrashItem[];
+      for (const item of Array.isArray(items) ? items : []) {
+        if (item?.id && typeof item.dirName === 'string') this.trash.set(item.id, item);
+      }
+    } catch { /* no trash yet */ }
+    try {
+      this.undo.load(JSON.parse(await fsPromises.readFile(path.join(this.trashDir, 'undo.json'), 'utf-8')) as Record<string, UndoHistoryJSON<SkillStep>>);
+    } catch { /* no history yet */ }
+  }
+
+  private async persistTrash(): Promise<void> {
+    try {
+      await fsPromises.writeFile(path.join(this.trashDir, 'index.json'), JSON.stringify([...this.trash.values()]), 'utf-8');
+    } catch (err) {
+      log.warn(`Failed to persist the skill trash index: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Only uninstall steps go to disk: they point into the trash; enable steps stay in memory. */
+  private async persistUndo(): Promise<void> {
+    const out: Record<string, UndoHistoryJSON<SkillStep>> = {};
+    for (const [caller, h] of Object.entries(this.undo.toJSON())) {
+      const keep = (s: UndoStep<SkillStep>) => s.data.kind === 'uninstall';
+      const saved = { done: h.done.filter(keep), undone: h.undone.filter(keep) };
+      if (saved.done.length + saved.undone.length > 0) out[caller] = saved;
+    }
+    try {
+      await fsPromises.writeFile(path.join(this.trashDir, 'undo.json'), JSON.stringify(out), 'utf-8');
+    } catch (err) {
+      log.warn(`Failed to persist skill undo history: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Forget uninstalled skills past keeping: what no undo step points at any
+   * more, what was set aside before this session and longer ago than
+   * TRASH_KEEP_MS, and beyond the count and size caps, oldest first. Steps
+   * that pointed at what went are dropped.
+   */
+  private async purgeTrash(): Promise<void> {
+    const referenced = new Set(this.undo.steps().map(s => s.data.kind === 'uninstall' ? s.data.trashId : undefined));
+    const now = Date.now();
+    const items = [...this.trash.values()].sort((a, b) => a.removedAt - b.removedAt);
+    const gone = new Set(items.filter(t => !referenced.has(t.id)
+      || (t.removedAt < this.sessionStartedAt && now - t.removedAt > TRASH_KEEP_MS)).map(t => t.id));
+    let count = items.length - gone.size;
+    let bytes = items.filter(t => !gone.has(t.id)).reduce((n, t) => n + t.bytes, 0);
+    for (const t of items) {
+      if (count <= TRASH_MAX_ITEMS && bytes <= TRASH_MAX_BYTES) break;
+      if (gone.has(t.id)) continue;
+      gone.add(t.id);
+      count--;
+      bytes -= t.bytes;
+    }
+    if (gone.size > 0) {
+      for (const id of gone) {
+        this.trash.delete(id);
+        await fsPromises.rm(path.join(this.trashDir, id), { recursive: true, force: true });
+      }
+      await this.persistTrash();
+    }
+    const before = this.undo.steps().length;
+    this.undo.prune(step => step.data.kind !== 'uninstall' || !step.data.trashId || this.trash.has(step.data.trashId));
+    if (this.undo.steps().length !== before) await this.persistUndo();
+  }
+
   // ─── MCP Bridge Lifecycle ──────────────────────────────────────
 
   private async spawnMCPBridge(name: string, entry: SkillEntry): Promise<void> {
@@ -1539,6 +1805,28 @@ function extractRequiredSecretMapping(frontmatter: Record<string, unknown>): Rec
   }
 
   return undefined;
+}
+
+/** Total size of the files under a directory. */
+async function dirSize(dir: string): Promise<number> {
+  let total = 0;
+  for (const e of await fsPromises.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) total += await dirSize(p);
+    else if (e.isFile()) total += (await fsPromises.stat(p).catch(() => null))?.size ?? 0;
+  }
+  return total;
+}
+
+/** Move a directory, copying when it crosses file systems. */
+async function moveDir(from: string, to: string): Promise<void> {
+  try {
+    await fsPromises.rename(from, to);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+    await fsPromises.cp(from, to, { recursive: true });
+    await fsPromises.rm(from, { recursive: true, force: true });
+  }
 }
 
 export const SKILL_REGISTRY_ID = 'abjects:skill-registry' as AbjectId;

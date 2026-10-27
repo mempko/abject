@@ -35,6 +35,7 @@ import { Log } from '../core/timed-log.js';
 import { isPackageOwner, packageDataKey } from '../core/packages.js';
 import { bytesToHex } from '../core/encoding.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
+import { UndoHistories, UndoRefused, UNDO_EVENTS, undoMethods, type UndoAction, type UndoStep } from '../core/undo.js';
 
 const log = new Log('ABJECT-STORE');
 
@@ -46,6 +47,11 @@ const INDEX_KEY = 'abject-store:index';
 const bodyKey = (typeId: string) => `abject-store:body:${typeId}`;
 const sourceKey = (hash: string) => `abject-store:source:${hash}`;
 const previewKey = (typeId: string) => `abject-store:preview:${typeId}`;
+/** What was removed, kept a while so it can come back. */
+const TRASH_INDEX_KEY = 'abject-store:trash-index';
+const trashKey = (id: string) => `abject-store:trash:${id}`;
+/** Each caller's undo history, kept on disk with the trash it points into. */
+const UNDO_KEY = 'abject-store:undo';
 
 /** When an object runs: with the workspace, or only while something needs it. */
 export type Loading = 'boot' | 'needed';
@@ -106,6 +112,40 @@ export interface ObjectPreview {
   commands: unknown[];
   savedAt: number;
 }
+
+/** A removed object, as the trash index lists it. */
+interface TrashItem {
+  id: string;
+  typeId: string;
+  name: string;
+  owner: string;
+  removedAt: number;
+  /** Sources it keeps from being dropped (current and versions). */
+  sourceHashes: string[];
+  bytes: number;
+}
+
+/** A removed object in full: its record, data and preview. */
+interface TrashRecord {
+  entry: StoreEntry;
+  data?: Record<string, unknown>;
+  preview?: ObjectPreview;
+  wasRunning: boolean;
+}
+
+/** A record's placement, whole, as an undo step keeps it. */
+interface PlacementState {
+  folder: string;
+  loading: Loading;
+  tags: string[];
+}
+
+/** One undoable change to the store. */
+type StoreStep =
+  | { kind: 'remove'; items: Array<{ trashId?: string; typeId: string }> }
+  | { kind: 'copy'; typeId: string; trashId?: string }
+  | { kind: 'place'; typeId: string; before: PlacementState; after: PlacementState }
+  | { kind: 'source'; typeId: string; beforeHash: string; afterHash: string };
 
 /** Where an object goes and how it loads, as callers ask for it. */
 interface Placement {
@@ -181,6 +221,19 @@ export class AbjectStore extends Abject {
   private static readonly PREVIEW_MAX_COMMANDS = 4000;
   private static readonly PREVIEW_MAX_CHARS = 256_000;
 
+  /** Removed objects kept for undo, by trash id. */
+  private trash: Map<string, TrashItem> = new Map();
+  /** Each caller's undoable changes (by its durable typeId). */
+  private undo = new UndoHistories<StoreStep>({ mergeMs: 0, maxSteps: 50 });
+  private undoPersistTimer?: ReturnType<typeof setTimeout>;
+  /** Live ids of objects just removed: a last save from one is not a new object. */
+  private removedIds: Map<string, number> = new Map();
+  private readonly sessionStartedAt = Date.now();
+  /** Removed objects are kept for the session and at least this long. */
+  static readonly TRASH_KEEP_MS = 3 * 24 * 60 * 60_000;
+  private static readonly TRASH_MAX_ITEMS = 200;
+  private static readonly TRASH_MAX_BYTES = 64 * 1024 * 1024;
+
   // Debounced index write state (see schedulePersist).
   private static readonly PERSIST_DEBOUNCE_MS = 500;
   private persistTimer?: ReturnType<typeof setTimeout>;
@@ -210,6 +263,7 @@ export class AbjectStore extends Abject {
                   { name: 'data', type: { kind: 'object', properties: {} }, description: 'Optional internal data record (this.data) to persist with the snapshot' },
                   { name: 'folder', type: { kind: 'primitive', primitive: 'string' }, description: 'Folder to keep it in (default: where it is, else "user")', optional: true },
                   { name: 'loading', type: { kind: 'primitive', primitive: 'string' }, description: '"boot" (start with the workspace) or "needed" (asleep until looked up or shown)', optional: true },
+                  { name: 'undo', type: { kind: 'primitive', primitive: 'string' }, description: 'A label (e.g. "Edit source") that keeps a source change in your undo history here', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -252,10 +306,23 @@ export class AbjectStore extends Abject {
               },
               {
                 name: 'remove',
-                description: 'Remove a saved snapshot',
+                description: 'Remove a kept object. It is set aside for this session and three days, so `undo` (from whoever removed it) brings it back, running again if it ran.',
                 parameters: [{ name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'The ID of the object to remove' }],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'listRemoved',
+                description: 'Objects removed recently and still kept: [{ id, typeId, name, removedAt }]. A built-in caller sees all; anyone else sees what they own.',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+              },
+              {
+                name: 'restoreRemoved',
+                description: 'Bring back a removed object by its id from listRemoved (built-in objects and its owner). Returns { typeId, objectId }.',
+                parameters: [{ name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Its id from listRemoved' }],
+                returns: { kind: 'object', properties: {} },
+              },
+              ...undoMethods('your last change here: a removal (the objects come back), a placement, a copy (it is removed), or a source saved with an undo label'),
               {
                 name: 'list',
                 description: 'List the kept user objects (abjects from installed packages are not listed): { typeId, objectId, name, description, tags, folder, loading, asleep, owner, savedAt }. Filter by folder (including the folders inside it), tag, or loading.',
@@ -371,6 +438,7 @@ export class AbjectStore extends Abject {
                 returns: { kind: 'object', properties: {} },
               },
             ],
+            events: UNDO_EVENTS,
           },
         tags: ['system', 'persistence'],
       },
@@ -421,7 +489,7 @@ export class AbjectStore extends Abject {
   private setupHandlers(): void {
     describeMessages(this.manifest, [{name:'getDurableSnapshot',description:'Read a source/data snapshot directly from Storage after durable acknowledgement.',parameters:{objectId:protocolText}}]);
     this.on('save', async (msg: AbjectMessage) => {
-      const { objectId, manifest, source, owner, data, folder, loading } = msg.payload as {
+      const { objectId, manifest, source, owner, data, folder, loading, undo } = msg.payload as {
         objectId: string;
         manifest: AbjectManifest;
         source: string;
@@ -429,12 +497,19 @@ export class AbjectStore extends Abject {
         data?: Record<string, unknown>;
         folder?: string;
         loading?: Loading;
+        undo?: string;
       };
       // An object saving itself keeps the owner its registration records: a
       // claimed `package:<name>` would write that package's data instead.
       const registered = await this.requireSnapshotWriter(msg, objectId, 'save');
       const finalOwner = registered === undefined ? owner : (registered.owner ?? this.findEntry(objectId)?.owner ?? '');
-      return this.saveSnapshot(objectId, manifest, source, finalOwner, data, { folder, loading });
+      const beforeHash = this.findEntry(objectId)?.sourceHash;
+      const saved = await this.saveSnapshot(objectId, manifest, source, finalOwner, data, { folder, loading });
+      const after = this.findEntry(objectId);
+      if (typeof undo === 'string' && undo.trim() && beforeHash && after && after.sourceHash !== beforeHash) {
+        await this.recordStep(msg.routing.from, undo.trim(), { kind: 'source', typeId: after.typeId, beforeHash, afterHash: after.sourceHash });
+      }
+      return saved;
     });
 
     this.on('create', async (msg: AbjectMessage) => {
@@ -468,26 +543,66 @@ export class AbjectStore extends Abject {
       }
       const full = await this.fullRecord(entry);
       const manifest = name ? { ...entry.manifest, name } : entry.manifest;
-      return this.createObject({
+      const made = await this.createObject({
         manifest,
         source: full.source,
         data: data ?? structuredClone(full.data ?? {}),
         owner: builtIn ? entry.owner : caller,
         placement: { folder: folder ?? entry.folder, tags: tags ?? entry.manifest.tags, loading: loading ?? entry.loading },
       });
+      await this.recordStep(caller, `Copy ${entry.manifest.name}`, { kind: 'copy', typeId: made.typeId });
+      return made;
     });
 
     this.on('place', async (msg: AbjectMessage) => {
       const { objectId, folder, tags, loading } = msg.payload as { objectId: string; folder?: string; tags?: string[]; loading?: Loading };
       await this.requireSnapshotWriter(msg, objectId, 'place');
-      return this.placeObject(this.requireEntry(objectId, 'place'), { folder, tags, loading });
+      const entry = this.requireEntry(objectId, 'place');
+      const before = this.placementState(entry);
+      const placed = await this.placeObject(entry, { folder, tags, loading });
+      const after = this.placementState(entry);
+      if (JSON.stringify(before) !== JSON.stringify(after)) {
+        await this.recordStep(msg.routing.from, this.placeLabel(entry.manifest.name, before, after),
+          { kind: 'place', typeId: entry.typeId, before, after });
+      }
+      return placed;
     });
 
+    // The Factory removes a killed object's record on behalf of whoever
+    // asked for the kill (`for`), so that caller's undo brings it back.
     this.on('remove', async (msg: AbjectMessage) => {
-      const { objectId } = msg.payload as { objectId: string };
+      const { objectId, for: onBehalfOf } = msg.payload as { objectId: string; for?: AbjectId };
       await this.requireSnapshotWriter(msg, objectId, 'remove');
-      return this.removeSnapshot(objectId);
+      const entry = this.findEntry(objectId);
+      if (!entry) return false;
+      if (isPackageOwner(entry.owner)) return this.removeSnapshot(objectId);
+      const actor = onBehalfOf && await this.isBuiltInCaller(msg.routing.from) ? onBehalfOf : msg.routing.from;
+      const trashId = await this.setAside(entry);
+      await this.recordStep(actor, `Delete ${entry.manifest.name}`, { kind: 'remove', items: [{ trashId, typeId: entry.typeId }] });
+      return true;
     });
+
+    this.on('listRemoved', async (msg: AbjectMessage) => {
+      const builtIn = await this.isBuiltInCaller(msg.routing.from);
+      return [...this.trash.values()]
+        .filter(t => builtIn || t.owner === msg.routing.from)
+        .sort((a, b) => b.removedAt - a.removedAt)
+        .map(t => ({ id: t.id, typeId: t.typeId, name: t.name, removedAt: t.removedAt }));
+    });
+
+    this.on('restoreRemoved', async (msg: AbjectMessage) => {
+      const { id } = msg.payload as { id: string };
+      const item = this.trash.get(id);
+      precondition(item !== undefined, `restoreRemoved: nothing removed under '${id}' is kept`);
+      precondition(await this.isBuiltInCaller(msg.routing.from) || item!.owner === msg.routing.from,
+        'restoreRemoved is taken from built-in objects and the object\'s owner');
+      const typeId = await this.restoreFromTrash(id);
+      return { typeId, objectId: this.entries.get(typeId)?.objectId ?? '' };
+    });
+
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg.routing.from, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg.routing.from, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) => this.undo.state(await this.undoCallerKey(msg.routing.from)));
 
     this.on('list', async (msg: AbjectMessage) => {
       const { folder, tag, loading } = (msg.payload ?? {}) as { folder?: string; tag?: string; loading?: Loading };
@@ -512,7 +627,9 @@ export class AbjectStore extends Abject {
       const inFolder = this.userEntries()
         .filter(e => e.folder === folder || e.folder.startsWith(`${folder}/`))
         .filter(e => builtIn || e.owner === caller);
-      for (const entry of inFolder) await this.retireEntry(entry);
+      const items: Array<{ trashId?: string; typeId: string }> = [];
+      for (const entry of inFolder) items.push({ trashId: await this.retireEntry(entry), typeId: entry.typeId });
+      if (items.length > 0) await this.recordStep(caller, `Delete folder ${folder}`, { kind: 'remove', items });
       log.info(`Removed folder '${folder}': ${inFolder.length} object(s)`);
       return { removed: inFolder.length };
     });
@@ -832,6 +949,7 @@ export class AbjectStore extends Abject {
       used.add(e.sourceHash);
       for (const v of e.versions ?? []) used.add(v.sourceHash);
     }
+    for (const t of this.trash.values()) for (const h of t.sourceHashes) used.add(h);
     for (const hash of new Set(candidates)) {
       if (used.has(hash)) continue;
       this.storedSources.delete(hash);
@@ -955,6 +1073,7 @@ export class AbjectStore extends Abject {
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
 
     await this.loadFromStorage();
+    await this.loadTrash();
     this.setRecurringTimer(() => { void this.sweepIdle(); }, AbjectStore.SWEEP_MS);
   }
 
@@ -971,6 +1090,13 @@ export class AbjectStore extends Abject {
       this.persistDirty = false;
       try {
         this.bus.send(event(this.id, this.storageId, 'set', { key: INDEX_KEY, value: [...this.entries.values()] }));
+      } catch { /* best effort at shutdown */ }
+    }
+    if (this.undoPersistTimer && this.storageId) {
+      clearTimeout(this.undoPersistTimer);
+      this.undoPersistTimer = undefined;
+      try {
+        this.bus.send(event(this.id, this.storageId, 'set', { key: UNDO_KEY, value: this.undo.toJSON() }));
       } catch { /* best effort at shutdown */ }
     }
   }
@@ -1068,6 +1194,9 @@ export class AbjectStore extends Abject {
     if (isPackageOwner(owner)) {
       return this.savePackageSnapshot(objectId, manifest, source, owner, data);
     }
+    // The last save of an object just removed (it flushes as it stops) is
+    // not a new object; undo brings the removed one back.
+    if (this.removedIds.has(objectId) && !this.findEntry(objectId)) return true;
 
     return withKeyedLock(`${this.id}:save:${objectId}`, async () => {
       const wsId = await this.ensureWorkspaceId();
@@ -1306,14 +1435,273 @@ export class AbjectStore extends Abject {
     }
   }
 
-  /** Stop an object if it runs, then forget it. */
-  private async retireEntry(entry: StoreEntry): Promise<void> {
+  /** Stop an object if it runs, then set it aside; its trash id. */
+  private async retireEntry(entry: StoreEntry): Promise<string> {
+    const wasRunning = !!entry.objectId;
     if (entry.objectId && this.factoryId) {
       try {
         await this.request(request(this.id, this.factoryId, 'kill', { objectId: entry.objectId, keepSnapshot: true }), 15_000);
       } catch { /* already gone */ }
     }
+    return this.setAside(entry, wasRunning);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Removed objects, kept for undo
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Remove a record but keep it whole (record, data, preview; its sources
+   * stay stored) under a trash id, for the session and at least
+   * TRASH_KEEP_MS. Undo and restoreRemoved bring it back.
+   */
+  private async setAside(entry: StoreEntry, wasRunning = !!entry.objectId): Promise<string> {
+    precondition(!isPackageOwner(entry.owner), 'setAside: package data is not kept for undo');
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const [body, preview] = await Promise.all([
+      this.readBody(entry.typeId),
+      entry.preview ? this.storageGet<ObjectPreview>(previewKey(entry.typeId)).catch(() => null) : Promise.resolve(null),
+    ]);
+    const record: TrashRecord = {
+      entry: { ...entry, objectId: '' },
+      ...(body?.data !== undefined ? { data: body.data } : {}),
+      ...(preview ? { preview } : {}),
+      wasRunning,
+    };
+    const bytes = JSON.stringify(record).length;
+    await this.storageSet(trashKey(id), record);
+    this.trash.set(id, {
+      id,
+      typeId: entry.typeId,
+      name: entry.manifest.name,
+      owner: entry.owner,
+      removedAt: Date.now(),
+      sourceHashes: [...new Set([entry.sourceHash, ...(entry.versions ?? []).map(v => v.sourceHash)])],
+      bytes,
+    });
+    await this.persistTrashIndex();
+    if (entry.objectId) this.removedIds.set(entry.objectId, Date.now());
     await this.dropEntry(entry);
+    log.info(`Removed '${entry.manifest.name}' (kept as ${id} for undo)`);
+    await this.purgeTrash();
+    return id;
+  }
+
+  /**
+   * Bring a removed object back: its record (under its old typeId unless
+   * another object took it), data and preview. One that loads at boot, or
+   * ran when removed, starts again; the rest are registered asleep.
+   */
+  private async restoreFromTrash(id: string): Promise<string> {
+    const item = this.trash.get(id);
+    if (!item) throw new UndoRefused('The removed object is no longer kept');
+    const record = await this.storageGet<TrashRecord>(trashKey(id)).catch(() => null);
+    if (!record?.entry || !isValidManifest(record.entry.manifest)) {
+      this.trash.delete(id);
+      await this.persistTrashIndex();
+      throw new UndoRefused(`'${item.name}' is no longer kept`);
+    }
+    const typeId = this.entries.has(record.entry.typeId) ? await this.newTypeId(record.entry.manifest.name) : record.entry.typeId;
+    const entry: StoreEntry = { ...record.entry, typeId, objectId: '' };
+    if (record.data !== undefined) await this.storageSet(bodyKey(typeId), { data: record.data });
+    this.bodyHashes.delete(typeId);
+    if (record.preview) await this.storageSet(previewKey(typeId), record.preview);
+    else delete entry.preview;
+    this.entries.set(typeId, entry);
+    this.trash.delete(id);
+    this.schedulePersist();
+    await this.flushPersist();
+    await this.persistTrashIndex();
+    await this.storageDelete(trashKey(id));
+    if (entry.loading === 'boot' || record.wasRunning) {
+      const objectId = await this.wake(entry);
+      const tags = entry.manifest.tags ?? [];
+      if (entry.loading === 'boot' && (tags.includes('autostart') || tags.includes('agent'))) {
+        try { await this.request(request(this.id, objectId, 'startup', {}), 10_000); } catch { /* best effort */ }
+      }
+    } else {
+      await this.registerAsleep([entry]);
+    }
+    log.info(`Brought back '${entry.manifest.name}' as ${typeId}`);
+    return typeId;
+  }
+
+  private async loadTrash(): Promise<void> {
+    try {
+      const index = await this.storageGet<TrashItem[]>(TRASH_INDEX_KEY);
+      for (const item of Array.isArray(index) ? index : []) {
+        if (item?.id && item.typeId) this.trash.set(item.id, item);
+      }
+      this.undo.load(await this.storageGet(UNDO_KEY).catch(() => null) as Parameters<typeof this.undo.load>[0]);
+      await this.purgeTrash();
+    } catch (err) {
+      log.warn('Failed to load removed objects:', err);
+    }
+  }
+
+  private async persistTrashIndex(): Promise<void> {
+    await this.storageSet(TRASH_INDEX_KEY, [...this.trash.values()]);
+  }
+
+  /**
+   * Forget removed objects past keeping: removed before this session and
+   * longer ago than TRASH_KEEP_MS, or beyond the count and size limits
+   * (oldest first). Undo steps that pointed at them go too.
+   */
+  private async purgeTrash(): Promise<void> {
+    const now = Date.now();
+    const items = [...this.trash.values()].sort((a, b) => a.removedAt - b.removedAt);
+    const expired = new Set(items.filter(t => t.removedAt < this.sessionStartedAt && now - t.removedAt > AbjectStore.TRASH_KEEP_MS).map(t => t.id));
+    let count = items.length - expired.size;
+    let bytes = items.filter(t => !expired.has(t.id)).reduce((n, t) => n + t.bytes, 0);
+    for (const t of items) {
+      if (expired.has(t.id)) continue;
+      if (count <= AbjectStore.TRASH_MAX_ITEMS && bytes <= AbjectStore.TRASH_MAX_BYTES) break;
+      expired.add(t.id);
+      count--;
+      bytes -= t.bytes;
+    }
+    if (expired.size > 0) {
+      const hashes: string[] = [];
+      for (const id of expired) {
+        const t = this.trash.get(id);
+        if (t) hashes.push(...t.sourceHashes);
+        this.trash.delete(id);
+        await this.storageDelete(trashKey(id));
+      }
+      await this.persistTrashIndex();
+      await this.dropUnusedSources(hashes);
+      log.info(`Forgot ${expired.size} removed object(s) past keeping`);
+    }
+    const before = this.undo.steps().length;
+    this.undo.prune(step => this.stepStillApplies(step));
+    if (this.undo.steps().length !== before) this.scheduleUndoPersist();
+  }
+
+  /** Whether what a step brings back is still kept. */
+  private stepStillApplies(step: UndoStep<StoreStep>): boolean {
+    const d = step.data;
+    if (d.kind === 'remove') return d.items.every(i => i.trashId ? this.trash.has(i.trashId) : this.entries.has(i.typeId));
+    if (d.kind === 'copy') return d.trashId ? this.trash.has(d.trashId) : this.entries.has(d.typeId);
+    return this.entries.has(d.typeId);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Undo
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async recordStep(callerId: AbjectId, label: string, step: StoreStep): Promise<void> {
+    const caller = await this.undoCallerKey(callerId);
+    this.undo.for(caller).record(label, step);
+    this.scheduleUndoPersist();
+    this.send(event(this.id, callerId, 'undoStateChanged', this.undo.state(caller)));
+  }
+
+  private async undoFor(callerId: AbjectId, action: UndoAction): Promise<unknown> {
+    const caller = await this.undoCallerKey(callerId);
+    const history = this.undo.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](step => this.applyStep(step, action));
+    this.scheduleUndoPersist();
+    this.send(event(this.id, callerId, 'undoStateChanged', this.undo.state(caller)));
+    return result;
+  }
+
+  /** Take a step back (undo) or forward again (redo). */
+  private async applyStep(step: UndoStep<StoreStep>, action: UndoAction): Promise<unknown> {
+    const d = step.data;
+    switch (d.kind) {
+      case 'remove': {
+        if (action === 'undo') {
+          const restored: string[] = [];
+          for (const item of d.items) {
+            if (!item.trashId) continue;
+            item.typeId = await this.restoreFromTrash(item.trashId);
+            delete item.trashId;
+            restored.push(item.typeId);
+          }
+          return { typeIds: restored };
+        }
+        for (const item of d.items) {
+          const entry = this.entries.get(item.typeId);
+          if (!entry) throw new UndoRefused(`'${item.typeId}' is gone already`);
+        }
+        for (const item of d.items) item.trashId = await this.retireEntry(this.entries.get(item.typeId)!);
+        return {};
+      }
+      case 'copy': {
+        if (action === 'undo') {
+          const entry = this.entries.get(d.typeId);
+          if (!entry) throw new UndoRefused('The copy is gone already');
+          d.trashId = await this.retireEntry(entry);
+          return {};
+        }
+        if (!d.trashId) throw new UndoRefused('The copy is no longer kept');
+        d.typeId = await this.restoreFromTrash(d.trashId);
+        delete d.trashId;
+        return { typeIds: [d.typeId] };
+      }
+      case 'place': {
+        const entry = this.entries.get(d.typeId);
+        if (!entry) throw new UndoRefused(`'${d.typeId}' is no longer kept`);
+        const expect = action === 'undo' ? d.after : d.before;
+        if (JSON.stringify(this.placementState(entry)) !== JSON.stringify(expect)) {
+          throw new UndoRefused(`'${entry.manifest.name}' was placed again since`);
+        }
+        await this.setPlacement(entry, action === 'undo' ? d.before : d.after);
+        return { typeIds: [entry.typeId] };
+      }
+      case 'source': {
+        const entry = this.entries.get(d.typeId);
+        if (!entry) throw new UndoRefused(`'${d.typeId}' is no longer kept`);
+        const [from, to] = action === 'undo' ? [d.afterHash, d.beforeHash] : [d.beforeHash, d.afterHash];
+        if (entry.sourceHash !== from) throw new UndoRefused(`The source of '${entry.manifest.name}' changed since`);
+        const switched = await this.switchSource(entry, to);
+        if (!switched.success) throw new Error(switched.error ?? 'the source did not apply');
+        return { typeIds: [entry.typeId] };
+      }
+    }
+  }
+
+  private scheduleUndoPersist(): void {
+    if (this.undoPersistTimer) return;
+    this.undoPersistTimer = setTimeout(() => {
+      this.undoPersistTimer = undefined;
+      if (!this.storageId) return;
+      void this.storageSet(UNDO_KEY, this.undo.toJSON()).catch(err => log.warn('Undo history persistence failed:', err));
+    }, AbjectStore.PERSIST_DEBOUNCE_MS);
+  }
+
+  private placementState(entry: StoreEntry): PlacementState {
+    return { folder: entry.folder, loading: entry.loading, tags: [...(entry.manifest.tags ?? [])] };
+  }
+
+  private placeLabel(name: string, before: PlacementState, after: PlacementState): string {
+    if (before.folder !== after.folder) return `Move ${name}`;
+    if (before.loading !== after.loading) return `Change when ${name} loads`;
+    return `Tag ${name}`;
+  }
+
+  /** Put a record back where a step had it: folder, loading, and its exact tags. */
+  private async setPlacement(entry: StoreEntry, p: PlacementState): Promise<void> {
+    const tagsChanged = JSON.stringify(entry.manifest.tags ?? []) !== JSON.stringify(p.tags);
+    entry.folder = p.folder;
+    entry.loading = p.loading;
+    if (tagsChanged) {
+      entry.manifest = { ...entry.manifest, tags: [...p.tags] };
+      if (entry.objectId && this.registryId) {
+        try {
+          await this.request(request(this.id, this.registryId, 'updateManifest', { objectId: entry.objectId, manifest: entry.manifest }));
+        } catch { /* registry sync is best effort */ }
+      }
+    }
+    entry.savedAt = Date.now();
+    this.schedulePersist();
+    await this.flushPersist();
+    if (!entry.objectId) {
+      if (entry.loading === 'boot') await this.wake(entry);
+      else await this.registerAsleep([entry]);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1410,6 +1798,10 @@ export class AbjectStore extends Abject {
     for (const [id, retired] of this.retiredIds) {
       if (now - retired.at > AbjectStore.RETIRED_KEEP_MS) this.retiredIds.delete(id);
     }
+    for (const [id, at] of this.removedIds) {
+      if (now - at > AbjectStore.RETIRED_KEEP_MS) this.removedIds.delete(id);
+    }
+    await this.purgeTrash().catch(err => log.warn(`could not purge removed objects: ${err instanceof Error ? err.message : String(err)}`));
     const idle = this.userEntries().filter(e => e.loading === 'needed' && e.objectId
       && !(this.holds.get(e.typeId)?.size)
       && now - (this.touchedAt.get(e.typeId) ?? 0) >= idleMs);
@@ -1517,11 +1909,23 @@ export class AbjectStore extends Abject {
       return { success: false, error: `Version index ${index} out of range (object has ${versions.length} prior versions)` };
     }
     const chosen = versions[index];
-    const source = await this.readSource(chosen.sourceHash);
+    const result = await this.switchSource(entry, chosen.sourceHash);
+    if (!result.success) return result;
+    log.info(`Restored '${entry.manifest.name}' to version from ${new Date(chosen.savedAt).toISOString()}`);
+    this.changed('versionRestored', { typeId: entry.typeId, objectId: entry.objectId, restoredSavedAt: chosen.savedAt });
+    return { success: true };
+  }
+
+  /**
+   * Make a stored source the live one: the running object gets it first
+   * (updateSource; an old source that no longer compiles fails here and
+   * nothing changes), the current source goes onto the version ring (a
+   * switch is itself restorable), the record and the registry follow.
+   */
+  private async switchSource(entry: StoreEntry, hash: string): Promise<{ success: boolean; error?: string }> {
+    const source = await this.readSource(hash);
     if (!source) return { success: false, error: 'That version\'s source is missing from Storage' };
 
-    // Apply to the live object first — if the old source no longer compiles
-    // against today's runtime, fail without touching the record.
     if (entry.objectId) {
       try {
         const result = await this.request<{ success: boolean; error?: string }>(
@@ -1532,8 +1936,8 @@ export class AbjectStore extends Abject {
       }
     }
 
-    entry.versions = [{ sourceHash: entry.sourceHash, savedAt: entry.savedAt }, ...versions].slice(0, AbjectStore.MAX_VERSIONS);
-    entry.sourceHash = chosen.sourceHash;
+    entry.versions = [{ sourceHash: entry.sourceHash, savedAt: entry.savedAt }, ...(entry.versions ?? [])].slice(0, AbjectStore.MAX_VERSIONS);
+    entry.sourceHash = hash;
     entry.savedAt = Date.now();
     this.schedulePersist();
     await this.flushPersist();
@@ -1543,9 +1947,6 @@ export class AbjectStore extends Abject {
         await this.request(request(this.id, this.registryId, 'updateSource', { objectId: entry.objectId, source }));
       } catch { /* registry sync is best effort */ }
     }
-
-    log.info(`Restored '${entry.manifest.name}' to version from ${new Date(chosen.savedAt).toISOString()}`);
-    this.changed('versionRestored', { typeId: entry.typeId, objectId: entry.objectId, restoredSavedAt: chosen.savedAt });
     return { success: true };
   }
 

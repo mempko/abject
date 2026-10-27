@@ -6,12 +6,37 @@ import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { Log } from '../../core/timed-log.js';
 import { require } from '../../core/contracts.js';
+import { event } from '../../core/message.js';
+import { UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods } from '../../core/undo.js';
 
 const log = new Log('Storage');
 
 const STORAGE_INTERFACE = 'abjects:storage';
 const DB_NAME = 'abjects-storage';
 const STORE_NAME = 'kv';
+
+/** One key a step changed: what it held before and after. */
+interface JournalEntry {
+  key: string;
+  before: unknown;
+  beforeExists: boolean;
+  after: unknown;
+  afterExists: boolean;
+}
+
+/** A write to apply in setMany: a value, or `delete: true`. */
+interface ManyWrite {
+  key: string;
+  value?: unknown;
+  delete?: boolean;
+}
+
+const undoParam = {
+  name: 'undo',
+  type: { kind: 'primitive' as const, primitive: 'string' as const },
+  description: 'A label for this change (e.g. "Star Notes"). Given one, the change is kept in your undo history here and the `undo` method takes it back.',
+  optional: true,
+};
 
 export interface StorageEntry {
   key: string;
@@ -73,6 +98,7 @@ export class Storage extends Abject {
                     type: { kind: 'reference', reference: 'any' },
                     description: 'Value to store',
                   },
+                  undoParam,
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -85,9 +111,24 @@ export class Storage extends Abject {
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'Storage key',
                   },
+                  undoParam,
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'setMany',
+                description: 'Write several keys as one change: each write is { key, value } or { key, delete: true }. With `undo`, one undo takes them all back.',
+                parameters: [
+                  {
+                    name: 'writes',
+                    type: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+                    description: 'The writes, in order',
+                  },
+                  undoParam,
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              ...undoMethods('your last change made with an `undo` label (your changes only). On success the reply carries `restored`: { key: value } for each key put back, null for one now absent; re-read your state from it. A key that changed again since is not overwritten: the undo is refused'),
               {
                 name: 'has',
                 description: 'Check if key exists',
@@ -147,6 +188,7 @@ export class Storage extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
             ],
+            events: UNDO_EVENTS,
           },
         tags: ['system', 'capability', 'storage', 'persistence'],
       },
@@ -167,14 +209,34 @@ export class Storage extends Abject {
     });
 
     this.on('set', async (msg: AbjectMessage) => {
-      const { key, value } = msg.payload as { key: string; value: unknown };
-      return this.setValue(key, value);
+      const { key, value, undo } = msg.payload as { key: string; value: unknown; undo?: string };
+      if (undo === undefined) return this.setValue(key, value);
+      return this.writeWithUndo(msg, undo, [{ key, value }]);
     });
 
     this.on('delete', async (msg: AbjectMessage) => {
-      const { key } = msg.payload as { key: string };
-      return this.deleteValue(key);
+      const { key, undo } = msg.payload as { key: string; undo?: string };
+      if (undo === undefined) return this.deleteValue(key);
+      return this.writeWithUndo(msg, undo, [{ key, delete: true }]);
     });
+
+    this.on('setMany', async (msg: AbjectMessage) => {
+      const { writes, undo } = msg.payload as { writes: ManyWrite[]; undo?: string };
+      require(Array.isArray(writes) && writes.every(w => typeof w?.key === 'string' && w.key.length > 0),
+        'setMany: writes must be [{ key, value }] or [{ key, delete: true }]');
+      if (undo === undefined) {
+        for (const w of writes) {
+          if (w.delete) await this.deleteValue(w.key); else await this.setValue(w.key, w.value);
+        }
+        return true;
+      }
+      return this.writeWithUndo(msg, undo, writes);
+    });
+
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) =>
+      this.journal.state(await this.undoCallerKey(msg.routing.from)));
 
     this.on('has', async (msg: AbjectMessage) => {
       const { key } = msg.payload as { key: string };
@@ -199,6 +261,90 @@ export class Storage extends Abject {
     this.on('clear', async () => {
       return this.clearAll();
     });
+  }
+
+  // ── Undo journal ────────────────────────────────────────────────
+
+  /**
+   * Each writer's labeled changes, kept for this session. A step holds the
+   * keys it changed with their values before and after, so undo writes the
+   * before values back and redo the after values, each only while the keys
+   * still hold what the step left there.
+   */
+  private journal = new UndoHistories<JournalEntry[]>({
+    merge: (older, newer) => {
+      const byKey = new Map(older.map(e => [e.key, { ...e }]));
+      for (const e of newer) {
+        const prior = byKey.get(e.key);
+        byKey.set(e.key, prior ? { ...prior, after: e.after, afterExists: e.afterExists } : e);
+      }
+      return [...byKey.values()];
+    },
+  });
+  /** The live id each writer last wrote from, to tell it its undo state moved. */
+  private journalWriters = new Map<string, AbjectId>();
+
+  private async readEntry(key: string): Promise<{ exists: boolean; value: unknown }> {
+    const exists = await this.hasKey(key);
+    return { exists, value: exists ? await this.getValue(key) : null };
+  }
+
+  private async writeEntry(key: string, exists: boolean, value: unknown): Promise<void> {
+    if (exists) await this.setValue(key, value); else await this.deleteValue(key);
+  }
+
+  private async writeWithUndo(msg: AbjectMessage, label: string, writes: ManyWrite[]): Promise<boolean> {
+    require(typeof label === 'string' && label.trim().length > 0, 'undo: the label must be a non-empty string');
+    const caller = await this.undoCallerKey(msg.routing.from);
+    const entries: JournalEntry[] = [];
+    for (const w of writes) {
+      const before = await this.readEntry(w.key);
+      const afterExists = !w.delete;
+      const after = afterExists ? w.value : null;
+      await this.writeEntry(w.key, afterExists, after);
+      const prior = entries.find(e => e.key === w.key);
+      if (prior) { prior.after = after; prior.afterExists = afterExists; continue; }
+      entries.push({ key: w.key, before: before.value, beforeExists: before.exists, after, afterExists });
+    }
+    const changed = entries.filter(e => e.beforeExists !== e.afterExists || !sameValue(e.before, e.after));
+    if (changed.length > 0) {
+      this.journal.for(caller).record(label.trim(), changed, { mergeKey: changed.map(e => e.key).join('\n') });
+      this.journalWriters.set(caller, msg.routing.from);
+      this.tellUndoState(caller);
+    }
+    return true;
+  }
+
+  private async undoFor(msg: AbjectMessage, action: 'undo' | 'redo'): Promise<unknown> {
+    const caller = await this.undoCallerKey(msg.routing.from);
+    const history = this.journal.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](async (step) => {
+      const restored: Record<string, unknown> = {};
+      for (const e of step.data) {
+        const now = await this.readEntry(e.key);
+        const expectExists = action === 'undo' ? e.afterExists : e.beforeExists;
+        const expect = action === 'undo' ? e.after : e.before;
+        if (now.exists !== expectExists || (now.exists && !sameValue(now.value, expect))) {
+          throw new UndoRefused(`'${e.key}' changed since, so "${step.label}" can no longer be ${action === 'undo' ? 'undone' : 'redone'}`);
+        }
+      }
+      for (const e of step.data) {
+        const exists = action === 'undo' ? e.beforeExists : e.afterExists;
+        const value = action === 'undo' ? e.before : e.after;
+        await this.writeEntry(e.key, exists, value);
+        restored[e.key] = exists ? value : null;
+      }
+      return { restored };
+    });
+    this.journalWriters.set(caller, msg.routing.from);
+    this.tellUndoState(caller);
+    return result;
+  }
+
+  private tellUndoState(caller: string): void {
+    const to = this.journalWriters.get(caller);
+    if (to) this.send(event(this.id, to, 'undoStateChanged', this.journal.state(caller)));
   }
 
   /**

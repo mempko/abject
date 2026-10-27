@@ -23,6 +23,7 @@ import { require } from '../core/contracts.js';
 import { chromeCase } from '../core/theme-data.js';
 import { ActivityLatch, dockStyles, type DockLauncher } from './dock-style.js';
 import { withAlpha } from './widgets/widget-types.js';
+import { UNDO_EVENTS, undoMethods, type UndoAction, type UndoResult, type UndoState } from '../core/undo.js';
 
 const log = new Log('Taskbar');
 
@@ -115,6 +116,8 @@ export class Taskbar extends Abject {
   private restoreButtons: Map<AbjectId, string> = new Map();
   /** User object row -> that object's favorite key (for its star). */
   private rowKeys: Map<AbjectId, string> = new Map();
+  /** Favorite key -> the name last shown for it, for undo labels ("Star Notes"). */
+  private keyNames: Map<string, string> = new Map();
   /** The built-in launcher rows in order, with the label the search matches. */
   private launcherRows: Array<{ btnId: AbjectId; label: string }> = [];
   /** Launcher rows and rules the search has hidden. */
@@ -197,7 +200,9 @@ export class Taskbar extends Abject {
                   key: { kind: 'primitive', primitive: 'string' },
                 }}},
               },
+              ...undoMethods('the last star or unstar of a dock row (the favorites are put back as they were)'),
             ],
+            events: UNDO_EVENTS,
           },
         tags: ['system', 'ui'],
       },
@@ -225,6 +230,8 @@ can restore windows from the sidebar.
 - \`setFavorite({ object, favorite? })\` -- Favorite (default) or unfavorite a
   launchable user object by name, typeId or AbjectId.
 - \`getFavorites()\` -- The favorited objects as \`[{ name, key }]\`.
+- \`undo()\` / \`redo()\` -- Take back (or redo) the last star or unstar.
+  Returns \`{ ok, label, reason }\`; \`getUndoState()\` says what undo would do.
 
 ### Favorites and search
 A search field at the top of the section filters every row by name (and a
@@ -411,6 +418,7 @@ row; favorites list right under the built-in apps and are kept per workspace.
       const target = objects.find((o) => o.id === object || o.typeId === object)
         ?? objects.find((o) => o.manifest.name === object);
       if (!target) throw new Error(`No launchable user object '${object}' (it needs show and hide methods)`);
+      this.keyNames.set(favoriteKey(target), target.manifest.name);
       await this.applyFavorite(favoriteKey(target), favorite !== false);
       return true;
     });
@@ -418,6 +426,18 @@ row; favorites list right under the built-in apps and are kept per workspace.
     this.on('getFavorites', async () => {
       const byKey = new Map((await this.discoverShowableObjects()).map((o) => [favoriteKey(o), o]));
       return this.favorites.map((key) => ({ name: byKey.get(key)?.manifest.name ?? key, key }));
+    });
+
+    // Storage keeps the favorites' history: this object is its one writer.
+    this.on('undo', async () => this.undoFavorites('undo'));
+    this.on('redo', async () => this.undoFavorites('redo'));
+    this.on('getUndoState', async (): Promise<UndoState> => {
+      if (!this.storageId) return { canUndo: false, canRedo: false };
+      try {
+        return await this.request<UndoState>(request(this.id, this.storageId, 'getUndoState', {}), 5000);
+      } catch {
+        return { canUndo: false, canRedo: false };
+      }
     });
 
     // WidgetManager broadcasts these (with the owning app's id) whenever any
@@ -960,6 +980,7 @@ row; favorites list right under the built-in apps and are kept per workspace.
     rowIds.forEach((btnId, i) => {
       this.userObjButtons.set(btnId, objs[i].id);
       this.rowKeys.set(btnId, favoriteKey(objs[i]));
+      this.keyNames.set(favoriteKey(objs[i]), objs[i].manifest.name);
     });
     if (favorite) this.favoriteRowIds = rowIds; else this.otherRowIds = rowIds;
 
@@ -1048,10 +1069,31 @@ row; favorites list right under the built-in apps and are kept per workspace.
     if (favorite === has) return;
     this.favorites = favorite ? [...this.favorites, key] : this.favorites.filter((k) => k !== key);
     if (this.storageId) {
-      this.send(request(this.id, this.storageId, 'set', { key: FAVORITES_KEY, value: this.favorites }));
+      const name = this.keyNames.get(key) ?? key;
+      this.send(request(this.id, this.storageId, 'set', {
+        key: FAVORITES_KEY, value: this.favorites, undo: `${favorite ? 'Star' : 'Unstar'} ${name}`,
+      }));
     }
     this.changed('favorites', this.favorites);
     await this.refreshObjectLists();
+  }
+
+  /**
+   * Undo or redo the last star through Storage, which journals each labeled
+   * write, then take the favorites it put back and move the rows the way a
+   * star press does.
+   */
+  private async undoFavorites(action: UndoAction): Promise<UndoResult> {
+    if (!this.storageId) return { ok: false, reason: 'Favorites are not kept here' };
+    const result = await this.request<UndoResult>(request(this.id, this.storageId, action, {}), 30000);
+    const restored = (result?.restored ?? {}) as Record<string, unknown>;
+    if (result?.ok && FAVORITES_KEY in restored) {
+      const value = restored[FAVORITES_KEY];
+      this.favorites = Array.isArray(value) ? value.filter((k): k is string => typeof k === 'string') : [];
+      this.changed('favorites', this.favorites);
+      await this.refreshObjectLists();
+    }
+    return result;
   }
 
   private async loadFavorites(): Promise<void> {

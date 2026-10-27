@@ -113,7 +113,12 @@ instance.
   `node:sqlite` (one `kv` table, WAL mode, O(1) per key) at
   `$ABJECTS_DATA_DIR/storage.db` (global) and `$ABJECTS_DATA_DIR/ws-<id>/storage.db`
   (per workspace). It imports a legacy `storage.json` once and keeps it as
-  `.bak`, which is what `getPrevious` reads.
+  `.bak`, which is what `getPrevious` reads. Undo (`src/core/undo.ts`):
+  `set`, `delete` and `setMany` (several keys as one change) given
+  `undo: 'Label'` are journaled per writer for the session; that writer's
+  `undo` / `redo` put the keys back only while they still hold what the step
+  left, and the reply's `restored` (`{ key: value | null }`) is what the
+  writer reloads its state from.
 - **`filesystem.ts`**: `FileSystem` (`FILESYSTEM_ID`). A per-workspace virtual
   filesystem: `readFile`, `writeFile`, `readFileBytes`, `writeFileBytes`,
   `deleteFile`, `mkdir`, `rmdir`, `remove`, `rename`, `readdir`, `stat`,
@@ -123,6 +128,19 @@ instance.
   references (images, audio, video) resolve through it. A tree an older build
   left at `~/.abject/ws-<workspaceId>/files` moves into the data directory the
   first time the workspace opens it (`../data-dir-layout.ts`).
+  Undo (`undo`, `redo`, `getUndoState`, one history per caller, kept in
+  `undo.json`): deletes (`deleteFile`, `rmdir`, recursive `remove`), the old
+  content of an overwritten file and a rename's overwritten target are set
+  aside under `trash/<id>/` (index `trash/index.json`) instead of destroyed.
+  Each content change gets a new blob, so a file's blob id is its version.
+  A step is one swap (what is at a path now goes aside, what is aside comes
+  back), a move, or a mkdir; it refuses when the path changed since, and a
+  deleted file that comes back where another now lives returns beside it as
+  "name (restored)". Trash is kept for the session and three days, capped at
+  500 items and 512 MB (oldest first), and purged at init, hourly and after
+  each step; items no step points at go at once. Writes built-ins make in
+  their own folders (`/uploads`, `/mcp`, `/recordings`) record no step, and a
+  write of identical content changes nothing.
 - **`shared-state.ts`**: `SharedState` (`SHARED_STATE_ID`). Named namespaces of
   last-writer-wins registers: `create`, `get`, `getAll`, `set`, `delete`,
   `subscribe`, `unsubscribe`, `listNamespaces`, `removeNamespace`,

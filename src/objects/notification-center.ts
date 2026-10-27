@@ -29,6 +29,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as contractRequire, invariant } from '../core/contracts.js';
 import { shapeOf } from '../core/theme-data.js';
+import { UndoHistory, UNDO_EVENTS, undoMethods } from '../core/undo.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 import type { SlabEffectSpec } from '../ui/gl/slab-motion.js';
 import type { ListItem } from './widgets/list-widget.js';
@@ -178,6 +179,8 @@ export class NotificationCenter extends Abject {
   /** In-memory history; capped at MAX_HISTORY. Newest first. */
   private history: NotificationEntry[] = [];
   private nextHistoryId = 1;
+  /** Clearings of the history, each holding what it removed, for undo. */
+  private clearings = new UndoHistory<NotificationEntry[]>({ maxSteps: 10, mergeMs: 0 });
 
   // Viewer window state. Distinct from toast windows.
   private viewerWindowId?: AbjectId;
@@ -203,6 +206,7 @@ export class NotificationCenter extends Abject {
                 { name: 'message',     type: { kind: 'primitive', primitive: 'string' },  description: 'Text to display' },
                 { name: 'level',       type: { kind: 'primitive', primitive: 'string' },  description: 'info | success | warning | error', optional: true },
                 { name: 'durationMs',  type: { kind: 'primitive', primitive: 'number' },  description: 'Visible duration in ms (default 4000)', optional: true },
+                { name: 'quiet',       type: { kind: 'primitive', primitive: 'boolean' }, description: 'Show the toast only, keeping it out of history (e.g. "Undid Delete Notes")', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
@@ -238,12 +242,14 @@ export class NotificationCenter extends Abject {
             },
             {
               name: 'clearHistory',
-              description: 'Remove every notification from history. Does not affect active toasts.',
+              description: 'Remove every notification from history. Does not affect active toasts. Undo brings them back.',
               parameters: [],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
+            ...undoMethods('the last clearing of the notification history'),
           ],
           events: [
+            ...UNDO_EVENTS,
             {
               name: 'notificationAdded',
               description: 'Fires with the full content of every new notification, so mirroring surfaces can show the toast.',
@@ -279,14 +285,15 @@ export class NotificationCenter extends Abject {
 
   private setupHandlers(): void {
     this.on('notify', async (msg: AbjectMessage) => {
-      const { message, level, durationMs } = msg.payload as {
+      const { message, level, durationMs, quiet } = msg.payload as {
         message: string;
         level?: NotificationLevel;
         durationMs?: number;
+        quiet?: boolean;
       };
       const text = message ?? '';
       const lvl = level ?? 'info';
-      if (text.length > 0) {
+      if (text.length > 0 && !quiet) {
         // Record before showing the toast — even if the toast spawn fails
         // (no WidgetManager yet, etc.), the entry still lands in history.
         this.recordHistory(text, lvl);
@@ -306,12 +313,29 @@ export class NotificationCenter extends Abject {
 
     this.on('listNotifications', async () => this.history.slice());
 
-    this.on('clearHistory', async () => {
-      this.history = [];
-      this.changed('historyChanged', { count: 0 });
-      if (this.viewerWindowId) await this.refreshViewer();
-      return true;
+    this.on('clearHistory', async () => this.clearHistory());
+
+    // One history of clearings, whoever cleared: what comes back is only
+    // what this object showed everyone already.
+    this.on('undo', async () => {
+      const result = await this.clearings.undo(async (step) => {
+        const kept = new Set(this.history.map(e => e.id));
+        this.history = [...this.history, ...step.data.filter(e => !kept.has(e.id))].slice(0, MAX_HISTORY);
+        await this.historyMoved();
+      });
+      this.changed('undoStateChanged', this.clearings.state());
+      return result;
     });
+    this.on('redo', async () => {
+      const result = await this.clearings.redo(async (step) => {
+        const gone = new Set(step.data.map(e => e.id));
+        this.history = this.history.filter(e => !gone.has(e.id));
+        await this.historyMoved();
+      });
+      this.changed('undoStateChanged', this.clearings.state());
+      return result;
+    });
+    this.on('getUndoState', async () => this.clearings.state());
 
     this.on('show',   async () => this.openViewer());
     this.on('hide',   async () => this.closeViewer());
@@ -328,15 +352,29 @@ export class NotificationCenter extends Abject {
       const fromId = m.routing.from;
       if (aspect === 'click' && fromId === this.viewerClearBtnId) {
         if (this.history.length === 0) return;
-        this.history = [];
-        this.changed('historyChanged', { count: 0 });
-        await this.refreshViewer();
+        await this.clearHistory();
         // Applied: a hand-coloured flash on the viewer.
         if (this.viewerWindowId) {
           this.playWindowEffect(this.viewerWindowId, 'flash', '$accent');
         }
       }
     });
+  }
+
+  private async clearHistory(): Promise<boolean> {
+    if (this.history.length > 0) {
+      const n = this.history.length;
+      this.clearings.record(`Clear ${n} notification${n === 1 ? '' : 's'}`, this.history);
+      this.changed('undoStateChanged', this.clearings.state());
+    }
+    this.history = [];
+    await this.historyMoved();
+    return true;
+  }
+
+  private async historyMoved(): Promise<void> {
+    this.changed('historyChanged', { count: this.history.length });
+    if (this.viewerWindowId) await this.refreshViewer();
   }
 
   private recordHistory(message: string, level: NotificationLevel): void {

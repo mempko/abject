@@ -16,6 +16,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, invariant } from '../core/contracts.js';
+import { undoMethods } from '../core/undo.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 import { buildGoalChatRows, type GoalRow, type GoalView } from './goal-tree.js';
 import { estimateMarkdownHeight } from './widgets/markdown.js';
@@ -227,6 +228,7 @@ export class ChatWindow extends Abject {
             { name: 'show', description: 'Open the window (or raise it).', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
             { name: 'raise', description: 'Bring the open window to the front.', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
             { name: 'close', description: 'Close the window.', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
+            ...undoMethods('the last clearing or title change of this conversation (its Chat keeps the history)'),
           ],
         },
         tags: ['system', 'ui'],
@@ -309,6 +311,24 @@ export class ChatWindow extends Abject {
         await this.clearMessageLabels();
         await this.showWelcomeState();
       });
+    });
+
+    // The transcript changed under the window (an undone clearing): draw it again.
+    this.on('chatReloaded', (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.chatId) return;
+      void this.render(() => this.redrawTranscript());
+    });
+
+    // Ctrl+Z here (WidgetManager, for the person at this window): the Chat
+    // keeps the conversation's history, and redraws this window itself.
+    this.on('undo', async () => this.forwardUndo([this.chatId], 'undo'));
+    this.on('redo', async () => this.forwardUndo([this.chatId], 'redo'));
+    this.on('getUndoState', async () => {
+      try {
+        return await this.request(request(this.id, this.chatId, 'getUndoState', {}), 5000);
+      } catch {
+        return { canUndo: false, canRedo: false };
+      }
     });
 
     // ── From the window ────────────────────────────────────────────────
@@ -748,6 +768,20 @@ export class ChatWindow extends Abject {
     await this.applyControls(transcript.controls);
     await this.applyActivity(transcript.activity);
     this.checkInvariants();
+  }
+
+  /** Clear the message log and draw the Chat's transcript again. */
+  private async redrawTranscript(): Promise<void> {
+    if (!this.windowId) return;
+    const transcript = await this.request<{ messages: ChatMessageView[] }>(
+      request(this.id, this.chatId, 'getTranscript', {}));
+    this.shownMessageIds.clear();
+    await this.clearMessageLabels();
+    if (transcript.messages.length === 0) {
+      await this.showWelcomeState();
+    } else {
+      for (const m of transcript.messages) await this.drawMessage(m);
+    }
   }
 
   private async closeWindow(): Promise<void> {

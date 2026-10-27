@@ -27,6 +27,7 @@ import type { ThemeData } from './theme-data.js';
 import type { DecisionOutcome, DecisionQuestion, DecisionState } from '../llm/decision.js';
 import type { DecisionMode } from './decision-sites.js';
 import { DEFAULT_THEME } from './theme-data.js';
+import type { UndoAction, UndoResult, UndoState } from './undo.js';
 
 const log = new Log('ABJECT');
 
@@ -677,6 +678,46 @@ export abstract class Abject {
       level,
       ...(durationMs !== undefined ? { durationMs } : {}),
     }));
+  }
+
+  /**
+   * Whose undo history a message's sender writes to: its durable typeId, so
+   * a window's history outlives its ephemeral id, else the id itself. An
+   * owner that offers undo (src/core/undo.ts) keeps one history per caller.
+   */
+  protected async undoCallerKey(callerId: AbjectId): Promise<string> {
+    return (await this.resolveCallerIdentity(callerId))?.typeId ?? callerId;
+  }
+
+  /**
+   * Undo or redo this object's own last change among the owners it changed:
+   * each is asked `getUndoState`, and the one whose step is newest (made
+   * last for undo, undone last for redo) is asked to act. The owner keeps
+   * the history; this object only names who to ask. Owners that are gone or
+   * offer no undo are skipped.
+   */
+  protected async forwardUndo(targets: Array<AbjectId | undefined>, action: UndoAction): Promise<UndoResult> {
+    const ids = [...new Set(targets.filter((t): t is AbjectId => !!t))];
+    const states = await Promise.all(ids.map(async (id) => {
+      try {
+        return { id, state: await this.request<UndoState>(request(this.id, id, 'getUndoState', {}), 5000) };
+      } catch {
+        return { id, state: undefined };
+      }
+    }));
+    let best: { id: AbjectId; at: number } | undefined;
+    for (const { id, state } of states) {
+      if (!state) continue;
+      const can = action === 'undo' ? state.canUndo : state.canRedo;
+      const at = (action === 'undo' ? state.undoAt : state.redoAt) ?? 0;
+      if (can && (!best || at > best.at)) best = { id, at };
+    }
+    if (!best) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    try {
+      return await this.request<UndoResult>(request(this.id, best.id, action, {}), 60_000);
+    } catch (err) {
+      return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /**

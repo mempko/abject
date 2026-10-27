@@ -21,9 +21,10 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require as precondition, requireNonEmpty, invariant } from '../core/contracts.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Sandbox } from '../core/sandbox.js';
 import { Log } from '../core/timed-log.js';
+import { UndoHistories, UndoRefused, UNDO_EVENTS, undoMethods, sameValue, type UndoAction, type UndoStep } from '../core/undo.js';
 
 const log = new Log('TriggerManager');
 
@@ -68,6 +69,24 @@ export interface TriggerRule {
   lastError?: string;
 }
 
+/**
+ * One undoable change to the rules, as the caller made it. A rule is kept
+ * whole so undo puts it back under its own id; firing stats are not part of
+ * what a step compares, since they change in the background.
+ */
+type RuleStep =
+  | { kind: 'add'; rule: TriggerRule }
+  | { kind: 'remove'; rule: TriggerRule }
+  | { kind: 'enabled'; ruleId: string; before: boolean; after: boolean };
+
+/** What a person defines about a rule (not its firing stats), for "changed since". */
+function ruleDefinition(rule: TriggerRule): unknown {
+  return {
+    name: rule.name, sourceName: rule.sourceName, aspect: rule.aspect, filter: rule.filter ?? null,
+    action: rule.action, enabled: rule.enabled,
+  };
+}
+
 export class TriggerManager extends Abject {
   private storageId?: AbjectId;
   private rules = new Map<string, TriggerRule>();
@@ -80,6 +99,8 @@ export class TriggerManager extends Abject {
   private sourceNamesById = new Map<AbjectId, string>();
   /** Resolved target cache; cleared per-name on send failure. */
   private targetIds = new Map<string, AbjectId>();
+  /** Each caller's rule changes, for undo (in memory: the rules are small). */
+  private undo = new UndoHistories<RuleStep>({ mergeMs: 0, maxSteps: 50 });
 
   constructor() {
     super({
@@ -143,8 +164,10 @@ export class TriggerManager extends Abject {
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
+            ...undoMethods('your last rule change: an added rule is removed, a removed rule comes back under its own id, an enable or disable is reversed'),
           ],
           events: [
+            ...UNDO_EVENTS,
             {
               name: 'triggerFired',
               description: 'A rule matched and its action was sent',
@@ -230,17 +253,16 @@ export class TriggerManager extends Abject {
       await this.persistToStorage();
       this.changed('triggerAdded', { triggerId: id, name: rule.name });
       log.info(`Added trigger "${rule.name}" -> ${id}`);
+      await this.recordStep(msg.routing.from, `Add rule ${rule.name}`, { kind: 'add', rule: structuredClone(rule) });
       return { triggerId: id };
     });
 
     this.on('removeTrigger', async (msg: AbjectMessage) => {
       const { triggerId } = msg.payload as { triggerId: string };
-      const deleted = this.rules.delete(triggerId);
-      this.dropExpressions(triggerId);
-      if (deleted) {
-        await this.persistToStorage();
-        this.changed('triggerRemoved', { triggerId });
-        log.info(`Removed trigger ${triggerId}`);
+      const rule = this.rules.get(triggerId);
+      const deleted = await this.dropRule(triggerId);
+      if (rule && deleted) {
+        await this.recordStep(msg.routing.from, `Delete rule ${rule.name}`, { kind: 'remove', rule: structuredClone(rule) });
       }
       return deleted;
     });
@@ -251,24 +273,18 @@ export class TriggerManager extends Abject {
 
     this.on('enableTrigger', async (msg: AbjectMessage) => {
       const { triggerId } = msg.payload as { triggerId: string };
-      const rule = this.rules.get(triggerId);
-      if (!rule) return false;
-      rule.enabled = true;
-      await this.subscribeSource(rule.sourceName);
-      await this.persistToStorage();
-      this.changed('triggerUpdated', { triggerId });
-      return true;
+      return this.setEnabledBy(msg.routing.from, triggerId, true);
     });
 
     this.on('disableTrigger', async (msg: AbjectMessage) => {
       const { triggerId } = msg.payload as { triggerId: string };
-      const rule = this.rules.get(triggerId);
-      if (!rule) return false;
-      rule.enabled = false;
-      await this.persistToStorage();
-      this.changed('triggerUpdated', { triggerId });
-      return true;
+      return this.setEnabledBy(msg.routing.from, triggerId, false);
     });
+
+    // Each caller undoes its own rule changes, newest first.
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg.routing.from, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg.routing.from, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) => this.undo.state(await this.undoCallerKey(msg.routing.from)));
 
     // Every source event arrives here: match against rules by sender + aspect.
     this.on('changed', async (msg: AbjectMessage) => {
@@ -302,6 +318,101 @@ export class TriggerManager extends Abject {
       if (recipient) this.dropStaleId(recipient);
       return true;
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Rule changes + undo
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Forget a rule and its compiled expressions; whether it existed. */
+  private async dropRule(triggerId: string): Promise<boolean> {
+    const deleted = this.rules.delete(triggerId);
+    this.dropExpressions(triggerId);
+    if (deleted) {
+      await this.persistToStorage();
+      this.changed('triggerRemoved', { triggerId });
+      log.info(`Removed trigger ${triggerId}`);
+    }
+    return deleted;
+  }
+
+  /** Put a rule back whole, under its own id. */
+  private async putRule(rule: TriggerRule): Promise<void> {
+    precondition(!this.rules.has(rule.id), `putRule: '${rule.id}' is taken`);
+    const restored = structuredClone(rule);
+    this.rules.set(restored.id, restored);
+    const n = Number(/^trig-(\d+)$/.exec(restored.id)?.[1] ?? 0);
+    if (n > this.ruleCounter) this.ruleCounter = n;
+    this.checkInvariants();
+    await this.subscribeSource(restored.sourceName);
+    await this.persistToStorage();
+    this.changed('triggerAdded', { triggerId: restored.id, name: restored.name });
+  }
+
+  private async setEnabled(rule: TriggerRule, enabled: boolean): Promise<void> {
+    rule.enabled = enabled;
+    if (enabled) await this.subscribeSource(rule.sourceName);
+    await this.persistToStorage();
+    this.changed('triggerUpdated', { triggerId: rule.id });
+  }
+
+  private async setEnabledBy(callerId: AbjectId, triggerId: string, enabled: boolean): Promise<boolean> {
+    const rule = this.rules.get(triggerId);
+    if (!rule) return false;
+    const before = rule.enabled;
+    await this.setEnabled(rule, enabled);
+    if (before !== enabled) {
+      await this.recordStep(callerId, `${enabled ? 'Enable' : 'Disable'} rule ${rule.name}`,
+        { kind: 'enabled', ruleId: rule.id, before, after: enabled });
+    }
+    return true;
+  }
+
+  private async recordStep(callerId: AbjectId, label: string, step: RuleStep): Promise<void> {
+    const caller = await this.undoCallerKey(callerId);
+    this.undo.for(caller).record(label, step);
+    this.send(event(this.id, callerId, 'undoStateChanged', this.undo.state(caller)));
+  }
+
+  private async undoFor(callerId: AbjectId, action: UndoAction): Promise<unknown> {
+    const caller = await this.undoCallerKey(callerId);
+    const history = this.undo.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](step => this.applyStep(step, action));
+    this.send(event(this.id, callerId, 'undoStateChanged', this.undo.state(caller)));
+    return result;
+  }
+
+  /**
+   * Take a rule change back (undo) or make it again (redo). A rule that
+   * changed since the step (renamed, toggled, removed or re-added by
+   * someone else) is left alone and the step refused.
+   */
+  private async applyStep(step: UndoStep<RuleStep>, action: UndoAction): Promise<unknown> {
+    const d = step.data;
+    if (d.kind === 'enabled') {
+      const rule = this.rules.get(d.ruleId);
+      if (!rule) throw new UndoRefused(`The rule was removed since`);
+      const [from, to] = action === 'undo' ? [d.after, d.before] : [d.before, d.after];
+      if (rule.enabled !== from) throw new UndoRefused(`'${rule.name}' was ${rule.enabled ? 'enabled' : 'disabled'} again since`);
+      await this.setEnabled(rule, to);
+      return { triggerId: rule.id };
+    }
+    // Adding undone and removing redone both take the rule away; the other
+    // two put it back.
+    const takeAway = (d.kind === 'add') === (action === 'undo');
+    const current = this.rules.get(d.rule.id);
+    if (takeAway) {
+      if (!current) throw new UndoRefused(`'${d.rule.name}' is gone already`);
+      if (!sameValue(ruleDefinition(current), ruleDefinition(d.rule))) throw new UndoRefused(`'${d.rule.name}' changed since`);
+      // Keep its stats as they are now, for when it comes back.
+      d.rule = structuredClone(current);
+      await this.dropRule(current.id);
+    } else {
+      if (current) throw new UndoRefused(`'${d.rule.name}' is back already`);
+      await this.putRule(d.rule);
+    }
+    return { triggerId: d.rule.id };
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -583,12 +694,15 @@ A rule reads: when \`sourceName\` emits \`aspect\` (and \`filter\` passes), send
   await call(await dep('TriggerManager'), 'disableTrigger', { triggerId: 'trig-1' });
   await call(await dep('TriggerManager'), 'enableTrigger', { triggerId: 'trig-1' });
   await call(await dep('TriggerManager'), 'removeTrigger', { triggerId: 'trig-1' });
+  await call(await dep('TriggerManager'), 'undo', {});  // takes back your last add, remove, enable or disable
+  await call(await dep('TriggerManager'), 'redo', {});
 
 ### Semantics
 - Sources and targets are registered object NAMES. Rules survive object respawns: ids are re-resolved automatically.
 - A rule whose source does not exist yet stays dormant and attaches when the object registers.
 - \`filter\` and \`payloadTemplate\` are synchronous JS expressions evaluated in a sandbox with \`aspect\` (string) and \`value\` (a copy of the event payload) in scope. A throwing filter counts as no match; a throwing template records lastError. Each evaluation may run for 250 ms.
 - Rules persist to Storage and reload on startup.
+- \`undo\` and \`redo\` act on your own rule changes for this session; a removed rule comes back under its own id. A rule changed since is left alone and the undo answers { ok: false, reason }.
 - Emits \`triggerFired\` and \`triggerFailed\` events; subscribe with addDependent to observe rule activity.`;
   }
 

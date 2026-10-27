@@ -8,16 +8,22 @@
  * A conversation can be opened without a window (`openConversation`, what a
  * terminal does) or shown in one (`showConversation`, on a desktop). Chat is
  * the conversation either way; its window is a separate view it spawns.
+ *
+ * Deleting a conversation sets it aside: its roster row, transcript and
+ * active-goal marker are kept on disk for the session and three days, and
+ * its cards folder is set aside by AbjectStore. `undo` (from whoever deleted
+ * it) puts all of it back; the Chat itself respawns when next opened.
  */
 
 import { v4 as uuidv4 } from 'uuid';
 import { AbjectId, AbjectMessage, InterfaceId, TypeId, SpawnResult } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { captureConversation, type ContextMessage } from '../core/conversation-context.js';
 import { describeMessages, protocolText } from '../core/protocol-description.js';
 import { Log } from '../core/timed-log.js';
-import { invariant } from '../core/contracts.js';
+import { invariant, require as precondition } from '../core/contracts.js';
+import { UndoHistories, UndoRefused, UNDO_EVENTS, undoMethods, type UndoAction, type UndoHistoryJSON, type UndoState, type UndoStep } from '../core/undo.js';
 
 const log = new Log('ChatManager');
 
@@ -25,6 +31,15 @@ const CHAT_MANAGER_INTERFACE: InterfaceId = 'abjects:chat-manager';
 
 const ROSTER_KEY = 'chats:roster';
 const DEFAULT_TITLE = 'New chat';
+const historyKey = (conversationId: string) => `chats:history:${conversationId}`;
+const activeGoalKey = (conversationId: string) => `chats:activegoal:${conversationId}`;
+/** The AbjectStore folder a conversation's cards live in. */
+const cardsFolder = (conversationId: string) => `chats/${conversationId.toLowerCase()}`;
+/** Deleted conversations, kept a while so undo can bring them back. */
+const TRASH_INDEX_KEY = 'chats:trash-index';
+const trashKey = (id: string) => `chats:trash:${id}`;
+/** Each caller's deletions, kept on disk with the trash they point into. */
+const UNDO_KEY = 'chats:undo';
 
 interface Rect { x: number; y: number; width: number; height: number }
 
@@ -40,6 +55,33 @@ export interface PersistedConversation {
 interface ConversationRuntime extends PersistedConversation {
   chatId?: AbjectId;
 }
+
+/** A deleted conversation, as the trash index lists it. */
+interface ChatTrashItem {
+  id: string;
+  conversationId: string;
+  title: string;
+  removedAt: number;
+  bytes: number;
+}
+
+/** What a deleted conversation leaves behind, kept whole for undo. */
+interface ChatTrashRecord {
+  conversation: PersistedConversation;
+  history?: unknown[];
+  activeGoal?: string;
+  /** AbjectStore trash ids of its cards, set aside with the folder. */
+  cards?: string[];
+}
+
+/**
+ * One undoable change to the roster. A deletion points into the trash while
+ * it is done (`trashId`) and loses the pointer once undone; renames stay in
+ * memory.
+ */
+type ChatStep =
+  | { kind: 'delete'; conversationId: string; trashId?: string }
+  | { kind: 'rename'; conversationId: string; before: string; after: string };
 
 export class ChatManager extends Abject {
   private registryId?: AbjectId;
@@ -61,6 +103,16 @@ export class ChatManager extends Abject {
   private lastGoalActivity?: boolean;
 
   private persistTimer?: ReturnType<typeof setTimeout>;
+
+  /** Deleted conversations kept for undo, by trash id. */
+  private trash: Map<string, ChatTrashItem> = new Map();
+  /** Each caller's undoable roster changes (by its durable typeId). */
+  private undo = new UndoHistories<ChatStep>({ mergeMs: 0, maxSteps: 50 });
+  private undoPersistTimer?: ReturnType<typeof setTimeout>;
+  private readonly sessionStartedAt = Date.now();
+  static readonly TRASH_KEEP_MS = 3 * 24 * 60 * 60_000;
+  private static readonly TRASH_MAX_ITEMS = 50;
+  private static readonly TRASH_MAX_BYTES = 32 * 1024 * 1024;
 
   constructor() {
     super({
@@ -149,7 +201,7 @@ export class ChatManager extends Abject {
             },
             {
               name: 'deleteConversation',
-              description: 'Remove a conversation, close its window, and delete its persisted history.',
+              description: 'Remove a conversation, close its window, and set its history and cards aside. `undo` (from whoever deleted it) brings it back within the session and three days; a goal it started keeps running either way.',
               parameters: [
                 { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Conversation id' },
               ],
@@ -157,15 +209,17 @@ export class ChatManager extends Abject {
             },
             {
               name: 'renameConversation',
-              description: 'Update the title of a conversation.',
+              description: 'Update the title of a conversation. `undo` from the same caller puts the old title back.',
               parameters: [
                 { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Conversation id' },
                 { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'New title' },
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
+            ...undoMethods('your last deletion or rename of a conversation'),
           ],
           events: [
+            ...UNDO_EVENTS,
             {
               name: 'conversationCreated',
               description: 'Fires when a new conversation is added to the roster.',
@@ -221,6 +275,7 @@ export class ChatManager extends Abject {
     await this.ensurePeerId();
     await this.ensureWorkspaceId();
     await this.loadRoster();
+    await this.loadTrash();
 
     // Lazy rehydration: we do NOT spawn a Chat Abject for every saved
     // conversation at boot. Each conversation's Chat is spawned on demand when
@@ -235,6 +290,20 @@ export class ChatManager extends Abject {
     super.checkInvariants();
     for (const c of this.conversations.values()) {
       invariant(typeof c.conversationId === 'string' && c.conversationId.length > 0, 'ChatManager: a conversation without an id');
+    }
+    for (const t of this.trash.values()) {
+      invariant(!this.conversations.has(t.conversationId), 'ChatManager: a conversation both on the roster and in the trash');
+    }
+  }
+
+  protected override async onStop(): Promise<void> {
+    // Undo histories are written on a short debounce; write the last one now.
+    if (this.undoPersistTimer && this.storageId) {
+      clearTimeout(this.undoPersistTimer);
+      this.undoPersistTimer = undefined;
+      try {
+        this.send(request(this.id, this.storageId, 'set', { key: UNDO_KEY, value: this.savedUndo() }));
+      } catch { /* storage gone */ }
     }
   }
 
@@ -326,13 +395,28 @@ export class ChatManager extends Abject {
 
     this.on('deleteConversation', async (msg: AbjectMessage) => {
       const { conversationId } = msg.payload as { conversationId: string };
-      return this.removeConversation(conversationId);
+      const c = this.conversations.get(conversationId);
+      if (!c) return false;
+      const title = c.title;
+      const trashId = await this.removeConversation(conversationId);
+      await this.recordStep(msg.routing.from, `Delete chat ${title}`, { kind: 'delete', conversationId, trashId });
+      return true;
     });
 
     this.on('renameConversation', async (msg: AbjectMessage) => {
       const { conversationId, title } = msg.payload as { conversationId: string; title: string };
-      return this.applyRename(conversationId, title, /* fromChat */ false);
+      const before = this.conversations.get(conversationId)?.title;
+      const renamed = await this.applyRename(conversationId, title, /* fromChat */ false);
+      const after = this.conversations.get(conversationId)?.title;
+      if (renamed && before !== undefined && after !== undefined) {
+        await this.recordStep(msg.routing.from, 'Rename chat', { kind: 'rename', conversationId, before, after });
+      }
+      return renamed;
     });
+
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg.routing.from, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg.routing.from, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) => this.undo.state(await this.undoCallerKey(msg.routing.from)));
 
     // Events from child Chat Abjects
     this.on('titleChanged', async (msg: AbjectMessage) => {
@@ -443,14 +527,7 @@ export class ChatManager extends Abject {
 
   private async persistRoster(): Promise<void> {
     if (!this.storageId) return;
-    const rows: PersistedConversation[] = Array.from(this.conversations.values()).map(c => ({
-      conversationId: c.conversationId,
-      typeId: c.typeId,
-      title: c.title,
-      rect: c.rect,
-      createdAt: c.createdAt,
-      lastActiveAt: c.lastActiveAt,
-    }));
+    const rows: PersistedConversation[] = Array.from(this.conversations.values()).map(c => this.persisted(c));
     try {
       await this.request(request(this.id, this.storageId, 'set', {
         key: ROSTER_KEY, value: rows,
@@ -568,45 +645,147 @@ export class ChatManager extends Abject {
     this.changed('goalActivity', { active });
   }
 
-  private async removeConversation(conversationId: string): Promise<boolean> {
+  /**
+   * Delete a conversation: its Chat stops, and its transcript, active-goal
+   * marker, roster row and cards are set aside. Returns the trash id that
+   * undo brings it back from. A goal it started is left running.
+   */
+  private async removeConversation(conversationId: string): Promise<string> {
     const c = this.conversations.get(conversationId);
-    if (!c) return false;
+    precondition(c !== undefined, `removeConversation: no conversation '${conversationId}'`);
 
     // Hide the Chat window, then kill the Abject
-    if (c.chatId) {
-      try { await this.request(request(this.id, c.chatId, 'hide', {}), 3000); } catch { /* best effort */ }
+    if (c!.chatId) {
+      try { await this.request(request(this.id, c!.chatId, 'hide', {}), 3000); } catch { /* best effort */ }
       if (this.factoryId) {
-        try { await this.request(request(this.id, this.factoryId, 'kill', { objectId: c.chatId }), 3000); } catch { /* best effort */ }
+        try { await this.request(request(this.id, this.factoryId, 'kill', { objectId: c!.chatId }), 3000); } catch { /* best effort */ }
       }
     }
+
+    // What the conversation said, and the goal it was following, kept for undo.
+    const history = await this.storageGet(historyKey(conversationId));
+    const activeGoal = await this.storageGet(activeGoalKey(conversationId));
+
+    // The conversation's cards are objects in its folder; they go with it,
+    // set aside by AbjectStore.
+    const cards = await this.removeCards(conversationId);
+
+    const trashId = await this.setAside({
+      conversation: this.persisted(c!),
+      ...(Array.isArray(history) ? { history } : {}),
+      ...(typeof activeGoal === 'string' && activeGoal ? { activeGoal } : {}),
+      ...(cards.length > 0 ? { cards } : {}),
+    });
 
     // Delete persisted history and any reconnect marker
     if (this.storageId) {
       try {
-        await this.request(request(this.id, this.storageId, 'delete', { key: `chats:history:${conversationId}` }));
+        await this.request(request(this.id, this.storageId, 'delete', { key: historyKey(conversationId) }));
       } catch { /* best effort */ }
       try {
-        await this.request(request(this.id, this.storageId, 'delete', { key: `chats:activegoal:${conversationId}` }));
+        await this.request(request(this.id, this.storageId, 'delete', { key: activeGoalKey(conversationId) }));
       } catch { /* best effort */ }
     }
 
-    // The conversation's cards are objects in its folder; they go with it.
-    const storeId = await this.discoverDep('AbjectStore');
-    if (storeId) {
-      try {
-        await this.request(request(this.id, storeId, 'removeFolder', { folder: `chats/${conversationId.toLowerCase()}` }), 30_000);
-      } catch { /* best effort */ }
-    }
-
-    if (c.chatId) {
-      this.busyChats.delete(c.chatId);
+    if (c!.chatId) {
+      this.busyChats.delete(c!.chatId);
       this.emitGoalActivity();
     }
     this.conversations.delete(conversationId);
     await this.persistRoster();
     this.changed('conversationDeleted', { conversationId });
     this.changed('rosterChanged', {});
-    return true;
+    return trashId;
+  }
+
+  /** Remove a conversation's cards folder; the AbjectStore trash ids of what it set aside. */
+  private async removeCards(conversationId: string): Promise<string[]> {
+    const storeId = await this.discoverDep('AbjectStore');
+    if (!storeId) return [];
+    const folder = cardsFolder(conversationId);
+    const startedAt = Date.now();
+    let typeIds: string[] = [];
+    try {
+      const listed = await this.request<Array<{ typeId: string }>>(request(this.id, storeId, 'list', { folder }), 10_000);
+      typeIds = listed.map(e => e.typeId);
+    } catch { /* best effort */ }
+    if (typeIds.length === 0) return [];
+    let removed = 0;
+    try {
+      const result = await this.request<{ removed?: number }>(request(this.id, storeId, 'removeFolder', { folder }), 30_000);
+      removed = result?.removed ?? 0;
+    } catch { /* best effort */ }
+    if (removed === 0) return [];
+    try {
+      const kept = await this.request<Array<{ id: string; typeId: string; removedAt: number }>>(
+        request(this.id, storeId, 'listRemoved', {}), 10_000);
+      return kept.filter(k => typeIds.includes(k.typeId) && k.removedAt >= startedAt).map(k => k.id);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Bring a conversation's cards back. AbjectStore's own undo when its next
+   * step for us is this folder's removal (it keeps AbjectStore's history in
+   * step); otherwise each set-aside card by its trash id, so deletions undone
+   * out of order still find their cards.
+   */
+  private async restoreCards(conversationId: string, cards: string[] | undefined): Promise<void> {
+    if (!cards || cards.length === 0) return;
+    const storeId = await this.discoverDep('AbjectStore');
+    if (!storeId) return;
+    try {
+      const state = await this.request<UndoState>(request(this.id, storeId, 'getUndoState', {}), 5000);
+      if (state.canUndo && state.undoLabel === `Delete folder ${cardsFolder(conversationId)}`) {
+        const undone = await this.request<{ ok: boolean }>(request(this.id, storeId, 'undo', {}), 60_000);
+        if (undone?.ok) return;
+      }
+    } catch { /* fall back to the trash ids */ }
+    for (const id of cards) {
+      try {
+        await this.request(request(this.id, storeId, 'restoreRemoved', { id }), 30_000);
+      } catch (err) {
+        log.warn(`Could not bring back a card of ${conversationId.slice(0, 8)}: ${String(err)}`);
+      }
+    }
+  }
+
+  /** Put a deleted conversation back from the trash: transcript, goal marker, cards, roster row. */
+  private async restoreConversation(trashId: string, conversationId: string): Promise<void> {
+    if (this.conversations.has(conversationId)) throw new UndoRefused('That chat is back already');
+    const item = this.trash.get(trashId);
+    if (!item) throw new UndoRefused('The deleted chat is no longer kept');
+    const record = await this.storageGet(trashKey(trashId)) as ChatTrashRecord | null;
+    if (!record?.conversation?.conversationId) {
+      this.trash.delete(trashId);
+      await this.persistTrashIndex();
+      throw new UndoRefused(`'${item.title}' is no longer kept`);
+    }
+    if (record.history) await this.storageSet(historyKey(conversationId), record.history);
+    if (record.activeGoal) await this.storageSet(activeGoalKey(conversationId), record.activeGoal);
+    await this.restoreCards(conversationId, record.cards);
+
+    // Back on the roster without a Chat: it respawns when next opened.
+    this.conversations.set(conversationId, { ...record.conversation });
+    await this.persistRoster();
+    this.trash.delete(trashId);
+    await this.persistTrashIndex();
+    await this.storageDelete(trashKey(trashId));
+    this.changed('conversationCreated', { conversationId, title: record.conversation.title });
+    this.changed('rosterChanged', {});
+    this.checkInvariants();
+  }
+
+  private persisted(c: ConversationRuntime): PersistedConversation {
+    return {
+      conversationId: c.conversationId,
+      typeId: c.typeId,
+      title: c.title,
+      rect: c.rect,
+      createdAt: c.createdAt,
+      lastActiveAt: c.lastActiveAt,
+    };
   }
 
   private async applyRename(conversationId: string, title: string, fromChat: boolean): Promise<boolean> {
@@ -626,6 +805,167 @@ export class ChatManager extends Abject {
     this.changed('conversationRenamed', { conversationId, title: trimmed });
     this.changed('rosterChanged', {});
     return true;
+  }
+
+  // ─── Deleted conversations, kept for undo ──────────────────────────
+
+  /**
+   * Keep a deleted conversation's record under a new trash id, for the
+   * session and at least TRASH_KEEP_MS, within the count and size limits.
+   */
+  private async setAside(record: ChatTrashRecord): Promise<string> {
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const bytes = JSON.stringify(record).length;
+    await this.storageSet(trashKey(id), record);
+    this.trash.set(id, {
+      id,
+      conversationId: record.conversation.conversationId,
+      title: record.conversation.title,
+      removedAt: Date.now(),
+      bytes,
+    });
+    await this.persistTrashIndex();
+    await this.purgeTrash();
+    return id;
+  }
+
+  private async loadTrash(): Promise<void> {
+    if (!this.storageId) return;
+    const index = await this.storageGet(TRASH_INDEX_KEY);
+    if (Array.isArray(index)) {
+      for (const item of index as ChatTrashItem[]) {
+        // A conversation on the roster is not also deleted (a crash between writes).
+        if (item?.id && item.conversationId && !this.conversations.has(item.conversationId)) this.trash.set(item.id, item);
+      }
+    }
+    this.undo.load(await this.storageGet(UNDO_KEY) as Record<string, UndoHistoryJSON<ChatStep>> | null);
+    await this.purgeTrash();
+  }
+
+  private async persistTrashIndex(): Promise<void> {
+    await this.storageSet(TRASH_INDEX_KEY, [...this.trash.values()]);
+  }
+
+  /**
+   * Forget deleted conversations past keeping: deleted before this session
+   * and longer ago than TRASH_KEEP_MS, or beyond the count and size limits
+   * (oldest first). Undo steps that pointed at them go too.
+   */
+  private async purgeTrash(): Promise<void> {
+    const now = Date.now();
+    const items = [...this.trash.values()].sort((a, b) => a.removedAt - b.removedAt);
+    const expired = new Set(items
+      .filter(t => t.removedAt < this.sessionStartedAt && now - t.removedAt > ChatManager.TRASH_KEEP_MS)
+      .map(t => t.id));
+    let count = items.length - expired.size;
+    let bytes = items.filter(t => !expired.has(t.id)).reduce((n, t) => n + t.bytes, 0);
+    for (const t of items) {
+      if (expired.has(t.id)) continue;
+      if (count <= ChatManager.TRASH_MAX_ITEMS && bytes <= ChatManager.TRASH_MAX_BYTES) break;
+      expired.add(t.id);
+      count--;
+      bytes -= t.bytes;
+    }
+    if (expired.size > 0) {
+      for (const id of expired) {
+        this.trash.delete(id);
+        await this.storageDelete(trashKey(id));
+      }
+      await this.persistTrashIndex();
+      log.info(`Forgot ${expired.size} deleted conversation(s) past keeping`);
+    }
+    const before = this.undo.steps().length;
+    this.undo.prune(step => this.stepStillApplies(step));
+    if (this.undo.steps().length !== before) this.scheduleUndoPersist();
+  }
+
+  /** Whether what a step acts on is still there (kept in the trash, or on the roster). */
+  private stepStillApplies(step: UndoStep<ChatStep>): boolean {
+    const d = step.data;
+    if (d.kind === 'delete' && d.trashId) return this.trash.has(d.trashId);
+    return this.conversations.has(d.conversationId);
+  }
+
+  // ─── Undo ──────────────────────────────────────────────────────────
+
+  private async recordStep(callerId: AbjectId, label: string, step: ChatStep): Promise<void> {
+    const caller = await this.undoCallerKey(callerId);
+    this.undo.for(caller).record(label, step);
+    if (step.kind === 'delete') this.scheduleUndoPersist();
+    this.send(event(this.id, callerId, 'undoStateChanged', this.undo.state(caller)));
+  }
+
+  private async undoFor(callerId: AbjectId, action: UndoAction): Promise<unknown> {
+    const caller = await this.undoCallerKey(callerId);
+    const history = this.undo.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](step => this.applyStep(step, action));
+    this.scheduleUndoPersist();
+    this.send(event(this.id, callerId, 'undoStateChanged', this.undo.state(caller)));
+    return result;
+  }
+
+  /** Take a step back (undo) or forward again (redo). */
+  private async applyStep(step: UndoStep<ChatStep>, action: UndoAction): Promise<void> {
+    const d = step.data;
+    if (d.kind === 'delete') {
+      if (action === 'undo') {
+        if (!d.trashId) throw new UndoRefused('The deleted chat is no longer kept');
+        await this.restoreConversation(d.trashId, d.conversationId);
+        delete d.trashId;
+      } else {
+        if (!this.conversations.has(d.conversationId)) throw new UndoRefused('That chat is gone already');
+        d.trashId = await this.removeConversation(d.conversationId);
+      }
+      return;
+    }
+    const c = this.conversations.get(d.conversationId);
+    if (!c) throw new UndoRefused('That chat is gone');
+    const [expect, next] = action === 'undo' ? [d.after, d.before] : [d.before, d.after];
+    if (c.title !== expect) throw new UndoRefused(`The chat was renamed since ('${c.title}')`);
+    await this.applyRename(d.conversationId, next, /* fromChat */ false);
+  }
+
+  /** Each caller's deletions, the part of the histories kept on disk (renames stay in memory). */
+  private savedUndo(): Record<string, UndoHistoryJSON<ChatStep>> {
+    const out: Record<string, UndoHistoryJSON<ChatStep>> = {};
+    for (const [caller, saved] of Object.entries(this.undo.toJSON())) {
+      const done = saved.done.filter(s => s.data.kind === 'delete');
+      const undone = saved.undone.filter(s => s.data.kind === 'delete');
+      if (done.length + undone.length > 0) out[caller] = { done, undone };
+    }
+    return out;
+  }
+
+  private scheduleUndoPersist(): void {
+    if (this.undoPersistTimer || !this.storageId) return;
+    this.undoPersistTimer = setTimeout(() => {
+      this.undoPersistTimer = undefined;
+      void this.storageSet(UNDO_KEY, this.savedUndo()).catch(err => log.warn(`Undo history persistence failed: ${String(err)}`));
+    }, 250);
+  }
+
+  // ─── Storage helpers ───────────────────────────────────────────────
+
+  private async storageGet(key: string): Promise<unknown> {
+    if (!this.storageId) return null;
+    try {
+      return await this.request<unknown>(request(this.id, this.storageId, 'get', { key }));
+    } catch {
+      return null;
+    }
+  }
+
+  private async storageSet(key: string, value: unknown): Promise<void> {
+    if (!this.storageId) return;
+    await this.request(request(this.id, this.storageId, 'set', { key, value }));
+  }
+
+  private async storageDelete(key: string): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      await this.request(request(this.id, this.storageId, 'delete', { key }));
+    } catch { /* best effort */ }
   }
 
   private latestConversation(): ConversationRuntime | undefined {

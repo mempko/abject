@@ -29,6 +29,7 @@ import {
   PopoutSurface, TOOLTIP_NODE_ID, TOOLTIP_DELAY_MS, cachedScreenSize, showTooltip,
 } from './popout.js';
 import { isScreenAnchor, type ScreenAnchor } from '../../ui/gl/scene-types.js';
+import { undoKeyAction } from '../../core/undo.js';
 
 /** The four title-bar buttons, as WindowManager names them. */
 type TitleButtonKind = 'close' | 'minimize' | 'maximize' | 'help';
@@ -1686,7 +1687,14 @@ by re-matching title/owner.
     code?: string;
     modifiers?: { shift: boolean; ctrl: boolean; alt: boolean; meta: boolean };
   }): Promise<void> {
-    if (!this.focusedChildId) return;
+    // Undo and redo that no widget took (a text field takes them only while
+    // it has typing to take back) go to the window's owner: WidgetManager
+    // forwards undoRequested / redoRequested to it.
+    const undoAction = undoKeyAction(e.key, e.modifiers);
+    if (!this.focusedChildId) {
+      if (undoAction) this.changed(undoAction === 'undo' ? 'undoRequested' : 'redoRequested', {});
+      return;
+    }
 
     try {
       const result = await this.request<{ consumed: boolean }>(
@@ -1697,7 +1705,9 @@ by re-matching title/owner.
 
       // Event bubbling — if child didn't consume, Window handles
       if (!result.consumed) {
-        if (e.key === 'Tab') {
+        if (undoAction) {
+          this.changed(undoAction === 'undo' ? 'undoRequested' : 'redoRequested', {});
+        } else if (e.key === 'Tab') {
           await this.focusNextWidget();
         } else if (e.key === 'Escape' && this.chromeless) {
           // Chromeless windows are used for modals/popups (palette, switcher,

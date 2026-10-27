@@ -21,6 +21,7 @@ import {
   type EntryType,
 } from './widgets/handler-parser.js';
 import { sectionHeaderStyle, sectionHeaderText } from './ui-kit.js';
+import { undoMethods, type UndoAction, type UndoResult } from '../core/undo.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { IconName } from '../ui/icons.js';
 
@@ -104,6 +105,7 @@ export class AbjectEditor extends Abject {
               parameters: [],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
+            ...undoMethods('your last saved source change made in this editor (AbjectStore keeps the step; the editor then shows the source as it is)'),
           ],
         },
         tags: ['system', 'ui'],
@@ -131,6 +133,19 @@ export class AbjectEditor extends Abject {
     });
 
     this.on('windowCloseRequested', async () => { await this.hide(); });
+
+    // A Save is kept by AbjectStore as a source step for this editor; the
+    // text field's own typing undo is used up before a key reaches here.
+    this.on('undo', async () => this.undoThroughStore('undo'));
+    this.on('redo', async () => this.undoThroughStore('redo'));
+    this.on('getUndoState', async () => {
+      if (!this.abjectStoreId) return { canUndo: false, canRedo: false };
+      try {
+        return await this.request(request(this.id, this.abjectStoreId, 'getUndoState', {}), 5000);
+      } catch {
+        return { canUndo: false, canRedo: false };
+      }
+    });
 
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
@@ -775,6 +790,23 @@ export class AbjectEditor extends Abject {
     }
   }
 
+  // ── Undo ──────────────────────────────────────────────────────────────
+
+  /** Undo or redo this editor's last saved source change, then show the live source. */
+  private async undoThroughStore(action: UndoAction): Promise<UndoResult> {
+    if (!this.abjectStoreId) this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
+    const result = await this.forwardUndo([this.abjectStoreId], action);
+    if (result.ok && this.windowId && this.editingObjectId) {
+      const reopenHistory = this.historyVisible;
+      if (reopenHistory) await this.closeHistory();
+      await this.loadCurrentSource();
+      // The source switched back is now the newest version in the history.
+      if (reopenHistory) await this.openHistory();
+      await this.updateStatus(`${action === 'undo' ? 'Undid' : 'Redid'} ${result.label ?? 'the last save'}`, this.theme.statusNeutral);
+    }
+    return result;
+  }
+
   // ── Apply / Save ──────────────────────────────────────────────────────
 
   private async handleApply(persist: boolean): Promise<void> {
@@ -813,15 +845,18 @@ export class AbjectEditor extends Abject {
         if (persist && this.abjectStoreId) {
           try {
             // Get manifest and owner from registry
-            const reg = await this.request<{ manifest: unknown; owner?: string } | null>(
+            const reg = await this.request<{ manifest: { name?: string }; owner?: string } | null>(
               request(this.id, this.registryId!, 'lookup', { objectId: this.editingObjectId })
             );
             if (reg) {
+              // The label keeps a changed source in this editor's undo
+              // history at the store (Ctrl+Z switches it back).
               await this.request(request(this.id, this.abjectStoreId, 'save', {
                 objectId: this.editingObjectId,
                 manifest: reg.manifest,
                 source,
                 owner: reg.owner ?? this.id,
+                undo: `Edit ${reg.manifest?.name || 'object'} source`,
               }));
             }
           } catch { /* persist not critical for apply */ }

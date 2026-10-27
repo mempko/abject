@@ -24,6 +24,7 @@ import { request } from '../core/message.js';
 import { isHostLocalObject } from './host-local-objects.js';
 import { Log } from '../core/timed-log.js';
 import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
+import { undoMethods, type UndoAction, type UndoResult } from '../core/undo.js';
 
 /** Filled destructive button style from the theme's destructive slots. */
 function destructiveFillStyle(theme: ThemeData): { background: string; color: string; borderColor: string } {
@@ -242,6 +243,7 @@ export class AppExplorer extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              ...undoMethods('your last delete, move, retag, loading change or copy made in this explorer (AbjectStore keeps the steps)'),
             ],
           },
         tags: ['system', 'ui'],
@@ -612,6 +614,20 @@ export class AppExplorer extends Abject {
 
     this.on('getState', async () => {
       return { visible: !!this.windowId };
+    });
+
+    // The kept objects' history lives in AbjectStore, keyed to this explorer:
+    // it removed, placed and copied them, so it asks for the step back.
+    this.on('undo', async () => this.undoThroughStore('undo'));
+    this.on('redo', async () => this.undoThroughStore('redo'));
+    this.on('getUndoState', async () => {
+      const storeId = await this.discoverDep('AbjectStore');
+      if (!storeId) return { canUndo: false, canRedo: false };
+      try {
+        return await this.request(request(this.id, storeId, 'getUndoState', {}), 5000);
+      } catch {
+        return { canUndo: false, canRedo: false };
+      }
     });
 
     this.on('browseRemote', async (msg: AbjectMessage) => {
@@ -1442,9 +1458,20 @@ export class AppExplorer extends Abject {
     }
   }
 
+  /** Undo or redo this explorer's last change to the kept objects, then show the lists as they are now. */
+  private async undoThroughStore(action: UndoAction): Promise<UndoResult> {
+    const storeId = await this.discoverDep('AbjectStore');
+    const result = await this.forwardUndo([storeId ?? undefined], action);
+    if (result.ok) await this.refreshLists();
+    return result;
+  }
+
   private async deleteObject(objectId: AbjectId): Promise<void> {
     if (!this.factoryId) return;
 
+    // A kept object is set aside, not destroyed: AbjectStore records the
+    // removal for this explorer (the Factory credits a kill to its asker).
+    const keptName = this.kept.get(objectId)?.name;
     let ok = true;
     try {
       if (this.asleepIds.has(objectId)) {
@@ -1459,9 +1486,18 @@ export class AppExplorer extends Abject {
       ok = false; /* object may already be gone */
     }
     if (!ok) this.windowEffect('shake');
-    await this.notify(ok ? 'Object deleted' : 'Delete failed', ok ? 'success' : 'error');
+    const done = keptName ? `Deleted ${keptName}. Ctrl+Z to undo` : 'Object deleted';
+    await this.notify(ok ? done : 'Delete failed', ok ? 'success' : 'error');
+    await this.refreshLists();
+  }
 
+  /**
+   * Re-read the objects and rebuild the lists, letting go of a selected kind
+   * that has no instances left.
+   */
+  private async refreshLists(): Promise<void> {
     this.cachedObjects = await this.objectsWithKept();
+    if (!this.windowId) return;
 
     if (this.selectedKindName) {
       // Mirrors rebuildInstanceList's predicate so "is this kind now empty?"

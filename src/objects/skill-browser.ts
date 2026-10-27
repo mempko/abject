@@ -2,12 +2,15 @@
  * SkillBrowser -- UI for managing installed skills.
  *
  * Two-pane layout: skill list (left) + detail (right scrollable).
- * Follows the ObjectBrowser widget pattern.
+ * Follows the ObjectBrowser widget pattern. SkillRegistry keeps the undo
+ * history of what is done here (this window is the caller); Ctrl+Z forwards.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
+import { undoMethods } from '../core/undo.js';
+import type { UndoAction, UndoState } from '../core/undo.js';
 import type { SkillInfo, SkillConfig } from '../core/skill-types.js';
 import { Log } from '../core/timed-log.js';
 import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
@@ -75,6 +78,7 @@ export class SkillBrowser extends Abject {
               parameters: [],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
+            ...undoMethods('the last uninstall, enable or disable made in this window'),
           ],
         },
         tags: ['system', 'ui', 'skill'],
@@ -109,7 +113,7 @@ pane shows details, configuration, and actions for the selected skill.
 
 - Click a skill in the list to view its details (name, source, version, description, status).
 - Click "Enable" / "Disable" to toggle the skill.
-- Click "Uninstall" to remove a skill from disk.
+- Click "Uninstall" to remove a skill (its folder is kept a few days; Ctrl+Z in the window brings it back).
 - Click "Scan Skills" to re-scan the skills directory for new SKILL.md files.
 - Configure environment variables for a skill and click "Save Config".
 - Click "Add Variable" to add custom environment variables.
@@ -238,6 +242,7 @@ pane shows details, configuration, and actions for the selected skill.
             await this.request(request(this.id, this.skillRegistryId, 'disableSkill', { name: skill.name }));
           } else if (action === 'uninstall') {
             await this.request(request(this.id, this.skillRegistryId, 'uninstallSkill', { name: skill.name }));
+            await this.notify(`Uninstalled ${skill.name}. Ctrl+Z to undo`, 'success');
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -252,6 +257,23 @@ pane shows details, configuration, and actions for the selected skill.
     this.on('windowCloseRequested', async () => {
       await this.hideWindow();
     });
+
+    this.on('undo', async () => this.undoRedo('undo'));
+    this.on('redo', async () => this.undoRedo('redo'));
+    this.on('getUndoState', async (): Promise<UndoState> => {
+      if (!this.skillRegistryId) return { canUndo: false, canRedo: false };
+      return this.request<UndoState>(request(this.id, this.skillRegistryId, 'getUndoState', {}));
+    });
+  }
+
+  /** Undo or redo this window's last change in SkillRegistry, then show the result. */
+  private async undoRedo(action: UndoAction): Promise<unknown> {
+    const result = await this.forwardUndo([this.skillRegistryId], action);
+    if (result.ok && this.windowId) {
+      await this.refreshSkillList();
+      await this.rebuildDetailPane();
+    }
+    return result;
   }
 
   // ─── Window lifecycle ───────────────────────────────────────────
@@ -670,7 +692,7 @@ pane shows details, configuration, and actions for the selected skill.
 
     // ── Danger zone: uninstalling removes the skill from disk ──
     const danger = await this.addSection('Danger zone',
-      'Uninstalling removes this skill and its files from disk.');
+      'Uninstalling removes this skill and its files. They are kept for a few days: Ctrl+Z brings them back.');
     await this.addDetailButton('Uninstall', 'uninstall', {
       background: this.theme.destructiveBg,
       color: this.theme.destructiveText,

@@ -21,6 +21,7 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
+import { undoMethods } from '../core/undo.js';
 import type { ThemeData } from '../core/theme-data.js';
 
 const SIDEBAR_INTERFACE: InterfaceId = 'abjects:sidebar';
@@ -49,6 +50,8 @@ export class Sidebar extends Abject {
 
   /** Horizontal collapse: compact docks show icon-only rows. */
   private compact = false;
+  /** Who fetched the sections (the providers drawing rows here): Ctrl+Z in the dock undoes among them. */
+  private sectionProviders = new Set<AbjectId>();
 
   /** Single-flight guard for show()'s destroy+rebuild (prevents duplicate docks). */
   private buildingUI = false;
@@ -97,6 +100,7 @@ export class Sidebar extends Abject {
                 },
               },
             },
+            ...undoMethods('the newest change made through the dock (a favorite starred, say), by asking the providers that draw its rows'),
           ],
         },
         tags: ['system', 'ui'],
@@ -124,6 +128,8 @@ click handling.
 - \`hide()\` -- Destroy the dock window.
 - \`toggleCompact()\` -- Collapse the dock into a compact icon-only strip, or
   expand it back. The System section's header carries the button for it.
+- \`undo()\` / \`redo()\` -- Ctrl+Z in the dock: forwarded to the providers that
+  fetched the sections, newest change first (a favorite starred, say).
 
 ### Behavior
 - The top two sections auto-size to their content; the bottom section takes the
@@ -153,10 +159,11 @@ click handling.
 
     this.on('hide', async () => this.hide());
 
-    this.on('getSections', async (): Promise<SidebarSections | null> => {
+    this.on('getSections', async (msg: AbjectMessage): Promise<SidebarSections | null> => {
       if (!this.windowId || !this.systemSectionId || !this.spacesSectionId || !this.abjectsSectionId) {
         return null;
       }
+      this.sectionProviders.add(msg.routing.from);
       return {
         windowId: this.windowId,
         system: this.systemSectionId,
@@ -167,6 +174,12 @@ click handling.
     });
 
     this.on('getState', async () => ({ visible: !!this.windowId, compact: this.compact }));
+
+    // The dock holds no state of its own: undo goes to the providers whose
+    // rows it shows (those without undo are skipped).
+    this.on('undo', async () => this.forwardUndo([...this.sectionProviders], 'undo'));
+    this.on('redo', async () => this.forwardUndo([...this.sectionProviders], 'redo'));
+    this.on('getUndoState', async () => ({ canUndo: this.sectionProviders.size > 0, canRedo: this.sectionProviders.size > 0 }));
 
     // The flip needs every section repopulated for the new width, so it routes
     // through WorkspaceManager's refreshTaskbar like every other dock rebuild.
@@ -200,6 +213,8 @@ click handling.
         this.spacesSectionId = undefined;
         this.abjectsSectionId = undefined;
       }
+      // New sections, new providers: they fetch them again after this show.
+      this.sectionProviders.clear();
 
       const display = await this.request<{ width: number; height: number }>(
         request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})

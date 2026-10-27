@@ -10,11 +10,15 @@
  *   getActiveThemeId→ id of the active preset, or 'custom' after setTheme()
  *   registerTheme   → add (or replace) a user preset
  *   unregisterTheme → remove a user preset
+ *   undo / redo     → take back the caller's last change of these (in memory,
+ *                     one history per caller; refused once someone changed
+ *                     the theme or that preset again since)
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { event, request } from '../core/message.js';
+import { UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods, type UndoAction, type UndoResult } from '../core/undo.js';
 import { require as contractRequire } from '../core/contracts.js';
 import {
   ThemeData,
@@ -86,6 +90,22 @@ function defaultTheme(): ThemeData {
   return { ...getBuiltinThemeById(DEFAULT_THEME_ID)! };
 }
 
+/** The active theme as one value: its data and its preset id (or 'custom'). */
+interface ActiveTheme {
+  theme: ThemeData;
+  id: string;
+}
+
+/**
+ * One undoable change: the active theme before and after, and/or one user
+ * preset before and after (absent when it did not exist), with its place in
+ * the picker so a removed preset comes back where it was.
+ */
+interface ThemeStep {
+  active?: { before: ActiveTheme; after: ActiveTheme };
+  preset?: { id: string; index: number; before?: ThemePreset; after?: ThemePreset };
+}
+
 export const THEME_ID = 'abjects:theme' as AbjectId;
 
 export class ThemeAbject extends Abject {
@@ -93,6 +113,21 @@ export class ThemeAbject extends Abject {
   private activeThemeId: string = DEFAULT_THEME_ID;
   private userPresets: Map<string, ThemePreset> = new Map();
   private storageId?: AbjectId;
+  /** Each caller's theme changes, for this session. A burst of colour edits is one step. */
+  private history = new UndoHistories<ThemeStep>({
+    merge: (older, newer) => ({
+      ...(older.active || newer.active ? { active: {
+        before: (older.active ?? newer.active)!.before,
+        after: (newer.active ?? older.active)!.after,
+      } } : {}),
+      ...(older.preset || newer.preset ? { preset: {
+        ...(older.preset ?? newer.preset)!,
+        after: (newer.preset ?? older.preset)!.after,
+      } } : {}),
+    }),
+  });
+  /** The live id each caller last changed the theme from, to tell it its undo state moved. */
+  private historyCallers = new Map<string, AbjectId>();
 
   constructor() {
     super({
@@ -164,7 +199,9 @@ export class ThemeAbject extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              ...undoMethods('your last theme change (set, reset, switch, register or remove a preset). A theme or preset someone changed again since is left alone'),
             ],
+            events: UNDO_EVENTS,
           },
         tags: ['system', 'ui', 'theme'],
       },
@@ -180,6 +217,7 @@ export class ThemeAbject extends Abject {
 
     this.on('setTheme', async (msg: AbjectMessage) => {
       const partial = msg.payload as Partial<ThemeData>;
+      const before = this.activeNow();
       // Colours merge; structure stays the design's (fillThemeDefaults runs
       // the result through palette()).
       this.currentTheme = fillThemeDefaults(mergeTheme(this.currentTheme, partial));
@@ -187,15 +225,18 @@ export class ThemeAbject extends Abject {
       this.applyBodyBackground();
       await this.persistTheme();
       this.changed('themeChanged', { ...this.currentTheme });
+      await this.recordStep(msg, 'Change theme colours', { active: { before, after: this.activeNow() } }, 'active');
       return { ...this.currentTheme };
     });
 
-    this.on('resetTheme', async () => {
+    this.on('resetTheme', async (msg: AbjectMessage) => {
+      const before = this.activeNow();
       this.currentTheme = defaultTheme();
       this.activeThemeId = DEFAULT_THEME_ID;
       this.applyBodyBackground();
       await this.persistTheme();
       this.changed('themeChanged', { ...this.currentTheme });
+      await this.recordStep(msg, 'Reset theme', { active: { before, after: this.activeNow() } });
       return { ...this.currentTheme };
     });
 
@@ -210,11 +251,13 @@ export class ThemeAbject extends Abject {
       const preset = this.findPreset(id);
       contractRequire(preset !== undefined, `setThemeById: unknown preset id "${id}"`);
 
+      const before = this.activeNow();
       this.currentTheme = { ...preset!.theme };
       this.activeThemeId = preset!.id;
       this.applyBodyBackground();
       await this.persistTheme();
       this.changed('themeChanged', { ...this.currentTheme });
+      await this.recordStep(msg, `Switch theme to ${preset!.name}`, { active: { before, after: this.activeNow() } });
       return { id: preset!.id, theme: { ...this.currentTheme } };
     });
 
@@ -253,9 +296,14 @@ export class ThemeAbject extends Abject {
         theme: fillThemeDefaults(theme),
       };
 
+      const prior = this.userPresets.get(id);
+      const index = this.presetIndex(id);
       this.userPresets.set(id, preset);
       await this.persistUserPresets();
       this.changed('presetsChanged', { presets: this.allPresets() });
+      await this.recordStep(msg, `${prior ? 'Update' : 'Add'} theme ${name}`, {
+        preset: { id, index, ...(prior ? { before: { ...prior } } : {}), after: { ...preset } },
+      });
       return preset;
     });
 
@@ -265,8 +313,11 @@ export class ThemeAbject extends Abject {
       contractRequire(!isBuiltinThemeId(id),
         `unregisterTheme: cannot remove built-in preset "${id}"`);
 
+      const prior = this.userPresets.get(id);
+      const index = this.presetIndex(id);
       const removed = this.userPresets.delete(id);
-      if (!removed) return false;
+      if (!removed || !prior) return false;
+      const activeBefore = this.activeNow();
 
       await this.persistUserPresets();
 
@@ -280,8 +331,95 @@ export class ThemeAbject extends Abject {
       }
 
       this.changed('presetsChanged', { presets: this.allPresets() });
+      await this.recordStep(msg, `Remove theme ${prior.name}`, {
+        preset: { id, index, before: { ...prior } },
+        active: { before: activeBefore, after: this.activeNow() },
+      });
       return true;
     });
+
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) =>
+      this.history.state(await this.undoCallerKey(msg.routing.from)));
+  }
+
+  // ── Undo ────────────────────────────────────────────────────────
+
+  private activeNow(): ActiveTheme {
+    return { theme: { ...this.currentTheme }, id: this.activeThemeId };
+  }
+
+  /** Where a user preset sits in the picker (after the built-ins), or the end. */
+  private presetIndex(id: string): number {
+    const i = [...this.userPresets.keys()].indexOf(id);
+    return i < 0 ? this.userPresets.size : i;
+  }
+
+  /** Keep a step for the caller, leaving out parts that did not change. */
+  private async recordStep(msg: AbjectMessage, label: string, step: ThemeStep, mergeKey?: string): Promise<void> {
+    const kept: ThemeStep = {};
+    if (step.active && !sameValue(step.active.before, step.active.after)) kept.active = step.active;
+    if (step.preset && !sameValue(step.preset.before, step.preset.after)) kept.preset = step.preset;
+    if (!kept.active && !kept.preset) return;
+    const caller = await this.undoCallerKey(msg.routing.from);
+    this.history.for(caller).record(label, kept, mergeKey ? { mergeKey } : {});
+    this.historyCallers.set(caller, msg.routing.from);
+    this.tellUndoState(caller);
+  }
+
+  /**
+   * Put the caller's last step back (or forward), only while the theme and
+   * the preset still hold what the step left; then persist and broadcast
+   * exactly as a normal change does.
+   */
+  private async undoFor(msg: AbjectMessage, action: UndoAction): Promise<UndoResult> {
+    const caller = await this.undoCallerKey(msg.routing.from);
+    const history = this.history.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](async (step) => {
+      const { active, preset } = step.data;
+      const verb = action === 'undo' ? 'undone' : 'redone';
+      const expectActive = active && (action === 'undo' ? active.after : active.before);
+      const expectPreset = preset && (action === 'undo' ? preset.after : preset.before);
+      if (expectActive && !sameValue(this.activeNow(), expectActive)) {
+        throw new UndoRefused(`The theme changed since, so "${step.label}" can no longer be ${verb}`);
+      }
+      if (preset && !sameValue(this.userPresets.get(preset.id), expectPreset)) {
+        throw new UndoRefused(`Theme '${preset.id}' changed since, so "${step.label}" can no longer be ${verb}`);
+      }
+      if (preset) {
+        const target = action === 'undo' ? preset.before : preset.after;
+        if (target && !this.userPresets.has(preset.id)) {
+          const entries = [...this.userPresets.entries()];
+          entries.splice(Math.min(preset.index, entries.length), 0, [preset.id, { ...target }]);
+          this.userPresets = new Map(entries);
+        } else if (target) {
+          this.userPresets.set(preset.id, { ...target });
+        } else {
+          this.userPresets.delete(preset.id);
+        }
+        await this.persistUserPresets();
+      }
+      if (active) {
+        const target = action === 'undo' ? active.before : active.after;
+        this.currentTheme = { ...target.theme };
+        this.activeThemeId = target.id;
+        this.applyBodyBackground();
+        await this.persistTheme();
+        this.changed('themeChanged', { ...this.currentTheme });
+      }
+      if (preset) this.changed('presetsChanged', { presets: this.allPresets() });
+      return { activeThemeId: this.activeThemeId };
+    });
+    this.historyCallers.set(caller, msg.routing.from);
+    this.tellUndoState(caller);
+    return result;
+  }
+
+  private tellUndoState(caller: string): void {
+    const to = this.historyCallers.get(caller);
+    if (to) this.send(event(this.id, to, 'undoStateChanged', this.history.state(caller)));
   }
 
   protected override async onInit(): Promise<void> {
@@ -562,6 +700,12 @@ design: a theme is a colour palette.
   await this.call(
     this.dep('Theme'), 'unregisterTheme', { id: 'forest' });
   // If 'forest' was active, the theme falls back to the default (red-sigil).
+
+### Undo
+
+  await this.call(this.dep('Theme'), 'undo', {});
+  // Takes back YOUR last theme change (set, reset, switch, register, remove);
+  // returns { ok, label, reason }. redo puts it back; getUndoState says what's next.
 
 ### Subscribing to Theme Changes
 

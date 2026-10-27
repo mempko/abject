@@ -34,6 +34,7 @@ import { Sandbox, SandboxSourceError, type SandboxOutcome } from '../core/sandbo
 import { isPackageOwner, packageNameOf } from '../core/packages.js';
 import { Log } from '../core/timed-log.js';
 import { bytesToHex } from '../core/encoding.js';
+import { UndoHistory, UndoRefused, sameValue, undoMethods, type UndoAction, type UndoResult } from '../core/undo.js';
 
 const log = new Log('ScriptableAbject');
 
@@ -107,6 +108,17 @@ const EDITABLE_METHODS: MethodDeclaration[] = [
   },
 ];
 
+// Undo of this.data: steps are made by saveData({ undo: 'label' }), and a
+// source may define its own undo / redo / getUndoState, reaching these with
+// super.undo(msg).
+EDITABLE_METHODS.push(...undoMethods("this object's last change saved with saveData({ undo: 'label' })"));
+
+/** Editable methods a manifest does not already declare itself. */
+function editableMethodsFor(declared: readonly MethodDeclaration[]): MethodDeclaration[] {
+  const names = new Set(declared.map(m => m.name));
+  return EDITABLE_METHODS.filter(m => !names.has(m.name));
+}
+
 const EDITABLE_EVENTS: EventDeclaration[] = [
   {
     name: 'sourceUpdated',
@@ -128,7 +140,7 @@ export function mergeScriptableManifest(manifest: AbjectManifest): AbjectManifes
   if (!tags.includes('scriptable')) tags.push('scriptable');
 
   const iface = manifest.interface;
-  const allMethods = [...iface.methods, ...EDITABLE_METHODS];
+  const allMethods = [...iface.methods, ...editableMethodsFor(iface.methods)];
   const allEvents = [...(iface.events ?? []), ...EDITABLE_EVENTS];
 
   // Also merge introspect methods/events (same as Abject constructor)
@@ -181,6 +193,24 @@ export class ScriptableAbject extends Abject {
   private _packageDataLoad?: Promise<void>;
   private _packageDataLoaded = false;
 
+  /**
+   * Undo of this.data. A step is the top-level keys that changed between
+   * the last save and a saveData({ undo: 'label' }), with their values
+   * before and after; any save moves the baseline the next step is measured
+   * from. Kept for the session.
+   */
+  private _dataUndo = new UndoHistory<DataKeyChange[]>({
+    merge: (older, newer) => {
+      const byKey = new Map(older.map(c => [c.key, { ...c }]));
+      for (const c of newer) {
+        const prior = byKey.get(c.key);
+        byKey.set(c.key, prior ? { ...prior, after: c.after, afterHas: c.afterHas } : c);
+      }
+      return [...byKey.values()];
+    },
+  });
+  private _undoBaseline: Record<string, unknown>;
+
   constructor(
     manifest: AbjectManifest,
     source: string,
@@ -199,7 +229,7 @@ export class ScriptableAbject extends Abject {
         ...manifest,
         interface: {
           ...iface,
-          methods: [...iface.methods, ...EDITABLE_METHODS],
+          methods: [...iface.methods, ...editableMethodsFor(iface.methods)],
           events: [...(iface.events ?? []), ...EDITABLE_EVENTS],
         },
         tags,
@@ -212,6 +242,7 @@ export class ScriptableAbject extends Abject {
     // and respawn. Source code mutates it as `this.data`; persistence is
     // explicit via `await this.saveData()`.
     this._lastData = data ?? {};
+    this._undoBaseline = structuredClone(this._lastData);
 
     this.compileAndInstall(source, this._lastData);
     this.setupEditableHandlers();
@@ -412,6 +443,16 @@ export class ScriptableAbject extends Abject {
     this.on('getSource', () => {
       return this._source;
     });
+
+    // Undo of this.data, or the source's own undo when it defines one (its
+    // super.undo(msg) is the system's).
+    for (const method of ['undo', 'redo', 'getUndoState'] as const) {
+      this.on(method, async (msg: AbjectMessage) => {
+        await this.packageDataReady();
+        if (this._handlerFunctions.has(method)) return this.invokeUserHandler(method, msg);
+        return method === 'getUndoState' ? this._dataUndo.state() : this.applyDataStep(method);
+      });
+    }
 
     this.on('getData', async () => {
       await this.packageDataReady();
@@ -824,9 +865,10 @@ export class ScriptableAbject extends Abject {
    * the object is). They reach the source through handleAsk and
    * handleDescribe, so the system's handler stays in front of them: an ask
    * still answers when the object is busy, and describe always carries the
-   * real manifest.
+   * real manifest. `undo`, `redo` and `getUndoState` work the same way:
+   * the system's take back what saveData({ undo }) recorded.
    */
-  static readonly INHERITED_HANDLERS = new Set(['ask', 'describe']);
+  static readonly INHERITED_HANDLERS = new Set(['ask', 'describe', 'undo', 'redo', 'getUndoState']);
 
   /** Keys on the this-proxy that must not be overwritten by user handler code. */
   private static readonly PROXY_BUILTINS = new Set([
@@ -858,6 +900,9 @@ export class ScriptableAbject extends Abject {
           return super.handleAsk(typeof question === 'string' ? question : '', m?.routing?.from);
         },
         describe: (msg: unknown) => super.handleDescribe(msg as AbjectMessage),
+        undo: () => this.applyDataStep('undo'),
+        redo: () => this.applyDataStep('redo'),
+        getUndoState: () => this._dataUndo.state(),
       },
       asyncHelpers: {
         call: (to: unknown, method: unknown, payload?: unknown, options?: unknown) =>
@@ -866,7 +911,7 @@ export class ScriptableAbject extends Abject {
         find: (name: unknown) => this.find(String(name)),
         emit: (to: unknown, eventName: unknown, payload?: unknown) => this.emit(to as AbjectId, String(eventName), payload),
         observe: (target: unknown) => this.observe(target as AbjectId),
-        saveData: () => this.saveData(),
+        saveData: (opts?: unknown) => this.saveData(opts as { undo?: string } | undefined),
       },
       syncHelpers: {
         id: () => this.id,
@@ -911,9 +956,10 @@ export class ScriptableAbject extends Abject {
    * other object's requests. The returned promise resolves once a save that
    * includes the caller's data mutations has been persisted.
    */
-  async saveData(): Promise<void> {
+  async saveData(opts?: { undo?: string }): Promise<void> {
+    let current: Record<string, unknown>;
     try {
-      this.sandbox.readData();
+      current = this.sandbox.readData();
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       throw new Error(
@@ -921,6 +967,11 @@ export class ScriptableAbject extends Abject {
         `Remove functions, cycles, or class instances and retry.`
       );
     }
+    const label = opts?.undo;
+    contractRequire(label === undefined || (typeof label === 'string' && label.trim().length > 0),
+      'saveData({ undo }): the undo label must be a non-empty string');
+    if (label !== undefined) this.recordDataStep(label.trim(), current);
+    this._undoBaseline = current;
 
     // Join the queued save if one exists — it has not started yet, so it
     // will pick up the caller's mutations when it reads the data.
@@ -947,6 +998,65 @@ export class ScriptableAbject extends Abject {
       }
     });
     return promise;
+  }
+
+  /** Record the keys that changed since the baseline as one undo step. */
+  private recordDataStep(label: string, current: Record<string, unknown>): void {
+    const base = this._undoBaseline;
+    const changes: DataKeyChange[] = [];
+    for (const key of new Set([...Object.keys(base), ...Object.keys(current)])) {
+      const beforeHas = Object.prototype.hasOwnProperty.call(base, key);
+      const afterHas = Object.prototype.hasOwnProperty.call(current, key);
+      if (beforeHas === afterHas && sameValue(base[key], current[key])) continue;
+      changes.push({ key, before: base[key], beforeHas, after: current[key], afterHas });
+    }
+    if (changes.length === 0) return;
+    this._dataUndo.record(label, changes, { mergeKey: changes.map(c => c.key).sort().join('\n') });
+    this.changed('undoStateChanged', this._dataUndo.state());
+  }
+
+  /**
+   * Take a step back (or forward): the step's keys get their values from
+   * before (or after), only while they still hold what the step left. The
+   * data is saved, then the source hears `restored({ action, label, keys })`
+   * to redraw; a source without one that is showing is shown again.
+   */
+  private async applyDataStep(action: UndoAction): Promise<UndoResult> {
+    const result = await this._dataUndo[action](async (step) => {
+      const data = this.readData();
+      for (const c of step.data) {
+        const has = Object.prototype.hasOwnProperty.call(data, c.key);
+        const expectHas = action === 'undo' ? c.afterHas : c.beforeHas;
+        const expect = action === 'undo' ? c.after : c.before;
+        if (has !== expectHas || (has && !sameValue(data[c.key], expect))) {
+          throw new UndoRefused(`'${c.key}' changed since, so "${step.label}" can no longer be ${action === 'undo' ? 'undone' : 'redone'}`);
+        }
+      }
+      const next = { ...data };
+      for (const c of step.data) {
+        if (action === 'undo' ? c.beforeHas : c.afterHas) next[c.key] = action === 'undo' ? c.before : c.after;
+        else delete next[c.key];
+      }
+      this.writeData(next);
+      await this.saveData();
+    });
+    this.changed('undoStateChanged', this._dataUndo.state());
+    if (result.ok) await this.afterRestore(action, result.label ?? '');
+    return result;
+  }
+
+  /** Let the source catch up with data undo or redo changed under it. */
+  private async afterRestore(action: UndoAction, label: string): Promise<void> {
+    try {
+      if (this._handlerFunctions.has('restored')) {
+        await this.invokeUserHandler('restored', request(this.id, this.id, 'restored', { action, label }));
+      } else if (this._showing && this._handlerFunctions.has('show')) {
+        if (this._handlerFunctions.has('hide')) await this.invokeUserHandler('hide', request(this.id, this.id, 'hide', {}));
+        await this.invokeUserHandler('show', request(this.id, this.id, 'show', {}));
+      }
+    } catch (err) {
+      log.warn(`[${this.manifest.name}] could not catch up after ${action}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -1016,7 +1126,7 @@ export class ScriptableAbject extends Abject {
       try {
         const stored = await this.request<Record<string, unknown> | null>(
           request(this.id, this._packagesId!, 'getPackageData', {}));
-        if (stored && typeof stored === 'object') this.writeData(stored);
+        if (stored && typeof stored === 'object') { this.writeData(stored); this._undoBaseline = structuredClone(stored); }
         this._packageDataLoaded = true;
       } catch (err) {
         log.warn(`[${this.manifest.name}] could not load package data:`, err);
@@ -1185,6 +1295,15 @@ export class ScriptableAbject extends Abject {
 }
 
 type HandlerList = Array<{ name: string; kind: 'function' | 'value' }>;
+
+/** One top-level key of this.data an undo step changed. */
+interface DataKeyChange {
+  key: string;
+  before: unknown;
+  beforeHas: boolean;
+  after: unknown;
+  afterHas: boolean;
+}
 
 interface ApplyResult {
   success: boolean;

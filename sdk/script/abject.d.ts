@@ -36,7 +36,25 @@
  *   },
  *
  * `ask` returns a string; `describe` returns a description string or extra
- * fields, and its reply always carries the real manifest. The other system
+ * fields, and its reply always carries the real manifest.
+ *
+ * Undo comes with every script abject. Save a change people may want back
+ * with a label, and Ctrl+Z in your window (or a call to `undo`) takes it back:
+ *
+ *   async rename(msg: AbjectMessage<{ name: string }>) {
+ *     this.data.name = msg.payload.name;
+ *     await this.saveData({ undo: 'Rename' });
+ *   },
+ *   async restored(msg: AbjectMessage<{ action: 'undo' | 'redo'; label: string }>) {
+ *     await this.redraw();   // this.data changed under you
+ *   },
+ *
+ * A step is the top-level keys of `this.data` that changed since the last
+ * save; repeated saves with the same label within a second merge into one.
+ * Undo puts those keys back while they still hold what the step left. Then
+ * `restored` runs; without one, an object that is showing is shown again.
+ * `undo`, `redo` and `getUndoState` may be your own, calling the system's
+ * with `super.undo(msg)`. The other system
  * handlers (getSource, getData, updateSource, persistSnapshot, probe,
  * getRegistry, ping, addDependent, removeDependent, freeMemory) are the
  * system's: a member with one of those names never runs.
@@ -70,8 +88,12 @@ export interface AbjectThis<D extends object = Record<string, unknown>> {
    * restarts once saved. Do not keep secrets here; `ask` shows it to the model.
    */
   data: Partial<D>;
-  /** Persist `this.data` (coalesced; resolves once the save covering it is stored). */
-  saveData(): Promise<void>;
+  /**
+   * Persist `this.data` (coalesced; resolves once the save covering it is
+   * stored). With `undo`, the keys changed since the last save become one
+   * undo step under that label (e.g. 'Delete card').
+   */
+  saveData(opts?: { undo?: string }): Promise<void>;
 
   /** Send a request and wait for the reply (30 s unless `timeout` is given). */
   call<T = unknown>(to: Target, method: string, payload?: unknown, options?: { timeout?: number }): Promise<T>;

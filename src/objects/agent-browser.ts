@@ -28,6 +28,7 @@ import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { IconName } from '../ui/icons.js';
 import { emptyStateMarkdown, emptyStateStyle, eyeSigilOps, removeSigilOps } from './ui-kit.js';
+import { undoMethods, type UndoAction, type UndoResult } from '../core/undo.js';
 
 const log = new Log('AgentBrowser');
 
@@ -191,6 +192,7 @@ export class AgentBrowser extends Abject {
                 watchCount: { kind: 'primitive', primitive: 'number' },
               }},
             },
+            ...undoMethods('your last agent delete or trigger rule change made in this browser (AbjectStore and TriggerManager keep the steps)'),
           ],
         },
         tags: ['system', 'ui'],
@@ -217,6 +219,23 @@ export class AgentBrowser extends Abject {
       watchCount: this.watches.length,
     }));
     this.on('windowCloseRequested', async () => { await this.hide(); });
+    // Deleted agents are kept by AbjectStore, rule changes by TriggerManager,
+    // each keyed to this browser: undo asks whichever holds the newest step.
+    this.on('undo', async () => this.undoThroughOwners('undo'));
+    this.on('redo', async () => this.undoThroughOwners('redo'));
+    this.on('getUndoState', async () => {
+      const ids = [await this.discoverDep('AbjectStore') ?? undefined, this.triggerManagerId].filter((id): id is AbjectId => !!id);
+      const states = await Promise.all(ids.map(id =>
+        this.request<{ canUndo: boolean; canRedo: boolean; undoAt?: number; redoAt?: number; undoLabel?: string; redoLabel?: string }>(
+          request(this.id, id, 'getUndoState', {}), 5000).catch(() => undefined)));
+      const u = states.filter(st => st?.canUndo).sort((a, b) => (b?.undoAt ?? 0) - (a?.undoAt ?? 0))[0];
+      const r = states.filter(st => st?.canRedo).sort((a, b) => (b?.redoAt ?? 0) - (a?.redoAt ?? 0))[0];
+      return {
+        canUndo: !!u, canRedo: !!r,
+        ...(u ? { undoLabel: u.undoLabel, undoAt: u.undoAt } : {}),
+        ...(r ? { redoLabel: r.redoLabel, redoAt: r.redoAt } : {}),
+      };
+    });
     this.on('windowResized', async (msg: AbjectMessage) => {
       const { windowId, width, height } = msg.payload as { windowId?: AbjectId; width: number; height: number };
       if (windowId && windowId !== this.windowId) return;
@@ -240,6 +259,9 @@ export class AgentBrowser extends Abject {
 - **Agents**: Lists all registered agents with live status (idle/busy), active task count.
 - **Sessions**: Inspect durable outcomes, usage and unknown operations; pause, resume or fork work.
 - **Watchers**: Merges TriggerManager rules (toggle, delete) with watcher-tagged objects and their event watch entries. Schedules live in the separate SchedulerBrowser.
+
+### Undo
+- \`undo()\` / \`redo()\` -- Take back (or make again) the last agent delete or trigger rule change made in this window; Ctrl+Z in the window does the same. A deleted agent comes back running and registered.
 
 ### Real-Time Updates
 AgentBrowser subscribes to AgentAbject for agent registration/status changes,
@@ -1350,13 +1372,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
         await this.notify(`This watch belongs to ${watch.watcherName}. Press Edit to open it and remove the watch there.`, 'info');
         return;
       }
-      const confirmed = await this.confirm({
-        title: 'Delete Trigger',
-        message: `Delete trigger rule "${watch.taskDescription}"? This cannot be undone.`,
-        confirmLabel: 'Delete',
-        destructive: true,
-      });
-      if (!confirmed) return;
+      // TriggerManager keeps the removed rule for this browser's undo.
       try {
         await this.request(
           request(this.id, watch.watcherId as AbjectId, 'removeTrigger', { triggerId: watch.id }),
@@ -1366,7 +1382,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
         await this.loadWatches();
         await this.rebuildList();
         await this.clearDetail();
-        await this.notify('Trigger deleted', 'success');
+        await this.notify('Trigger deleted. Ctrl+Z to undo', 'success');
       } catch (err) {
         log.warn('Failed to delete trigger:', err);
         this.playEffect('shake');
@@ -1397,13 +1413,19 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       return;
     }
 
-    const confirmed = await this.confirm({
-      title: 'Delete Agent',
-      message: `Delete agent "${agent.name}" and its backing object? This cannot be undone.`,
-      confirmLabel: 'Delete',
-      destructive: true,
-    });
-    if (!confirmed) return;
+    // A kept agent is set aside by AbjectStore and undo brings it back, so
+    // it goes at once; one the store does not keep is asked about first.
+    const abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
+    const kept = (await this.keptRunningIds(abjectStoreId)).has(agent.agentId);
+    if (!kept) {
+      const confirmed = await this.confirm({
+        title: 'Delete Agent',
+        message: `Delete agent "${agent.name}" and its backing object? This cannot be undone.`,
+        confirmLabel: 'Delete',
+        destructive: true,
+      });
+      if (!confirmed) return;
+    }
 
     try {
       // 1. Unregister from AgentAbject
@@ -1414,8 +1436,8 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
         );
       }
 
-      // 2. Remove snapshot from AbjectStore
-      const abjectStoreId = await this.discoverDep('AbjectStore');
+      // 2. Set its record aside in AbjectStore: the one undo step for this
+      //    delete (the Factory's own removal then finds nothing left)
       if (abjectStoreId) {
         await this.request(
           request(this.id, abjectStoreId, 'remove', { objectId: agent.agentId }),
@@ -1436,12 +1458,80 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       await this.loadAgents();
       await this.rebuildList();
       await this.clearDetail();
-      await this.notify(`Agent "${agent.name}" deleted`, 'success');
+      await this.notify(kept ? `Deleted ${agent.name}. Ctrl+Z to undo` : `Agent "${agent.name}" deleted`, 'success');
     } catch (err) {
       log.warn('Failed to delete agent:', err);
       this.playEffect('shake');
       const msg = err instanceof Error ? err.message : String(err);
       await this.notify(`Delete failed: ${msg.slice(0, 80)}`, 'error');
+    }
+  }
+
+  // -- Undo --
+
+  /**
+   * Undo or redo this browser's newest change among its owners. A deleted
+   * agent that comes back must be in AgentAbject's roster again; an agent
+   * deleted again by redo must leave it, as a delete here does.
+   */
+  private async undoThroughOwners(action: UndoAction): Promise<UndoResult> {
+    const storeId = await this.discoverDep('AbjectStore') ?? undefined;
+    if (!this.triggerManagerId) this.triggerManagerId = await this.discoverDep('TriggerManager') ?? undefined;
+    const runningBefore = action === 'redo' ? await this.keptRunningIds(storeId) : undefined;
+    const result = await this.forwardUndo([storeId, this.triggerManagerId], action);
+    if (!result.ok) return result;
+    if (Array.isArray(result.typeIds) && result.typeIds.length > 0) {
+      await this.reRegisterAgents(storeId, result.typeIds as string[]);
+    }
+    if (runningBefore && this.agentAbjectId) {
+      const runningAfter = await this.keptRunningIds(storeId);
+      await this.loadAgents();
+      for (const agent of this.agents) {
+        if (!runningBefore.has(agent.agentId) || runningAfter.has(agent.agentId)) continue;
+        try {
+          await this.request(request(agent.agentId as AbjectId, this.agentAbjectId, 'unregisterAgent', {}), 5000);
+        } catch { /* already gone from the roster */ }
+      }
+    }
+    if (this.windowId) await this.loadTabData();
+    if (this.activeTab !== 0) await this.loadAgents();
+    return result;
+  }
+
+  /** Live ids of the objects AbjectStore keeps that are running now. */
+  private async keptRunningIds(storeId: AbjectId | undefined): Promise<Set<string>> {
+    if (!storeId) return new Set();
+    try {
+      const entries = await this.request<Array<{ objectId?: string }>>(request(this.id, storeId, 'list', {}), 5000);
+      return new Set(entries.map(e => e.objectId).filter((id): id is string => !!id));
+    } catch {
+      return new Set();
+    }
+  }
+
+  /**
+   * Agents register with AgentAbject on startup. AbjectStore starts what it
+   * brings back that it starts at boot; one that came back running but is
+   * not in the roster hears startup here.
+   */
+  private async reRegisterAgents(storeId: AbjectId | undefined, typeIds: string[]): Promise<void> {
+    if (!storeId || !this.agentAbjectId) return;
+    let entries: Array<{ typeId: string; objectId?: string }> = [];
+    try {
+      entries = await this.request(request(this.id, storeId, 'list', {}), 5000);
+    } catch { return; }
+    const wanted = new Set(typeIds);
+    const back = entries.filter(e => wanted.has(e.typeId) && e.objectId).map(e => e.objectId as AbjectId);
+    if (back.length === 0) return;
+    await this.loadAgents();
+    const listed = new Set(this.agents.map(a => a.agentId));
+    for (const objectId of back) {
+      if (listed.has(objectId)) continue;
+      try {
+        await this.request(request(this.id, objectId, 'startup', {}), 10_000);
+      } catch (err) {
+        log.warn(`Restored agent ${objectId} did not start: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 

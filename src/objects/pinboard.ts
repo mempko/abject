@@ -9,6 +9,13 @@
  *
  * Any kept object that draws itself (answers `render`) can be pinned, not
  * only standard cards.
+ *
+ * Undo: what the person does at the pin windows (closing one, moving or
+ * resizing one) is one history, answered when WidgetManager asks; pin and
+ * unpin requests from other objects go to each caller's own history. An
+ * unpin is undone by bringing the removed copy back from AbjectStore (by
+ * its trash id, so the store's other steps for this board are untouched)
+ * and opening it where it was.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -16,6 +23,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import { UndoHistories, UndoHistory, UndoRefused, undoMethods, type UndoAction, type UndoResult, type UndoStep } from '../core/undo.js';
 
 const log = new Log('Pinboard');
 
@@ -34,6 +42,16 @@ interface Pin {
   rect: { x: number; y: number; width: number; height: number };
 }
 
+type Rect = Pin['rect'];
+
+/**
+ * One undoable change to the board. A pin or unpin keeps the pin whole (its
+ * rect too) and, while the copy is removed, its AbjectStore trash id.
+ */
+type PinStep =
+  | { kind: 'pin' | 'unpin'; pin: Pin; trashId?: string }
+  | { kind: 'rect'; typeId: string; before: Rect; after: Rect };
+
 /** A pin's open window and the slot in it. */
 interface OpenPin {
   windowId: AbjectId;
@@ -47,6 +65,10 @@ export class Pinboard extends Abject {
   private widgetManagerId?: AbjectId;
   private pins: Pin[] = [];
   private open = new Map<string, OpenPin>();
+  /** What the person did at the pin windows (in memory, for the session). */
+  private desk = new UndoHistory<PinStep>({ maxSteps: 50, merge: Pinboard.mergeRects });
+  /** Pin and unpin requests by other objects, by caller. */
+  private byCaller = new UndoHistories<PinStep>({ maxSteps: 20, mergeMs: 0 });
 
   constructor() {
     super({
@@ -80,6 +102,7 @@ export class Pinboard extends Abject {
               parameters: [],
               returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
             },
+            ...undoMethods('your last pin or unpin (an unpinned card comes back where it was); at the pin windows, the last close, move or resize'),
           ],
         },
         tags: ['system', 'ui'],
@@ -120,20 +143,37 @@ export class Pinboard extends Abject {
       await this.savePins();
       await this.openPin(pin);
       log.info(`Pinned ${typeId.split('/').pop()} as ${copy.typeId.split('/').pop()}`);
+      (await this.historyFor(msg.routing.from)).record(`Pin ${pin.title}`, { kind: 'pin', pin: structuredClone(pin) });
       return copy.typeId;
     });
 
     this.on('unpin', async (msg: AbjectMessage) => {
       const { typeId } = msg.payload as { typeId: string };
-      return this.unpin(typeId);
+      const pin = this.pins.find(p => p.typeId === typeId);
+      if (!pin) return false;
+      const kept = structuredClone(pin);
+      const trashId = await this.removePin(typeId);
+      (await this.historyFor(msg.routing.from)).record(`Unpin ${kept.title}`, { kind: 'unpin', pin: kept, ...(trashId ? { trashId } : {}) });
+      return true;
     });
+
+    this.on('undo', async (msg: AbjectMessage) => this.undoBy(msg.routing.from, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoBy(msg.routing.from, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) => (await this.historyFor(msg.routing.from)).state());
 
     this.on('listPins', async () => this.pins.map(p => ({ typeId: p.typeId, title: p.title })));
 
+    // Closing a pin's window unpins it: a step at the desk, so Ctrl+Z on
+    // another pinned card brings it back.
     this.on('windowCloseRequested', async (msg: AbjectMessage) => {
       const { windowId } = (msg.payload ?? {}) as { windowId?: AbjectId };
       const typeId = [...this.open].find(([, o]) => o.windowId === windowId)?.[0];
-      if (typeId) await this.unpin(typeId);
+      const pin = typeId ? this.pins.find(p => p.typeId === typeId) : undefined;
+      if (!typeId || !pin) return true;
+      const kept = structuredClone(pin);
+      const trashId = await this.removePin(typeId);
+      this.desk.record(`Unpin ${kept.title}`, { kind: 'unpin', pin: kept, ...(trashId ? { trashId } : {}) });
+      if (trashId && this.open.size > 0) await this.notify(`Unpinned ${kept.title}. Ctrl+Z on a pinned card brings it back`, 'success');
       return true;
     });
 
@@ -183,9 +223,13 @@ export class Pinboard extends Abject {
     this.checkInvariants();
   }
 
-  private async unpin(typeId: string): Promise<boolean> {
+  /**
+   * Close a pin and remove its copy; the copy's AbjectStore trash id, by
+   * which undo brings it back (none when the store kept nothing).
+   */
+  private async removePin(typeId: string): Promise<string | undefined> {
     const index = this.pins.findIndex(p => p.typeId === typeId);
-    if (index < 0) return false;
+    precondition(index >= 0, `removePin: '${typeId}' is not pinned`);
     this.pins.splice(index, 1);
     await this.savePins();
     const o = this.open.get(typeId);
@@ -193,10 +237,88 @@ export class Pinboard extends Abject {
     if (o && this.widgetManagerId) {
       try { await this.request(request(this.id, this.widgetManagerId, 'destroyWindowAbject', { windowId: o.windowId })); } catch { /* gone */ }
     }
-    try { await this.request(request(this.id, this.storeId!, 'remove', { objectId: typeId })); } catch { /* already gone */ }
+    let trashId: string | undefined;
+    try {
+      if (await this.request<boolean>(request(this.id, this.storeId!, 'remove', { objectId: typeId }))) {
+        const removed = await this.request<Array<{ id: string; typeId: string; removedAt: number }>>(
+          request(this.id, this.storeId!, 'listRemoved', {}));
+        trashId = removed.filter(r => r.typeId === typeId).sort((a, b) => b.removedAt - a.removedAt)[0]?.id;
+      }
+    } catch { /* already gone */ }
     log.info(`Unpinned ${typeId.split('/').pop()}`);
     this.checkInvariants();
-    return true;
+    return trashId;
+  }
+
+  /** Bring an unpinned copy back from AbjectStore and open it where it was. */
+  private async restorePin(pin: Pin, trashId: string | undefined): Promise<Pin> {
+    if (!trashId) throw new UndoRefused(`'${pin.title}' is no longer kept`);
+    let typeId: string;
+    try {
+      ({ typeId } = await this.request<{ typeId: string }>(request(this.id, this.storeId!, 'restoreRemoved', { id: trashId }), 30_000));
+    } catch {
+      throw new UndoRefused(`'${pin.title}' is no longer kept`);
+    }
+    const back: Pin = { ...structuredClone(pin), typeId };
+    this.pins.push(back);
+    await this.savePins();
+    await this.openPin(back).catch(err => log.warn(`could not reopen a pin: ${String(err)}`));
+    this.checkInvariants();
+    return back;
+  }
+
+  // ── Undo ──
+
+  /** The history a caller's changes and undos go to: the desk for WidgetManager (the person at the pin windows). */
+  private async historyFor(callerId: AbjectId): Promise<UndoHistory<PinStep>> {
+    if (callerId === this.widgetManagerId) return this.desk;
+    return this.byCaller.for(await this.undoCallerKey(callerId));
+  }
+
+  private async undoBy(callerId: AbjectId, action: UndoAction): Promise<UndoResult> {
+    const history = await this.historyFor(callerId);
+    return history[action](step => this.applyStep(step, action));
+  }
+
+  /** Take a step back (undo) or forward again (redo). */
+  private async applyStep(step: UndoStep<PinStep>, action: UndoAction): Promise<unknown> {
+    const d = step.data;
+    if (d.kind === 'rect') {
+      const pin = this.pins.find(p => p.typeId === d.typeId);
+      if (!pin) throw new UndoRefused('That card is no longer pinned');
+      const [from, to] = action === 'undo' ? [d.after, d.before] : [d.before, d.after];
+      // Height follows the card's content in the background; where the
+      // window stands and how wide it is are the person's.
+      if (pin.rect.x !== from.x || pin.rect.y !== from.y || pin.rect.width !== from.width) {
+        throw new UndoRefused(`'${pin.title}' was moved since`);
+      }
+      pin.rect = { ...to };
+      await this.savePins();
+      const o = this.open.get(pin.typeId);
+      if (o) {
+        try { await this.request(request(this.id, o.windowId, 'windowRect', pin.rect)); } catch { /* window closed meanwhile */ }
+      }
+      return {};
+    }
+    // Unpin undone and pin redone put the card back; the other two take it away.
+    const putBack = (d.kind === 'unpin') === (action === 'undo');
+    if (putBack) {
+      d.pin = await this.restorePin(d.pin, d.trashId);
+      delete d.trashId;
+      return { typeId: d.pin.typeId };
+    }
+    const pin = this.pins.find(p => p.typeId === d.pin.typeId);
+    if (!pin) throw new UndoRefused(`'${d.pin.title}' is not pinned`);
+    d.pin = structuredClone(pin);
+    const trashId = await this.removePin(pin.typeId);
+    if (trashId) d.trashId = trashId; else delete d.trashId;
+    return {};
+  }
+
+  /** A drag or resize burst is one step: from where it started to where it ended. */
+  private static mergeRects(older: PinStep, newer: PinStep): PinStep {
+    if (older.kind !== 'rect' || newer.kind !== 'rect') return newer;
+    return { ...newer, before: older.before };
   }
 
   private async rememberRect(msg: AbjectMessage): Promise<void> {
@@ -204,12 +326,20 @@ export class Pinboard extends Abject {
     const typeId = [...this.open].find(([, o]) => o.windowId === windowId)?.[0];
     const pin = typeId ? this.pins.find(p => p.typeId === typeId) : undefined;
     if (!pin) return;
+    const before = pin.rect;
     pin.rect = {
       x: typeof x === 'number' ? x : pin.rect.x,
       y: typeof y === 'number' ? y : pin.rect.y,
       width: typeof width === 'number' ? width : pin.rect.width,
       height: typeof height === 'number' ? height : pin.rect.height,
     };
+    // Only the person's moves and resizes are steps: the window echoing a
+    // rect this board set (undo, fitting the content) changes nothing here.
+    const moved = pin.rect.x !== before.x || pin.rect.y !== before.y;
+    if (moved || pin.rect.width !== before.width || pin.rect.height !== before.height) {
+      this.desk.record(`${moved ? 'Move' : 'Resize'} ${pin.title}`, { kind: 'rect', typeId: pin.typeId, before, after: { ...pin.rect } },
+        { mergeKey: pin.typeId });
+    }
     await this.savePins();
   }
 

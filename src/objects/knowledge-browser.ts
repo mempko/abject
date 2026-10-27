@@ -28,6 +28,12 @@
  * misses, and how many of the resulting updates reached the world model. It
  * replaces the list and detail panes while active, loads when first shown,
  * and re-reads on Refresh.
+ *
+ * Forgetting a live entry (it is archived) and restoring an archived one are
+ * undoable from the window: the browser keeps one history of what was done
+ * through it (in memory) and undoes with the opposite `archive` message.
+ * Deleting an archived entry for good stays final, behind its confirm: its
+ * tombstone has already gone to peers.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -35,6 +41,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 import { require as precondition, ensure } from '../core/contracts.js';
+import { UndoHistory, UndoRefused, UNDO_EVENTS, undoMethods, type UndoAction } from '../core/undo.js';
 import { emptyStateMarkdown, emptyStateStyle, hintStyle, sectionHeaderStyle, sectionHeaderText } from './ui-kit.js';
 import { readPattern, readStructured, renderPatternText } from '../core/pattern.js';
 import type { KnowledgeEntry, KnowledgeType } from '../core/knowledge.js';
@@ -271,6 +278,11 @@ export class KnowledgeBrowser extends Abject {
   private showArchived = false;
   /** When the last new-entry flash played. */
   private lastArrivalFlashAt = 0;
+  /**
+   * Archivings and restorings made through this window, for undo. Each step
+   * holds the archived state it left the entry in.
+   */
+  private archiveSteps = new UndoHistory<{ id: string; title: string; archived: boolean }>({ maxSteps: 50, mergeMs: 0 });
 
   constructor() {
     super({
@@ -296,7 +308,9 @@ export class KnowledgeBrowser extends Abject {
               parameters: [],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
+            ...undoMethods('the last entry forgotten (archived) or restored in this window'),
           ],
+          events: [...UNDO_EVENTS],
         },
         tags: ['system', 'ui'],
       },
@@ -327,6 +341,9 @@ export class KnowledgeBrowser extends Abject {
     this.on('show', async () => this.show());
     this.on('hide', async () => this.hide());
     this.on('windowCloseRequested', async () => { await this.hide(); });
+    this.on('undo', async () => this.undoArchive('undo'));
+    this.on('redo', async () => this.undoArchive('redo'));
+    this.on('getUndoState', async () => this.archiveSteps.state());
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       await this.handleChanged(msg.routing.from, aspect, value);
@@ -1437,14 +1454,17 @@ export class KnowledgeBrowser extends Abject {
         await this.notify('This entry belongs to another peer and is read-only here.', 'warning');
         return;
       }
+      const restoreId = this.selectedId;
       this.send(event(this.id, this.restoreBtnId, 'update', { busy: true }));
       try {
         const res = await this.request<{ success?: boolean; error?: string }>(
-          request(this.id, this.knowledgeBaseId, 'archive', { id: this.selectedId, archived: false })
+          request(this.id, this.knowledgeBaseId, 'archive', { id: restoreId, archived: false })
         );
         if (res && res.success === false) {
           throw new Error(res.error ?? 'entry no longer exists');
         }
+        this.recordArchiveStep(entry ? `Restore ${entry.title}` : 'Restore entry',
+          { id: restoreId, title: entry?.title ?? 'entry', archived: false });
         this.playEffect('flash');
         await this.notify(entry ? `Restored "${entry.title}"` : 'Entry restored', 'success');
         await this.loadEntries();
@@ -1511,32 +1531,41 @@ export class KnowledgeBrowser extends Abject {
         await this.notify('This entry belongs to another peer and is read-only here.', 'warning');
         return;
       }
-      // Forgetting is two-step, and the dialog says which step this is. A
-      // live entry is archived: out of recall and the default list, but kept
-      // and restorable. An archived entry is deleted for good, learning
-      // history included; the user has now said it twice.
-      const deleting = entry?.archived === true;
-      const name = entry ? `"${entry.title}"` : 'This entry';
-      const confirmed = await this.confirm({
-        title: deleting ? 'Delete this knowledge for good?' : 'Forget this knowledge?',
-        message: deleting
-          ? `${name} is archived and will be permanently removed, along with everything learned from it.`
-          : `${name} will be archived: hidden from recall and from this list. Tick "Show archived" to find it again, or forget it once more to delete it.`,
-        confirmLabel: deleting ? 'Delete' : 'Forget',
-        destructive: true,
-      });
-      if (!confirmed) return;
+      // Forgetting is two-step. A live entry is archived: out of recall and
+      // the default list, but kept, and Ctrl+Z (or Restore) brings it back,
+      // so it needs no dialog. An archived entry is deleted for good, learning
+      // history included, and its tombstone reaches peers: that asks first.
+      // Whether it is archived is read fresh, so a stale list never deletes
+      // without asking.
+      const selectedId = this.selectedId;
+      const fresh = await this.request<KnowledgeEntry | null>(
+        request(this.id, this.knowledgeBaseId, 'get', { id: selectedId })).catch(() => null);
+      const deleting = (fresh ?? entry)?.archived === true;
+      const title = fresh?.title ?? entry?.title;
+      const name = title ? `"${title}"` : 'This entry';
+      if (deleting) {
+        const confirmed = await this.confirm({
+          title: 'Delete this knowledge for good?',
+          message: `${name} is archived and will be permanently removed, along with everything learned from it.`,
+          confirmLabel: 'Delete',
+          destructive: true,
+        });
+        if (!confirmed) return;
+      }
 
       this.send(event(this.id, this.deleteBtnId, 'update', { busy: true }));
       try {
         const res = await this.request<{ success?: boolean; archived?: boolean; deleted?: boolean; error?: string }>(
-          request(this.id, this.knowledgeBaseId, 'forget', { id: this.selectedId })
+          request(this.id, this.knowledgeBaseId, 'forget', { id: selectedId })
         );
         if (res && res.success === false) {
           throw new Error(res.error ?? 'entry no longer exists');
         }
+        if (!res?.deleted) {
+          this.recordArchiveStep(title ? `Forget ${title}` : 'Forget entry', { id: selectedId, title: title ?? 'entry', archived: true });
+        }
         await this.notify(
-          res?.deleted ? `Deleted ${name}` : `Forgot ${name}: archived, restorable from "Show archived"`,
+          res?.deleted ? `Deleted ${name}` : `Forgot ${name}: archived. Ctrl+Z to undo`,
           'success',
         );
         this.selectedId = undefined;
@@ -1581,6 +1610,45 @@ export class KnowledgeBrowser extends Abject {
       }
       return;
     }
+  }
+
+  // ── Undo ───────────────────────────────────────────────────────────
+
+  private recordArchiveStep(label: string, step: { id: string; title: string; archived: boolean }): void {
+    this.archiveSteps.record(label, step);
+    this.changed('undoStateChanged', this.archiveSteps.state());
+  }
+
+  /**
+   * Undo or redo an archiving made here with the opposite `archive` message.
+   * The entry must still be in the state the step left it in: one archived,
+   * restored or deleted since (by curation, an agent, a peer) is left alone.
+   */
+  private async undoArchive(action: UndoAction): Promise<unknown> {
+    const result = await this.archiveSteps[action](async (step) => {
+      const kb = this.knowledgeBaseId;
+      if (!kb) throw new Error('KnowledgeBase not available');
+      const { id, title, archived } = step.data;
+      const left = action === 'undo' ? archived : !archived;
+      const entry = await this.request<KnowledgeEntry | null>(request(this.id, kb, 'get', { id })).catch(() => null);
+      if (!entry) throw new UndoRefused(`"${title}" is gone`);
+      if (entry.archived !== left) throw new UndoRefused(`"${title}" was ${entry.archived ? 'archived' : 'restored'} since`);
+      const res = await this.request<{ success?: boolean; error?: string }>(
+        request(this.id, kb, 'archive', { id, archived: !left }));
+      if (res && res.success === false) throw new UndoRefused(res.error ?? `"${title}" no longer exists`);
+    });
+    this.changed('undoStateChanged', this.archiveSteps.state());
+    if (result.ok && this.windowId) {
+      await this.loadEntries();
+      const shown = this.selectedId ? this.filteredEntries.find(e => e.id === this.selectedId) : undefined;
+      if (shown) {
+        await this.showDetail(shown);
+      } else if (this.selectedId) {
+        this.selectedId = undefined;
+        await this.showEmptyState(true);
+      }
+    }
+    return result;
   }
 }
 

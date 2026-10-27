@@ -1118,25 +1118,25 @@ export class TextInputWidget extends WidgetAbject {
 
     // Ctrl/Meta+Z = undo; Ctrl/Meta+Shift+Z or Ctrl+Y = redo. Both work
     // even when the widget is disabled because read-only widgets shouldn't
-    // generally have anything in their history anyway.
+    // generally have anything in their history anyway. With nothing of its
+    // own to take back the key goes on to the window, whose owner undoes its
+    // last change (typing first, then the app's steps).
     if ((ctrl || meta) && (key === 'z' || key === 'Z') && !shift) {
       const prev = this.history.undo(this.snapshot());
-      if (prev) {
-        this.restoreSnapshot(prev);
-        this.changed('change', this.text);
-        await this.notifySelectionChanged();
-        await this.requestRedraw();
-      }
+      if (!prev) return { consumed: false };
+      this.restoreSnapshot(prev);
+      this.changed('change', this.text);
+      await this.notifySelectionChanged();
+      await this.requestRedraw();
       return { consumed: true };
     }
     if ((ctrl || meta) && ((key === 'z' || key === 'Z') && shift || key === 'y' || key === 'Y')) {
       const next = this.history.redo(this.snapshot());
-      if (next) {
-        this.restoreSnapshot(next);
-        this.changed('change', this.text);
-        await this.notifySelectionChanged();
-        await this.requestRedraw();
-      }
+      if (!next) return { consumed: false };
+      this.restoreSnapshot(next);
+      this.changed('change', this.text);
+      await this.notifySelectionChanged();
+      await this.requestRedraw();
       return { consumed: true };
     }
 

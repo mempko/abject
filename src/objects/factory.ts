@@ -92,6 +92,8 @@ export class Factory extends Abject {
   private workerEligible: Set<string> = new Set();
   /** Objects being stopped whose snapshots must survive (see the kill handler). */
   private snapshotKeep = new Set<AbjectId>();
+  /** Who asked for each kill in progress: the store credits the removal (and its undo) to them. */
+  private killRequester = new Map<AbjectId, AbjectId>();
   private workerSpawned: Map<AbjectId, string> = new Map(); // objectId → constructorName
   private workerRegistries: Map<AbjectId, AbjectId> = new Map(); // objectId → registryId
 
@@ -272,7 +274,8 @@ export class Factory extends Abject {
       // snapshot goes too. Recovery stops objects it is about to bring back
       // from those very snapshots, and says so.
       if (keepSnapshot) this.snapshotKeep.add(objectId);
-      try { return await this.kill(objectId); } finally { this.snapshotKeep.delete(objectId); }
+      this.killRequester.set(objectId, msg.routing.from);
+      try { return await this.kill(objectId); } finally { this.snapshotKeep.delete(objectId); this.killRequester.delete(objectId); }
     });
 
     this.on('clone', async (msg: AbjectMessage) => {
@@ -1486,7 +1489,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         );
         if (storeResults.length > 0 && !this.snapshotKeep.has(objectId)) {
           await this.request(
-            request(this.id, storeResults[0].id, 'remove', { objectId })
+            request(this.id, storeResults[0].id, 'remove', { objectId, ...this.removalFor(objectId) })
           );
         }
       } catch { /* AbjectStore may not exist in this workspace */ }
@@ -1498,6 +1501,12 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     this.workerRegistries.delete(objectId);
 
     return true;
+  }
+
+  /** The `for` a removal carries: who asked for the kill, when someone did. */
+  private removalFor(objectId: AbjectId): { for?: AbjectId } {
+    const by = this.killRequester.get(objectId);
+    return by ? { for: by } : {};
   }
 
   /**
@@ -1542,7 +1551,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         );
         if (storeResults.length > 0 && !this.snapshotKeep.has(objectId)) {
           await this.request(
-            request(this.id, storeResults[0].id, 'remove', { objectId })
+            request(this.id, storeResults[0].id, 'remove', { objectId, ...this.removalFor(objectId) })
           );
         }
       } catch { /* AbjectStore may not exist in this workspace */ }

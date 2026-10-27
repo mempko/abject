@@ -20,8 +20,9 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
-import { require as precondition, invariant } from '../core/contracts.js';
+import { request, event } from '../core/message.js';
+import { require as precondition, invariant, ContractViolation } from '../core/contracts.js';
+import { UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods, type UndoAction, type UndoResult, type UndoStep } from '../core/undo.js';
 import { Log } from '../core/timed-log.js';
 import { LLMProviderDescription, servesChat } from '../llm/provider.js';
 import { LATEST_MODEL, aliasLadders, freezeModel, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
@@ -182,6 +183,23 @@ const WRITERS = ['GlobalSettings', 'CliServer'] as const;
 /** Who may read secrets back. */
 const SECRET_READERS = ['GlobalSettings'] as const;
 
+/**
+ * What undo puts back. Only the AI section's plain fields and the saved
+ * presets: credentials are secrets and never enter a history, and every other
+ * section (the login, filesystem, shell, web, prompt mode) decides access, so
+ * taking a change back there could widen it. Those changes stay final.
+ */
+const AI_UNDO_LABELS: Record<string, string> = {
+  ...Object.fromEntries(TIER_NAMES.map(t => [`tiers.${t}`, `${TIER_LABELS[t]} tier`])),
+  vision: 'Vision fallback', fallback: 'Tier fallback', decision: 'Decision model',
+  decisionGates: 'decision gates', cacheKeepalive: 'prompt-cache keepalive', learningBudgetUsdPerDay: 'learning budget',
+};
+
+/** One undoable change: the AI fields it changed (before and after), or one saved preset. */
+type SettingsUndoStep =
+  | { kind: 'ai'; before: Record<string, unknown>; after: Record<string, unknown> }
+  | { kind: 'preset'; name: string; before: TierPreset | null; after: TierPreset | null };
+
 /** Read a stored rules record, tolerating the plain allow-array first written. */
 function parseObjectRules(json: string): ObjectCommandRules {
   const parsed = JSON.parse(json) as unknown;
@@ -249,6 +267,24 @@ export class SettingsManager extends Abject {
   private permissionBrokerId?: AbjectId;
   private authorityClaimed = false;
 
+  /**
+   * Each writer's undoable changes, in memory for the session: the AI fields a
+   * change moved (no credential) and saved presets. A burst of saves to the
+   * same fields merges into one step.
+   */
+  private undoHistories = new UndoHistories<SettingsUndoStep>({
+    maxSteps: 50,
+    maxBytes: 256 * 1024,
+    merge: (older, newer) => {
+      if (older.kind === 'ai' && newer.kind === 'ai') {
+        return { kind: 'ai', before: { ...newer.before, ...older.before }, after: { ...older.after, ...newer.after } };
+      }
+      return older.kind === 'preset' && newer.kind === 'preset' ? { ...older, after: newer.after } : newer;
+    },
+  }, 16);
+  /** The live id each writer last changed settings from, to tell it its undo state moved. */
+  private undoCallers = new Map<string, AbjectId>();
+
   constructor() {
     super({
       manifest: {
@@ -289,8 +325,10 @@ export class SettingsManager extends Abject {
             { name: 'deletePreset', description: 'Delete a saved preset (built-ins stay).', parameters: [{ name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Preset name' }], returns: { kind: 'primitive', primitive: 'boolean' } },
             { name: 'listModels', description: 'Models one provider offers (its live catalog when reachable).', parameters: [{ name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider id' }], returns: { kind: 'array', elementType: { kind: 'reference', reference: 'ModelInfo' } } },
             { name: 'isConfigured', description: 'True once any model credential or tier is set.', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
+            ...undoMethods('your last change to the AI settings (tiers, single-model rows, gates, keepalive, learning budget) or to a saved preset. Credentials, the login and the permission sections are never undone'),
           ],
           events: [
+            ...UNDO_EVENTS,
             { name: 'settingsChanged', description: 'A section changed (changed aspect, value: { section }). Section "presets" also announces a provider registered or withdrawn by another abject, which changes the built-in presets and the provider options in the schema.', payload: { kind: 'object', properties: { section: { kind: 'primitive', primitive: 'string' } } } },
           ],
         },
@@ -357,7 +395,9 @@ export class SettingsManager extends Abject {
       const { section, values } = (msg.payload ?? {}) as { section?: string; values?: Record<string, unknown> };
       precondition(SETTINGS_SECTIONS.includes(section as SettingsSectionId), `Unknown settings section: ${section}. Sections: ${SETTINGS_SECTIONS.join(', ')}`);
       precondition(!!values && typeof values === 'object' && !Array.isArray(values), 'values must be an object of the fields to change');
+      const before = section === 'ai' ? this.aiUndoFields() : undefined;
       await this.setSection(section as SettingsSectionId, values!);
+      if (before) await this.recordAiChange(msg, before);
       return this.view(section as SettingsSectionId, false);
     });
 
@@ -390,7 +430,9 @@ export class SettingsManager extends Abject {
         const route = tiers[tier];
         if (!route || !this.providerDescById.has(route.provider)) tiers[tier] = this.tiers[tier];
       }
+      const before = this.aiUndoFields();
       await this.setSection('ai', update);
+      await this.recordAiChange(msg, before, `Apply preset ${name}`);
       return this.view('ai', false);
     });
 
@@ -417,9 +459,10 @@ export class SettingsManager extends Abject {
         const model = desc ? freezeModel(desc, this.catalogFor(route.provider), tier, route.model) : route.model;
         routing[tier] = { provider: route.provider, model, ...(route.effort ? { effort: route.effort } : {}) };
       }
-      this.savedPresets[name!.trim()] = { routing, vision: source.vision ?? null, fallback: source.fallback ?? null, decision: source.decision ?? null };
-      await this.store('set', STORAGE_KEY_TIER_PRESETS, JSON.stringify(this.savedPresets));
-      this.changed('settingsChanged', { section: 'presets' });
+      const key = name!.trim();
+      const before = this.savedPresets[key] ?? null;
+      await this.writePreset(key, { routing, vision: source.vision ?? null, fallback: source.fallback ?? null, decision: source.decision ?? null });
+      await this.recordUndo(msg, `Save preset ${key}`, { kind: 'preset', name: key, before, after: this.savedPresets[key] }, `preset:${key}`);
       return true;
     });
 
@@ -427,11 +470,19 @@ export class SettingsManager extends Abject {
       await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
       const { name } = (msg.payload ?? {}) as { name?: string };
       precondition(typeof name === 'string' && !!this.savedPresets[name], 'Only saved presets can be deleted (built-ins stay).');
-      delete this.savedPresets[name!];
-      await this.store('set', STORAGE_KEY_TIER_PRESETS, JSON.stringify(this.savedPresets));
-      this.changed('settingsChanged', { section: 'presets' });
+      const before = this.savedPresets[name!];
+      await this.writePreset(name!, null);
+      await this.recordUndo(msg, `Delete preset ${name}`, { kind: 'preset', name: name!, before, after: null }, `preset:${name}`);
       return true;
     });
+
+    // Undo and redo take back the caller's own changes, through the same
+    // write paths (validated, persisted, applied, announced). Admitted like a
+    // write: whoever may change settings may take their change back.
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) =>
+      this.undoHistories.state(await this.undoCallerKey(msg.routing.from)));
 
     this.on('listModels', async (msg: AbjectMessage) => {
       const { provider } = (msg.payload ?? {}) as { provider?: string };
@@ -1272,6 +1323,106 @@ export class SettingsManager extends Abject {
   }
 
   // ===========================================================================
+  // Undo
+  // ===========================================================================
+
+  /** The AI fields undo covers, by path, as they stand now. No credential is among them. */
+  private aiUndoFields(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const t of TIER_NAMES) out[`tiers.${t}`] = this.tiers[t] ? { ...this.tiers[t]! } : null;
+    for (const k of AUX_ROW_KEYS) out[k] = this.aux[k] ? { ...this.aux[k]! } : null;
+    out.decisionGates = this.decisionGates;
+    out.cacheKeepalive = this.cacheKeepalive;
+    out.learningBudgetUsdPerDay = this.learningBudgetUsdPerDay;
+    return out;
+  }
+
+  /** The setAi values that put these fields back. */
+  private aiValuesFrom(fields: Record<string, unknown>): Record<string, unknown> {
+    const values: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(fields)) {
+      if (key.startsWith('tiers.')) {
+        values.tiers = { ...(values.tiers as Record<string, unknown> | undefined), [key.slice('tiers.'.length)]: value };
+      } else {
+        values[key] = value;
+      }
+    }
+    return values;
+  }
+
+  /** Record the AI fields a change moved, if any did; credentials changed with them stay out. */
+  private async recordAiChange(msg: AbjectMessage, before: Record<string, unknown>, label?: string): Promise<void> {
+    const now = this.aiUndoFields();
+    const keys = Object.keys(now).filter(k => !sameValue(before[k], now[k]));
+    if (keys.length === 0) return;
+    const pick = (from: Record<string, unknown>) => Object.fromEntries(keys.map(k => [k, from[k]]));
+    await this.recordUndo(msg,
+      label ?? (keys.length === 1 ? `Change ${AI_UNDO_LABELS[keys[0]]}` : 'Change AI settings'),
+      { kind: 'ai', before: pick(before), after: pick(now) }, keys.join(','));
+  }
+
+  private async recordUndo(msg: AbjectMessage, label: string, data: SettingsUndoStep, mergeKey: string): Promise<void> {
+    const caller = await this.undoCallerKey(msg.routing.from);
+    this.undoHistories.for(caller).record(label, data, { mergeKey });
+    this.undoCallers.set(caller, msg.routing.from);
+    this.tellUndoState(caller);
+  }
+
+  private async undoFor(msg: AbjectMessage, action: UndoAction): Promise<UndoResult> {
+    await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
+    const caller = await this.undoCallerKey(msg.routing.from);
+    const history = this.undoHistories.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](step => this.applyUndoStep(step, action));
+    this.undoCallers.set(caller, msg.routing.from);
+    this.tellUndoState(caller);
+    return result;
+  }
+
+  /**
+   * Put a step's other side back, only while what it would overwrite still
+   * holds what the step left. A write the current settings no longer accept
+   * (a provider gone, its key removed) refuses the step.
+   */
+  private async applyUndoStep(step: UndoStep<SettingsUndoStep>, action: UndoAction): Promise<void> {
+    const verb = action === 'undo' ? 'undone' : 'redone';
+    const data = step.data;
+    const expect = action === 'undo' ? data.after : data.before;
+    const target = action === 'undo' ? data.before : data.after;
+    try {
+      if (data.kind === 'ai') {
+        const now = this.aiUndoFields();
+        for (const key of Object.keys(expect as Record<string, unknown>)) {
+          if (!sameValue(now[key], (expect as Record<string, unknown>)[key])) {
+            throw new UndoRefused(`The ${AI_UNDO_LABELS[key] ?? key} changed since, so "${step.label}" can no longer be ${verb}`);
+          }
+        }
+        await this.setSection('ai', this.aiValuesFrom(target as Record<string, unknown>));
+      } else {
+        if (!sameValue(this.savedPresets[data.name] ?? null, expect)) {
+          throw new UndoRefused(`Preset '${data.name}' changed since, so "${step.label}" can no longer be ${verb}`);
+        }
+        await this.writePreset(data.name, target as TierPreset | null);
+      }
+    } catch (err) {
+      if (err instanceof ContractViolation) throw new UndoRefused(err.message);
+      throw err;
+    }
+  }
+
+  private tellUndoState(caller: string): void {
+    const to = this.undoCallers.get(caller);
+    if (to) this.send(event(this.id, to, 'undoStateChanged', this.undoHistories.state(caller)));
+  }
+
+  /** Save (or, with null, delete) one preset, persist the set, and announce it. */
+  private async writePreset(name: string, preset: TierPreset | null): Promise<void> {
+    if (preset) this.savedPresets[name] = preset; else delete this.savedPresets[name];
+    await this.store('set', STORAGE_KEY_TIER_PRESETS, JSON.stringify(this.savedPresets));
+    this.changed('settingsChanged', { section: 'presets' });
+  }
+
+  // ===========================================================================
   // Storage
   // ===========================================================================
 
@@ -1305,8 +1456,15 @@ The global settings as data. The Settings window and the terminal client edit th
 setSettings, applyPreset, savePreset and deletePreset are taken from the Settings window, the terminal client, and objects in a local workspace this machine hosts (never from shared or public workspaces):
 changing settings is the person's call. To change something, open the Settings window (GlobalSettings.show) or ask the user.
 
+### Undo
+undo() / redo() take back your own last change to the AI settings (tier routing, the single-model rows,
+decision gates, keepalive, the learning budget) or to a saved preset, re-applied through the same checks
+as setSettings. getUndoState() says what they would do. Credentials, the login and the permission sections
+are never undone: change those again with setSettings.
+
 ### Events
-- settingsChanged { section } after every change.`;
+- settingsChanged { section } after every change.
+- undoStateChanged to the caller whose undo history moved.`;
   }
 }
 

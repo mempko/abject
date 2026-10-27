@@ -146,7 +146,50 @@ the workspace Console (never throws); `setTimer()`, `setRecurringTimer()`,
 `builtIn`) and `isBuiltInCaller()` (the admission check privileged handlers
 make);
 `capabilityCaller()` and `requireTaskRuntime()` (recover the real caller
-behind JobManager or AgentAbject); `retainTaskResult()` / `takeTaskResult()`.
+behind JobManager or AgentAbject); `retainTaskResult()` / `takeTaskResult()`;
+`undoCallerKey()` (whose undo history a sender writes to: its durable typeId)
+and `forwardUndo()` (undo this object's newest change among the owners it
+changed; see Undo below).
+
+## Undo
+
+`undo.ts` is the protocol and the bookkeeping; the abjects do the rest by
+message.
+
+- **The owner of the data keeps the history, one per caller.** An abject
+  that offers undo declares `undoMethods()` (`undo`, `redo`, `getUndoState`)
+  and `UNDO_EVENTS` (`undoStateChanged`, sent to the caller whose history
+  moved). `undo` answers `UndoResult` `{ ok, label, reason }`; nothing to
+  undo, or a step that no longer applies, is `ok: false` with a reason, never
+  a thrown error. Histories are keyed by `undoCallerKey(from)`, so a window
+  asks the owner to undo *its own* last change and the undo arrives from the
+  same caller the change did: the owner's admission checks still hold.
+- **A window forwards.** An object whose window changes other owners'
+  data answers `undo` / `redo` with `forwardUndo([owners], action)`, which
+  asks each `getUndoState` and acts on the newest step (`undoAt` for undo,
+  `redoAt` for redo). An object that owns both the window and the data keeps
+  one history of its own and answers from it.
+- **`UndoHistory`** keeps labeled steps; a step recorded within `mergeMs`
+  of the last with the same label and `mergeKey` merges into it when a
+  `merge` function is given. `undo(apply)` / `redo(apply)` run one at a time
+  and move the step across only when `apply` succeeds. `apply` throws
+  `UndoRefused` when the step can no longer apply (the data changed since,
+  what it brings back expired): the step is dropped. Any other error keeps
+  it. `toJSON()` / `load()` persist it; `UndoHistories` is one per caller.
+- **Routing.** A key press of Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y
+  (`undoKeyAction()`) that no widget consumes makes the window emit
+  `undoRequested` / `redoRequested`; WidgetManager sends `undo` / `redo` to
+  the window's owner when its manifest `isUndoable()`, and shows the result
+  as a quiet toast (NotificationCenter `notify { quiet: true }` keeps it out
+  of history). A text field consumes the keys only while it has typing to
+  take back, so typing is undone first, then the app's steps. The desktop
+  app's Edit menu types the same keys.
+- **Undo never grants.** No step is recorded for a change whose reversal
+  would widen access, re-admit a peer or bring back a credential; such
+  changes keep their confirm dialogs.
+- Storage journals `set` / `delete` / `setMany` given `undo: 'Label'`;
+  ScriptableAbject records `saveData({ undo })`; AbjectStore sets removed
+  objects aside for the session and three days. See their READMEs.
 
 ## Files
 
@@ -163,6 +206,9 @@ behind JobManager or AgentAbject); `retainTaskResult()` / `takeTaskResult()`.
   registry types (`ObjectRegistration`, `ObjectSummary`, `DiscoveryQuery`),
   and `SpawnRequest` / `SpawnResult`. WASM ABI types live in
   `src/sandbox/wasm-abi.ts`.
+- **undo.ts**: the undo protocol. `undoMethods()`, `UNDO_EVENTS`,
+  `UndoState`, `UndoResult`, `UndoHistory`, `UndoHistories`, `UndoRefused`,
+  `isUndoable()`, `undoKeyAction()`, `sameValue()`. See Undo above.
 - **built-in.ts**: which objects the system trusts. `isBuiltInRegistration()`
   (a registration with no source, no package owner, no remote peer: an
   instance of a server class) and `BOOTSTRAP_SENDER_ID`, the sender the

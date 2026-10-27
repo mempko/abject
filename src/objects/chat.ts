@@ -23,6 +23,7 @@ import { replyKindQuestions, REPLY_KINDS_TO_AUDIT, criterion, instruction } from
 import { choiceOf, type DecisionOutcome, type DecisionQuestion } from '../llm/decision.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, invariant } from '../core/contracts.js';
+import { UndoHistory, UndoRefused, UNDO_EVENTS, undoMethods } from '../core/undo.js';
 import { cleanChoices } from '../core/choices.js';
 import { cleanCardData, cardText, standardCardManifest, STANDARD_CARD_SOURCE, CARD_GUIDANCE } from './standard-card.js';
 import type { AgentAction } from './agent-abject.js';
@@ -216,6 +217,11 @@ function withCardText(entry: { content: string; card?: { text: string } }): stri
 
 // ─── Chat-specific types ─────────────────────────────────────────────
 
+/** One undoable change to a conversation: the entries a clearing removed, or a title change. */
+type ChatEdit =
+  | { kind: 'clear'; entries: ConversationEntry[] }
+  | { kind: 'title'; before: string; after: string };
+
 interface ConversationEntry {
   id?: string;
   sourceGoalId?: string;
@@ -308,6 +314,13 @@ export class Chat extends Abject {
   private turnChoices?: string[];
 
   private conversationHistory: ConversationEntry[] = [];
+  /**
+   * This conversation's clearings and title changes, for undo (in memory,
+   * the session). One history, whoever made the change: the window's undo
+   * is the person at this conversation, and all it brings back is what the
+   * conversation already held.
+   */
+  private edits = new UndoHistory<ChatEdit>({ maxSteps: 20, mergeMs: 0 });
   private turnContext?: ConversationContext;
   /** Last goalActivity value emitted (dedupe transitions). */
   private lastGoalActivity?: boolean;
@@ -506,20 +519,22 @@ export class Chat extends Abject {
               },
               {
                 name: 'clearHistory',
-                description: 'Reset conversation history',
+                description: 'Reset conversation history. `undo` puts the cleared messages back.',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'setTitle',
-                description: 'Update the conversation title.',
+                description: 'Update the conversation title. `undo` puts the old title back.',
                 parameters: [
                   { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'New conversation title' },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              ...undoMethods('the last clearing or title change of this conversation'),
             ],
             events: [
+              ...UNDO_EVENTS,
               {
                 name: 'messageAdded',
                 description: 'Fires every time a message joins the conversation (user input, assistant reply, system notification, or error). Subscribe via addDependent to forward, mirror, or log messages from bridges, proxies, relays, and integrations. In-progress agent activity is not a message and never fires this. Includes conversationId for multi-chat subscribers and a message id.',
@@ -780,6 +795,11 @@ export class Chat extends Abject {
     }));
 
     this.on('clearHistory', async () => {
+      if (this.conversationHistory.length > 0) {
+        if (this.conversationId) this.conversationHistory = identifyMessages(this.conversationId, this.conversationHistory);
+        this.edits.record('Clear chat', { kind: 'clear', entries: this.conversationHistory });
+        this.changed('undoStateChanged', this.edits.state());
+      }
       this.conversationHistory = [];
       // Drop persisted history too; the roster entry survives so the
       // conversation itself isn't deleted (ChatManager owns that).
@@ -799,18 +819,28 @@ export class Chat extends Abject {
     this.on('setTitle', async (msg: AbjectMessage) => {
       const { title } = msg.payload as { title: string };
       const next = (title ?? '').trim().slice(0, 80);
-      if (!next || next === this.conversationTitle) return false;
-      this.conversationTitle = next;
-      // Notify ChatManager for roster updates
-      if (this.chatManagerId && this.conversationId) {
-        this.send(event(this.id, this.chatManagerId, 'titleChanged', {
-          conversationId: this.conversationId,
-          title: next,
-        }));
+      const before = this.conversationTitle ?? '';
+      if (!next || next === before) return false;
+      // A rename made through ChatManager is its step; it passes the title on here.
+      if (msg.routing.from !== this.chatManagerId) {
+        this.edits.record('Rename chat', { kind: 'title', before, after: next });
+        this.changed('undoStateChanged', this.edits.state());
       }
-      this.changed('titleChanged', { conversationId: this.conversationId ?? '', title: next });
+      this.applyTitle(next);
       return true;
     });
+
+    this.on('undo', async () => {
+      const result = await this.edits.undo(step => this.applyEdit(step.data, 'undo'));
+      this.changed('undoStateChanged', this.edits.state());
+      return result;
+    });
+    this.on('redo', async () => {
+      const result = await this.edits.redo(step => this.applyEdit(step.data, 'redo'));
+      this.changed('undoStateChanged', this.edits.state());
+      return result;
+    });
+    this.on('getUndoState', async () => this.edits.state());
 
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
@@ -2105,6 +2135,46 @@ A single successful creation goal is a complete turn. End it with **done**.
     }, 250);
   }
 
+  /** Set the title, and tell ChatManager (the roster) and the window. */
+  private applyTitle(next: string): void {
+    this.conversationTitle = next;
+    if (this.chatManagerId && this.conversationId) {
+      this.send(event(this.id, this.chatManagerId, 'titleChanged', {
+        conversationId: this.conversationId,
+        title: next,
+      }));
+    }
+    this.changed('titleChanged', { conversationId: this.conversationId ?? '', title: next });
+  }
+
+  /**
+   * Undo or redo one change. Undoing a clearing puts its messages back ahead
+   * of anything said since; redoing it takes the same messages out again.
+   */
+  private async applyEdit(edit: ChatEdit, action: 'undo' | 'redo'): Promise<void> {
+    if (edit.kind === 'title') {
+      const [expect, next] = action === 'undo' ? [edit.after, edit.before] : [edit.before, edit.after];
+      if ((this.conversationTitle ?? '') !== expect) throw new UndoRefused(`The chat was renamed since ('${this.conversationTitle ?? ''}')`);
+      if (!next) throw new UndoRefused('The chat had no title to go back to');
+      this.applyTitle(next);
+      return;
+    }
+    const ids = new Set(edit.entries.map(e => e.id).filter((id): id is string => !!id));
+    const same = (e: ConversationEntry) => edit.entries.includes(e) || (!!e.id && ids.has(e.id));
+    const since = this.conversationHistory.filter(e => !same(e));
+    this.conversationHistory = action === 'undo' ? [...edit.entries, ...since] : since;
+    if (this.conversationHistory.length > 0) {
+      await this.persistHistory();
+    } else if (this.conversationId && this.storageId) {
+      try {
+        await this.request(request(this.id, this.storageId, 'delete', { key: `chats:history:${this.conversationId}` }));
+      } catch { /* best effort */ }
+    }
+    if (this.windowId) {
+      try { this.send(event(this.id, this.windowId, 'chatReloaded', {})); } catch { /* window gone */ }
+    }
+  }
+
   private schedulePersist(): void {
     if (!this.conversationId || !this.storageId) return;
     if (this.persistTimer) return;
@@ -2136,14 +2206,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     const cleaned = userText.replace(/\s+/g, ' ').trim();
     if (!cleaned) return;
     const derived = cleaned.length > 40 ? cleaned.slice(0, 40).trimEnd() + '…' : cleaned;
-    this.conversationTitle = derived;
-    if (this.chatManagerId) {
-      this.send(event(this.id, this.chatManagerId, 'titleChanged', {
-        conversationId: this.conversationId,
-        title: derived,
-      }));
-    }
-    this.changed('titleChanged', { conversationId: this.conversationId, title: derived });
+    this.applyTitle(derived);
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -2632,6 +2695,8 @@ Relaying a user's message from another channel (bridge / proxy pattern):
 ### Clear conversation history
 
   await call(await dep('Chat'), 'clearHistory', {});
+  // Undoable: undo puts the cleared messages back.
+  await call(await dep('Chat'), 'undo', {});
 
 ### Observe messages as they land (bridge / proxy / relay pattern)
 

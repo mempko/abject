@@ -13,6 +13,13 @@
  * Two objects that have never negotiated a protocol can still cooperate
  * through a shared collection; the change events give TriggerManager rules,
  * bound tables, and live charts something to react to.
+ *
+ * A write that carries `undo: 'Label'` is journaled for its caller (in memory,
+ * this session): the rows as they were before and after, so the caller's
+ * `undo` puts them back and `redo` takes them forward again, each only while
+ * the rows still hold what the step left. A collection dropped with a label
+ * is set aside instead (its table renamed under `_dropped_`), kept for the
+ * session and at least three days, so undo can bring it back whole.
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -27,8 +34,9 @@ import {
   requireNonEmpty,
   invariant,
 } from '../core/contracts.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods, type UndoAction, type UndoResult, type UndoStep } from '../core/undo.js';
 import { workspaceDataDir, legacyHomeDataDir, moveLegacyData } from './data-dir-layout.js';
 
 const log = new Log('COLLECTION-STORE');
@@ -48,6 +56,36 @@ const IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const RESERVED_COLUMNS = new Set(['id', 'createdAt', 'updatedAt', 'extra']);
 
 const QUERY_ROW_CAP = 1000;
+
+/** A dropped collection set aside for undo is kept at least this long (and for the whole session). */
+const DROPPED_KEEP_MS = 3 * 24 * 60 * 60_000;
+
+/** A row exactly as stored (`SELECT *`). */
+type RawRow = Record<string, unknown>;
+
+/** One row before and after a journaled write; null where the row is absent. */
+interface RowChange { collection: string; id: string; before: RawRow | null; after: RawRow | null }
+
+/** One undoable step: rows written, or a collection set aside under `hiddenAs`. */
+type CollectionUndoStep =
+  | { kind: 'rows'; changes: RowChange[] }
+  | { kind: 'drop'; name: string; hiddenAs: string };
+
+/** The optional undo label on writes. */
+const undoParam = {
+  name: 'undo',
+  type: { kind: 'primitive' as const, primitive: 'string' as const },
+  description: 'A label for this change (e.g. "Clean up expenses"). Given one, the change is kept in your undo history here and your `undo` call puts the rows back. Writes with the same label in a burst are one step.',
+  optional: true,
+};
+
+/** Same content, ignoring when it was last written. */
+function sameRow(a: RawRow | null, b: RawRow | null): boolean {
+  if (!a || !b) return a === b;
+  const { updatedAt: _a, ...restA } = a;
+  const { updatedAt: _b, ...restB } = b;
+  return sameValue(restA, restB);
+}
 
 type JsonSchema = {
   type?: string;
@@ -124,6 +162,30 @@ export class CollectionStore extends Abject {
   private collections: Map<string, CollectionMeta> = new Map();
   private ajv = new Ajv({ allErrors: true, strict: false });
 
+  /**
+   * Each caller's journaled writes, in memory for the session. A burst of
+   * writes under one label is one step, with each row's first before and
+   * last after.
+   */
+  private journal = new UndoHistories<CollectionUndoStep>({
+    maxSteps: 100,
+    maxBytes: 2 * 1024 * 1024,
+    mergeMs: 10_000,
+    merge: (older, newer) => {
+      if (older.kind !== 'rows' || newer.kind !== 'rows') return newer;
+      const byRow = new Map(older.changes.map(c => [`${c.collection}\u0000${c.id}`, { ...c }]));
+      for (const c of newer.changes) {
+        const key = `${c.collection}\u0000${c.id}`;
+        const prior = byRow.get(key);
+        byRow.set(key, prior ? { ...prior, after: c.after } : c);
+      }
+      return { kind: 'rows', changes: [...byRow.values()] };
+    },
+  }, 32);
+  /** The live id each caller last wrote from, to tell it its undo state moved. */
+  private journalCallers = new Map<string, AbjectId>();
+  private droppedSeq = 0;
+
   constructor() {
     super({
       manifest: {
@@ -152,6 +214,7 @@ export class CollectionStore extends Abject {
               parameters: [
                 { name: 'collection', type: { kind: 'primitive', primitive: 'string' }, description: 'Collection name' },
                 { name: 'record', type: { kind: 'object', properties: {} }, description: 'Record fields' },
+                undoParam,
               ],
               returns: { kind: 'object', properties: { id: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -162,6 +225,7 @@ export class CollectionStore extends Abject {
                 { name: 'collection', type: { kind: 'primitive', primitive: 'string' }, description: 'Collection name' },
                 { name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Record id' },
                 { name: 'changes', type: { kind: 'object', properties: {} }, description: 'Fields to change' },
+                undoParam,
               ],
               returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
@@ -171,6 +235,7 @@ export class CollectionStore extends Abject {
               parameters: [
                 { name: 'collection', type: { kind: 'primitive', primitive: 'string' }, description: 'Collection name' },
                 { name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Record id' },
+                undoParam,
               ],
               returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
@@ -212,14 +277,17 @@ export class CollectionStore extends Abject {
             },
             {
               name: 'dropCollection',
-              description: 'Delete a collection and all its records',
+              description: 'Delete a collection and all its records. With `undo`, the collection is set aside (session and at least three days) so your undo brings it back whole.',
               parameters: [
                 { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Collection name' },
+                undoParam,
               ],
               returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
+            ...undoMethods('your last write made with an `undo` label (your writes only): rows changed go back, inserted rows go, removed rows return with their ids, a dropped collection comes back. Rows written again since are not overwritten: the undo is refused. Undo writes emit the usual record events'),
           ],
           events: [
+            ...UNDO_EVENTS,
             { name: 'collectionCreated', description: 'A collection was created', payload: { kind: 'object', properties: { name: { kind: 'primitive', primitive: 'string' } } } },
             { name: 'collectionDropped', description: 'A collection was dropped', payload: { kind: 'object', properties: { name: { kind: 'primitive', primitive: 'string' } } } },
             { name: 'recordInserted', description: 'A record was inserted', payload: { kind: 'object', properties: { collection: { kind: 'primitive', primitive: 'string' }, id: { kind: 'primitive', primitive: 'string' } } } },
@@ -318,6 +386,16 @@ export class CollectionStore extends Abject {
       synced INTEGER NOT NULL DEFAULT 0,
       createdAt INTEGER NOT NULL
     )`);
+    // Collections dropped with an undo label wait here, renamed, until purged.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS _dropped (
+      hidden TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      schemaJson TEXT,
+      synced INTEGER NOT NULL DEFAULT 0,
+      createdAt INTEGER NOT NULL,
+      droppedAt INTEGER NOT NULL
+    )`);
+    this.purgeDropped();
     this.loadCollections();
     this.checkInvariants();
     return this.db;
@@ -458,11 +536,12 @@ export class CollectionStore extends Abject {
     });
 
     this.on('insert', async (msg: AbjectMessage) => {
-      const { collection, record } = msg.payload as {
-        collection: string; record: Record<string, unknown>;
+      const { collection, record, undo } = msg.payload as {
+        collection: string; record: Record<string, unknown>; undo?: string;
       };
       requireNonEmpty(collection, 'collection');
       precondition(record !== null && typeof record === 'object', 'record must be an object');
+      this.checkUndoLabel(undo);
       const db = this.openDb();
       const m = this.meta(collection);
       this.validateRecord(m, record);
@@ -484,16 +563,18 @@ export class CollectionStore extends Abject {
       const stored = this.rowToRecord(m, { id, createdAt: now, updatedAt: now, ...typed,
         extra: Object.keys(extra).length > 0 ? JSON.stringify(extra) : null });
       this.changed('recordInserted', { collection, id, record: stored });
+      if (undo !== undefined) await this.journalRows(msg, undo, [{ collection, id, before: null, after: this.readRaw(collection, id) }]);
       return { id };
     });
 
     this.on('update', async (msg: AbjectMessage) => {
-      const { collection, id, changes } = msg.payload as {
-        collection: string; id: string; changes: Record<string, unknown>;
+      const { collection, id, changes, undo } = msg.payload as {
+        collection: string; id: string; changes: Record<string, unknown>; undo?: string;
       };
       requireNonEmpty(collection, 'collection');
       requireNonEmpty(id, 'id');
       precondition(changes !== null && typeof changes === 'object', 'changes must be an object');
+      this.checkUndoLabel(undo);
       const db = this.openDb();
       const m = this.meta(collection);
 
@@ -520,18 +601,25 @@ export class CollectionStore extends Abject {
 
       const stored = { ...merged, id, createdAt: current.createdAt, updatedAt: now };
       this.changed('recordUpdated', { collection, id, record: stored });
+      if (undo !== undefined) {
+        const after = this.readRaw(collection, id);
+        if (!sameRow(row, after)) await this.journalRows(msg, undo, [{ collection, id, before: { ...row }, after }]);
+      }
       return { success: true };
     });
 
     this.on('remove', async (msg: AbjectMessage) => {
-      const { collection, id } = msg.payload as { collection: string; id: string };
+      const { collection, id, undo } = msg.payload as { collection: string; id: string; undo?: string };
       requireNonEmpty(collection, 'collection');
       requireNonEmpty(id, 'id');
+      this.checkUndoLabel(undo);
       const db = this.openDb();
       this.meta(collection);
+      const before = undo !== undefined ? this.readRaw(collection, id) : null;
       const res = db.prepare(`DELETE FROM "${collection}" WHERE id = ?`).run(id);
       const success = Number(res.changes) > 0;
       if (success) this.changed('recordRemoved', { collection, id });
+      if (success && before) await this.journalRows(msg, undo!, [{ collection, id, before, after: null }]);
       return { success };
     });
 
@@ -611,11 +699,17 @@ export class CollectionStore extends Abject {
     });
 
     this.on('dropCollection', async (msg: AbjectMessage) => {
-      const { name } = msg.payload as { name: string };
+      const { name, undo } = msg.payload as { name: string; undo?: string };
       requireNonEmpty(name, 'name');
       precondition(IDENT_RE.test(name), 'invalid collection name');
+      this.checkUndoLabel(undo);
       const db = this.openDb();
       if (!this.collections.has(name)) return { success: false };
+      if (undo !== undefined) {
+        const hiddenAs = this.setAside(name);
+        await this.recordStep(msg, undo, { kind: 'drop', name, hiddenAs }, `drop:${hiddenAs}`);
+        return { success: true };
+      }
       db.exec(`DROP TABLE IF EXISTS "${name}"`);
       db.prepare('DELETE FROM _collections WHERE name = ?').run(name);
       this.collections.delete(name);
@@ -623,6 +717,181 @@ export class CollectionStore extends Abject {
       this.changed('collectionDropped', { name });
       return { success: true };
     });
+
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) =>
+      this.journal.state(await this.undoCallerKey(msg.routing.from)));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Undo
+  // ═══════════════════════════════════════════════════════════════════
+
+  private checkUndoLabel(undo: unknown): void {
+    precondition(undo === undefined || (typeof undo === 'string' && undo.trim().length > 0),
+      'undo: the label must be a non-empty string');
+  }
+
+  private readRaw(collection: string, id: string): RawRow | null {
+    const row = this.openDb().prepare(`SELECT * FROM "${collection}" WHERE id = ?`).get(id) as RawRow | undefined;
+    return row ? { ...row } : null;
+  }
+
+  /** Write a stored row back as it was, stamped now. */
+  private writeRaw(collection: string, row: RawRow): RawRow {
+    const written: RawRow = { ...row, updatedAt: Date.now() };
+    const cols = Object.keys(written);
+    this.openDb().prepare(`INSERT OR REPLACE INTO "${collection}" (${cols.map(c => `"${c}"`).join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`)
+      .run(...Object.values(written) as never[]);
+    return written;
+  }
+
+  private async journalRows(msg: AbjectMessage, label: string, changes: RowChange[]): Promise<void> {
+    await this.recordStep(msg, label, { kind: 'rows', changes }, 'rows');
+  }
+
+  private async recordStep(msg: AbjectMessage, label: string, data: CollectionUndoStep, mergeKey: string): Promise<void> {
+    const caller = await this.undoCallerKey(msg.routing.from);
+    this.journal.for(caller).record(label.trim(), data, { mergeKey });
+    this.journalCallers.set(caller, msg.routing.from);
+    this.tellUndoState(caller);
+  }
+
+  private async undoFor(msg: AbjectMessage, action: UndoAction): Promise<UndoResult> {
+    const caller = await this.undoCallerKey(msg.routing.from);
+    const history = this.journal.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](step => this.applyUndoStep(step, action));
+    this.journalCallers.set(caller, msg.routing.from);
+    this.tellUndoState(caller);
+    return result;
+  }
+
+  private applyUndoStep(step: UndoStep<CollectionUndoStep>, action: UndoAction): void {
+    const verb = action === 'undo' ? 'undone' : 'redone';
+    const data = step.data;
+    this.openDb();
+    if (data.kind === 'drop') {
+      if (action === 'undo') {
+        this.restoreSetAside(data.name, data.hiddenAs, step.label);
+      } else {
+        if (!this.collections.has(data.name)) {
+          throw new UndoRefused(`Collection '${data.name}' is gone, so "${step.label}" can no longer be redone`);
+        }
+        data.hiddenAs = this.setAside(data.name);
+      }
+      return;
+    }
+
+    // Every row must still hold what the step left before any is written.
+    for (const c of data.changes) {
+      if (!this.collections.has(c.collection)) {
+        throw new UndoRefused(`Collection '${c.collection}' is gone, so "${step.label}" can no longer be ${verb}`);
+      }
+      if (!sameRow(this.readRaw(c.collection, c.id), action === 'undo' ? c.after : c.before)) {
+        throw new UndoRefused(`A row in '${c.collection}' changed since, so "${step.label}" can no longer be ${verb}`);
+      }
+    }
+    const db = this.openDb();
+    const events: Array<{ aspect: string; value: Record<string, unknown> }> = [];
+    db.exec('BEGIN');
+    try {
+      for (const c of data.changes) {
+        const target = action === 'undo' ? c.before : c.after;
+        const had = action === 'undo' ? c.after : c.before;
+        if (!target) {
+          db.prepare(`DELETE FROM "${c.collection}" WHERE id = ?`).run(c.id);
+          events.push({ aspect: 'recordRemoved', value: { collection: c.collection, id: c.id } });
+          continue;
+        }
+        const record = this.rowToRecord(this.meta(c.collection), this.writeRaw(c.collection, target));
+        events.push({ aspect: had ? 'recordUpdated' : 'recordInserted', value: { collection: c.collection, id: c.id, record } });
+      }
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+    // The same events a write sends, so views and rules follow the undo.
+    for (const e of events) this.changed(e.aspect, e.value);
+  }
+
+  /**
+   * Drop a collection by setting it aside: its table is renamed under
+   * `_dropped_` and its catalog row moves to `_dropped`. Returns the hidden
+   * name. Announced as a drop.
+   */
+  private setAside(name: string): string {
+    const db = this.openDb();
+    const m = this.meta(name);
+    const hiddenAs = `_dropped_${Date.now()}_${++this.droppedSeq}_${name}`;
+    const row = db.prepare('SELECT schemaJson, synced, createdAt FROM _collections WHERE name = ?').get(name) as
+      { schemaJson: string | null; synced: number; createdAt: number } | undefined;
+    db.exec('BEGIN');
+    try {
+      db.exec(`ALTER TABLE "${name}" RENAME TO "${hiddenAs}"`);
+      db.prepare('INSERT INTO _dropped (hidden, name, schemaJson, synced, createdAt, droppedAt) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(hiddenAs, name, row?.schemaJson ?? (m.schema ? JSON.stringify(m.schema) : null),
+          row?.synced ?? (m.synced ? 1 : 0), row?.createdAt ?? m.createdAt, Date.now());
+      db.prepare('DELETE FROM _collections WHERE name = ?').run(name);
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+    this.collections.delete(name);
+    this.checkInvariants();
+    this.changed('collectionDropped', { name });
+    return hiddenAs;
+  }
+
+  /** Bring a set-aside collection back under its name, announced as a creation. */
+  private restoreSetAside(name: string, hiddenAs: string, label: string): void {
+    const db = this.openDb();
+    if (this.collections.has(name)) {
+      throw new UndoRefused(`A collection named '${name}' exists again, so "${label}" can no longer be undone`);
+    }
+    const kept = db.prepare('SELECT schemaJson, synced, createdAt FROM _dropped WHERE hidden = ?').get(hiddenAs) as
+      { schemaJson: string | null; synced: number; createdAt: number } | undefined;
+    if (!kept) throw new UndoRefused(`'${name}' is no longer kept, so "${label}" can no longer be undone`);
+    db.exec('BEGIN');
+    try {
+      db.exec(`ALTER TABLE "${hiddenAs}" RENAME TO "${name}"`);
+      db.prepare('INSERT OR REPLACE INTO _collections (name, schemaJson, synced, createdAt) VALUES (?, ?, ?, ?)')
+        .run(name, kept.schemaJson, kept.synced, kept.createdAt);
+      db.prepare('DELETE FROM _dropped WHERE hidden = ?').run(hiddenAs);
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+    this.loadCollections();
+    this.checkInvariants();
+    this.changed('collectionCreated', { name });
+  }
+
+  /**
+   * Purge collections set aside more than three days ago. Runs when the
+   * database opens, so whatever this session set aside lasts the session.
+   */
+  private purgeDropped(): void {
+    const db = this.db!;
+    const old = db.prepare('SELECT hidden FROM _dropped WHERE droppedAt < ?').all(Date.now() - DROPPED_KEEP_MS) as { hidden: string }[];
+    for (const { hidden } of old) {
+      try {
+        db.exec(`DROP TABLE IF EXISTS "${hidden}"`);
+        db.prepare('DELETE FROM _dropped WHERE hidden = ?').run(hidden);
+      } catch (err) {
+        log.warn(`Could not purge dropped collection ${hidden}:`, err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (old.length > 0) log.info(`Purged ${old.length} dropped collection(s) kept past three days`);
+  }
+
+  private tellUndoState(caller: string): void {
+    const to = this.journalCallers.get(caller);
+    if (to) this.send(event(this.id, to, 'undoStateChanged', this.journal.state(caller)));
   }
 
   private listCollectionsInfo(): { name: string; schema?: JsonSchema; synced: boolean; rowCount: number }[] {
@@ -665,6 +934,19 @@ schema are stored too (in a JSON extra column) and come back on reads.
 
 Writes emit recordInserted/recordUpdated/recordRemoved to dependents, so UIs
 and rules stay live. addDependent to receive them.
+
+### Undoable writes
+Pass an undo label on insert, update, remove or dropCollection when the person
+may want the change back (cleaning up, bulk edits, an import):
+
+  await call(storeId, 'update', { collection: 'expenses', id, changes: { amount: 13 }, undo: 'Fix amounts' });
+  await call(storeId, 'dropCollection', { name: 'scratch', undo: 'Drop scratch' });
+
+Writes with the same label in a burst form one step. undo() puts your last step
+back (changed rows return, inserted rows go, removed rows return with their ids,
+a dropped collection returns whole); redo() takes it forward again; getUndoState()
+says what they would do. A row written again since is left alone and the undo is
+refused. Undo writes send the usual record events.
 
 ### Read with find (simple) or query (full SQL, read-only)
 

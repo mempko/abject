@@ -23,6 +23,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { undoMethods, type UndoAction, type UndoResult, type UndoState } from '../core/undo.js';
 import { AUTONOMY_LEVELS, type AutonomyLevel, type ExternalProject } from './external-project-registry.js';
 import type { Rule, RuleScope } from './permission-broker.js';
 import { isInside } from '../core/path-scope.js';
@@ -148,6 +149,7 @@ export class ExternalProjectBrowser extends Abject {
                 selected: { kind: 'primitive', primitive: 'string' },
               }},
             },
+            ...undoMethods('the last project added, edited or removed from this window (ExternalProjectRegistry keeps the history; trust and autonomy are never undone)'),
           ],
         },
         tags: ['system', 'ui', 'projects'],
@@ -172,6 +174,18 @@ export class ExternalProjectBrowser extends Abject {
       selected: this.selected ?? null,
     }));
     this.on('windowCloseRequested', async () => { await this.hide(); });
+    // Ctrl+Z in the window: the registry keeps this window's history.
+    this.on('undo', async () => this.undoProjects('undo'));
+    this.on('redo', async () => this.undoProjects('redo'));
+    this.on('getUndoState', async (): Promise<UndoState> => {
+      const reg = await this.registry();
+      if (!reg) return { canUndo: false, canRedo: false };
+      try {
+        return await this.request<UndoState>(request(this.id, reg, 'getUndoState', {}), 5000);
+      } catch {
+        return { canUndo: false, canRedo: false };
+      }
+    });
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       await this.handleChanged(msg.routing.from, aspect, value);
@@ -191,6 +205,8 @@ that check and verify it, and whether it is trusted.
 - \`show()\` — open the window (raises it if already open).
 - \`hide()\` — close it.
 - \`getState()\` — { visible, projectCount, selected }.
+- \`undo()\` / \`redo()\`: take back the last project added, edited or removed here (Ctrl+Z in the window).
+  A removed project comes back untrusted; trust and autonomy changes are never undone.
 
 ### Trust
 A trusted project's CLAUDE.md / AGENTS.md get injected into an agent's prompt and
@@ -1420,21 +1436,28 @@ someone else wrote, so it is a button here rather than something granted on add.
       return;
     }
 
-    const ok = await this.confirm({
-      title: `Remove ${project.name}?`,
-      message: `This forgets the project. Nothing on disk at ${project.root} is touched.`,
-      confirmLabel: 'Remove',
-      destructive: true,
-    });
-    if (!ok) return;
-
+    // Nothing on disk is touched, and the registry keeps the record for undo.
     try {
       await this.request(request(this.id, reg, 'removeProject', { name: project.name }));
       this.selected = undefined;
+      await this.notify(`Removed ${project.name}. Ctrl+Z to undo`, 'success');
     } catch (err) {
       await this.reject(`Could not remove: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
     await this.load();
+  }
+
+  /** Undo or redo this window's last project change in the registry, then show the result. */
+  private async undoProjects(action: UndoAction): Promise<UndoResult> {
+    const result = await this.forwardUndo([await this.registry()], action);
+    if (!result.ok) return result;
+    if (typeof result.note === 'string') await this.notify(result.note, 'info');
+    if (this.windowId) {
+      this.configDraft.clear();
+      this.configDirty = false;
+      await this.load();
+    }
+    return result;
   }
 }
 

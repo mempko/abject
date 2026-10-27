@@ -9,6 +9,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { UNDO_EVENTS, undoMethods, type UndoAction, type UndoResult, type UndoState } from '../core/undo.js';
 import {
   ThemePreset,
   DEFAULT_THEME_ID,
@@ -109,6 +110,8 @@ export class Settings extends Abject {
 
   /** Maps delete button AbjectId → object ID for "Created Objects" section. */
   private objectDeleteButtons: Map<AbjectId, string> = new Map();
+  /** Object ID → its name, for the delete toast. */
+  private objectNames: Map<string, string> = new Map();
 
   /** Maps checkbox AbjectId → object ID for "Exposed" checkboxes on General tab. */
 
@@ -159,7 +162,9 @@ export class Settings extends Abject {
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              ...undoMethods('the last change made in this window: a deleted object, a workspace name, description or tags save, or a theme pick'),
             ],
+            events: UNDO_EVENTS,
           },
         tags: ['system', 'ui', 'settings'],
       },
@@ -253,10 +258,12 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
 - Access tab: select access mode (public or private).
 - Access tab: search and toggle peer whitelist entries (private mode).
 - Danger Zone: delete the entire workspace.
+- \`undo()\` / \`redo()\` (also Ctrl+Z in the window): take back the window's last
+  object delete, workspace name/description/tags save, or theme pick.
 
 ### IMPORTANT
 - The interface ID is '${SETTINGS_INTERFACE}'.
-- Settings is a UI object with show/hide methods only; all configuration is done through the window.
+- Settings is a UI object with show/hide (and undo/redo) methods only; all configuration is done through the window.
 - Changes are persisted via Storage and WorkspaceManager.`;
   }
 
@@ -395,6 +402,12 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     this.on('getState', async () => {
       return { visible: !!this.windowId };
     });
+
+    // The owners keep the history: AbjectStore (deleted objects),
+    // WorkspaceManager (name, description, tags), Theme (theme picks).
+    this.on('undo', async () => this.forwardSettingsUndo('undo'));
+    this.on('redo', async () => this.forwardSettingsUndo('redo'));
+    this.on('getUndoState', async (): Promise<UndoState> => this.settingsUndoState());
 
     // Handle 'changed' events from widget dependents
     this.on('changed', async (msg: AbjectMessage) => {
@@ -1585,6 +1598,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
             preferredSize: { width: 70, height: 28 },
           }));
           this.objectDeleteButtons.set(delBtnId, obj.id);
+          this.objectNames.set(obj.id, obj.name || obj.id);
         }
       }
     }
@@ -2121,10 +2135,12 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     if (!this.abjectStoreId) return;
 
     try {
-      // Remove from AbjectStore
+      // Remove from AbjectStore: it sets the object aside and keeps the
+      // step, so Ctrl+Z here brings it back.
       await this.request(
         request(this.id, this.abjectStoreId, 'remove', { objectId })
       );
+      await this.notify(`Deleted ${this.objectNames.get(objectId) ?? 'object'}. Ctrl+Z to undo`, 'success');
 
       // Kill the live object via Factory
       const factoryId = await this.discoverDep('Factory');
@@ -2234,6 +2250,62 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       const userCard = this.trackTabWidget(userCardId);
       await this.renderSwatchGrid(userCard, userThemes);
     }
+  }
+
+  // ── Undo ──────────────────────────────────────────────────────
+
+  /** The owners this window changes, as far as they are known yet. */
+  private async undoOwners(): Promise<Array<AbjectId | undefined>> {
+    if (!this.themeAbjectId) this.themeAbjectId = await this.discoverDep('Theme') ?? undefined;
+    return [this.abjectStoreId, this.workspaceManagerId, this.themeAbjectId];
+  }
+
+  /** What undo and redo would do next: the newest step among the owners. */
+  private async settingsUndoState(): Promise<UndoState> {
+    const states = await Promise.all((await this.undoOwners()).filter((id): id is AbjectId => !!id).map(async (id) => {
+      try {
+        return await this.request<UndoState>(request(this.id, id, 'getUndoState', {}), 5000);
+      } catch {
+        return undefined;
+      }
+    }));
+    const newest = (key: 'undoAt' | 'redoAt', can: 'canUndo' | 'canRedo') =>
+      states.filter((st): st is UndoState => !!st && st[can])
+        .sort((a, b) => (b[key] ?? 0) - (a[key] ?? 0))[0];
+    const u = newest('undoAt', 'canUndo');
+    const r = newest('redoAt', 'canRedo');
+    return {
+      canUndo: !!u, canRedo: !!r,
+      ...(u ? { undoLabel: u.undoLabel, undoAt: u.undoAt } : {}),
+      ...(r ? { redoLabel: r.redoLabel, redoAt: r.redoAt } : {}),
+    };
+  }
+
+  /**
+   * Undo or redo this window's last change through the owner that keeps it,
+   * then show the result: the open tab rebuilt from the owners, and the
+   * workspace switcher refreshed as a save refreshes it.
+   */
+  private async forwardSettingsUndo(action: UndoAction): Promise<UndoResult> {
+    const result = await this.forwardUndo(await this.undoOwners(), action);
+    if (!result.ok || !this.windowId) return result;
+    if (this.workspaceManagerId && this.workspaceId && this.workspaceSwitcherId) {
+      try {
+        const workspaces = await this.request<Array<{ id: string; name: string }>>(
+          request(this.id, this.workspaceManagerId, 'listWorkspaces', {})
+        );
+        await this.request(request(this.id, this.workspaceSwitcherId, 'show', {
+          workspaces, activeWorkspaceId: this.workspaceId,
+        }));
+      } catch { /* best effort */ }
+    }
+    await this.clearTabContent();
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    if (this.activeTab === 'general') await this.buildGeneralTab(r0);
+    else if (this.activeTab === 'access') await this.buildAccessTab(r0);
+    else if (this.activeTab === 'web') await this.buildWebTab(r0);
+    else await this.buildAppearanceTab();
+    return result;
   }
 
   /**

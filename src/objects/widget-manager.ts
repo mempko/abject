@@ -18,6 +18,7 @@ import { describeMessages, protocolText } from '../core/protocol-description.js'
 
 import {
   AbjectId,
+  AbjectManifest,
   AbjectMessage,
   InterfaceId,
 } from '../core/types.js';
@@ -39,6 +40,7 @@ import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { isUndoable, type UndoAction, type UndoResult } from '../core/undo.js';
 
 const log = new Log('WidgetManager');
 import { ModalDialog } from './modal-dialog.js';
@@ -1660,6 +1662,15 @@ export class WidgetManager extends Abject {
         return;
       }
 
+      // Undo / redo no widget took (Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y, the Edit
+      // menu): the window's owner undoes its own last change when it offers
+      // undo (src/core/undo.ts). A quiet toast says what was taken back.
+      if (aspect === 'undoRequested' || aspect === 'redoRequested') {
+        const ownerId = this.windowOwners.get(fromId);
+        if (ownerId) void this.forwardUndoToOwner(ownerId, aspect === 'undoRequested' ? 'undo' : 'redo');
+        return;
+      }
+
       // Forward window geometry changes to the owner. WindowAbject emits a
       // single 'windowRect' (drag, resize, maximize, programmatic); owners
       // listen for the split 'windowMoved'/'windowResized' events (e.g. Chat
@@ -2038,6 +2049,47 @@ export class WidgetManager extends Abject {
         this.send(request(this.id, this.workspaceManagerId, 'refreshTaskbar', {}));
       } catch { /* WorkspaceManager not reachable */ }
     }
+  }
+
+  /**
+   * Ask a window's owner to undo or redo its last change, when its manifest
+   * offers undo, and say what happened in a toast that stays out of the
+   * notification history. Owners that offer none are left alone.
+   */
+  private async forwardUndoToOwner(ownerId: AbjectId, action: UndoAction): Promise<void> {
+    if (!(await this.ownerOffersUndo(ownerId))) return;
+    let result: UndoResult;
+    try {
+      result = await this.request<UndoResult>(request(this.id, ownerId, action, {}), 60_000);
+    } catch (err) {
+      result = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    }
+    const done = action === 'undo' ? 'Undid' : 'Redid';
+    const text = result?.ok
+      ? `${done} ${result.label ?? 'the last change'}`
+      : (result?.reason ?? (action === 'undo' ? 'Nothing to undo' : 'Nothing to redo'));
+    const centerId = await this.discoverDep('NotificationCenter');
+    if (centerId) {
+      this.send(event(this.id, centerId, 'notify', {
+        message: text, level: result?.ok ? 'info' : 'warning', durationMs: 2000, quiet: true,
+      }));
+    }
+  }
+
+  /** Whether an object's registered manifest declares undo and redo (cached per id). */
+  private undoOwners = new Map<AbjectId, boolean>();
+  private async ownerOffersUndo(ownerId: AbjectId): Promise<boolean> {
+    const known = this.undoOwners.get(ownerId);
+    if (known !== undefined) return known;
+    let offers = false;
+    try {
+      const described = await this.request<{ manifest?: AbjectManifest }>(
+        request(this.id, ownerId, 'describe', {}), 5000);
+      offers = isUndoable(described?.manifest);
+    } catch { /* gone, or answers no describe */ }
+    if (this.undoOwners.size > 512) this.undoOwners.clear();
+    this.undoOwners.set(ownerId, offers);
+    return offers;
   }
 
   /** Get theme for a window's owner (traces windowOwners → objectWorkspaces → workspace theme). */
@@ -2857,6 +2909,7 @@ Any widget or layout (a button, a list row container, a card) wears a breathing 
 - TabBar: ArrowLeft/Right → switch tabs
 - Slider: ArrowLeft/Right/Up/Down → ±step; Home → min; End → max
 - Selectable Label: Ctrl+A (select all), Ctrl+C (copy), Shift+Arrow (extend selection), Home/End (jump), double-click (select word), click-drag (select range)
+- Undo / redo (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y): a TextInput or TextArea takes back its own typing first; with nothing left there (or no widget focused), the window's owner gets an 'undo' / 'redo' request and the system shows a short "Undid <label>" toast. A scriptable object gets this by saving commits with \`await this.saveData({ undo: 'Delete card' })\` and redrawing in \`restored(msg)\`; nothing else to wire.
 
 ### Layout Types
 

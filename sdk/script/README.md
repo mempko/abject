@@ -31,6 +31,11 @@ interface State { count: number }
   `observe()`, `ensure()` and `invariant()`. `call` and `emit` accept the
   promise `dep()` returns, so `this.call(this.dep('LLM'), ...)` needs no
   separate `await`.
+- **Undo.** `await this.saveData({ undo: 'Delete card' })` makes the keys of
+  `this.data` changed since the last save one undo step; Ctrl+Z in the
+  object's window (or an `undo` call) puts them back, then `restored(msg)`
+  runs so the object can redraw. `undo`, `redo` and `getUndoState` may be
+  your own, reaching the system's with `super.undo(msg)`.
 - **One expression and nothing else.** Helpers and constants go inside the map
   as `_` members (not message handlers). forge refuses top-level declarations,
   runtime `import`/`export`, and a JavaScript entry that starts with a comment.

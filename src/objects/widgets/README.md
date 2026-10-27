@@ -42,7 +42,11 @@ that owns the surface. The window strips the title bar, hit-tests its
 children, and sends `handleInput` to the one hit; layouts do the same for
 their children. Keyboard events skip layouts and go to the focused widget.
 Tab moves focus through `getFocusableWidgets()`; keys nobody consumes come out
-of the window as `keyUnhandled`. Title-bar drags and resizes are handled by
+of the window as `keyUnhandled`, except undo and redo (Ctrl/Cmd+Z,
+Ctrl/Cmd+Shift+Z, Ctrl+Y), which come out as `undoRequested` /
+`redoRequested`, also when no widget has focus. WidgetManager turns those into
+`undo` / `redo` for the window's owner (`src/core/undo.ts`). The text widgets
+consume them only while they have typing to take back. Title-bar drags and resizes are handled by
 UIServer and WindowManager, with the move itself done client-side.
 
 **Events.** Widgets report to dependents with `changed(aspect, value)` (an
@@ -138,7 +142,8 @@ which lists it in `listLayoutIssues`.
   `setSlabTransform`, `setFocusDecoration`, `attachTo` (ride a scene node) and
   `openFilePicker` / `fileUploaded`. Emits `windowFocus`, `windowRect`,
   `windowCloseRequested`, `windowMinimized`, `windowMaximized`,
-  `windowHelpRequested`, `nodeInput`, `keyUnhandled`.
+  `windowHelpRequested`, `nodeInput`, `keyUnhandled`, `undoRequested`,
+  `redoRequested`.
 - **`layout-abject.ts`**: `LayoutAbject`. Child list with size policies and
   spacers (`addLayoutChild`, `addLayoutChildren`, `addLayoutSpacer`,
   `updateLayoutChild`, `removeLayoutChild`, `clearLayoutChildren`,
@@ -192,7 +197,9 @@ which lists it in `listLayoutIssues`.
   selection, paste, Tab indent, optional word wrap and monospace. Event
   `change`.
 - **`text-edit-helpers.ts`**: word-boundary motion and `EditHistory` (undo/redo
-  with typing-burst coalescing), shared by the two text widgets.
+  with typing-burst coalescing), shared by the two text widgets. With an empty
+  history a widget leaves Ctrl+Z unconsumed, so the window's owner undoes
+  instead.
 - **`checkbox-widget.ts`**: `CheckboxWidget`. Box plus label; `change` on click
   or Space.
 - **`slider-widget.ts`**: `SliderWidget`. Min/max/step, arrow and Home/End keys;

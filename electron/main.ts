@@ -301,6 +301,16 @@ app.on('will-quit', () => {
   setTimeout(() => app.exit(0), 1500);
 });
 
+/** Type Ctrl/Cmd+Z (with Shift, redo) into the focused page. */
+function sendUndoKey(win: Electron.BaseWindow | undefined, redo: boolean): void {
+  const target = win instanceof BrowserWindow ? win : BrowserWindow.getFocusedWindow();
+  if (!target || target.isDestroyed()) return;
+  const modifiers: Array<'shift' | 'control' | 'meta'> = [process.platform === 'darwin' ? 'meta' : 'control'];
+  if (redo) modifiers.push('shift');
+  target.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Z', modifiers });
+  target.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Z', modifiers });
+}
+
 app.setName('Abject');
 
 app.whenReady().then(async () => {
@@ -311,7 +321,25 @@ app.whenReady().then(async () => {
   // Set up application menu
   const menu = Menu.buildFromTemplate([
     { role: 'fileMenu' },
-    { role: 'editMenu' },
+    {
+      // Undo and Redo send the key to the page as if typed: the desktop
+      // routes it to the focused window, whose text field takes back typing
+      // and whose owner takes back its last change (src/core/undo.ts). The
+      // page sees the real key first, so the accelerators are shown but not
+      // registered (registered, a press would act twice).
+      label: 'Edit',
+      submenu: [
+        { label: 'Undo', accelerator: 'CmdOrCtrl+Z', registerAccelerator: false, click: (_item, win) => sendUndoKey(win, false) },
+        { label: 'Redo', accelerator: 'CmdOrCtrl+Shift+Z', registerAccelerator: false, click: (_item, win) => sendUndoKey(win, true) },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'delete' },
+        { type: 'separator' },
+        { role: 'selectAll' },
+      ],
+    },
     { role: 'viewMenu' },
     { role: 'windowMenu' },
     {

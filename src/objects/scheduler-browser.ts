@@ -22,6 +22,7 @@ import type { ScheduleEntry } from './scheduler.js';
 import type { ListItem } from './widgets/list-widget.js';
 import { TITLE_BAR_HEIGHT } from './widgets/widget-types.js';
 import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
+import { UNDO_EVENTS, undoMethods, type UndoAction, type UndoResult, type UndoState } from '../core/undo.js';
 
 const log = new Log('SchedulerBrowser');
 
@@ -249,7 +250,9 @@ export class SchedulerBrowser extends Abject {
                 selectedScheduleId: { kind: 'primitive', primitive: 'string' },
               }},
             },
+            ...undoMethods('the last enable, disable or delete of a schedule made in this window'),
           ],
+          events: UNDO_EVENTS,
         },
         tags: ['system', 'ui'],
       },
@@ -279,6 +282,17 @@ export class SchedulerBrowser extends Abject {
       view: this.view,
       selectedScheduleId: this.entries[this.selectedIndex]?.id ?? '',
     }));
+    // The Scheduler keeps the history; this window's changes are its own steps there.
+    this.on('undo', async () => this.forwardScheduleUndo('undo'));
+    this.on('redo', async () => this.forwardScheduleUndo('redo'));
+    this.on('getUndoState', async (): Promise<UndoState> => {
+      if (!this.schedulerId) return { canUndo: false, canRedo: false };
+      try {
+        return await this.request<UndoState>(request(this.id, this.schedulerId, 'getUndoState', {}), 5000);
+      } catch {
+        return { canUndo: false, canRedo: false };
+      }
+    });
     this.on('windowCloseRequested', async () => { await this.hide(); });
     this.on('windowResized', async (msg: AbjectMessage) => {
       const { windowId, width, height } = msg.payload as { windowId?: AbjectId; width: number; height: number };
@@ -330,11 +344,14 @@ export class SchedulerBrowser extends Abject {
 - \`hide()\` -- Close the scheduler browser window.
 - \`setView({ view })\` -- "details" or "dial": what shows beside the list.
 - \`getState()\` -- Returns { visible, scheduleCount, view, selectedScheduleId }.
+- \`undo()\` / \`redo()\` -- Take back (or redo) the last enable, disable or delete
+  made in this window; a deleted schedule comes back with its own id.
 
 ### Schedule Management
 SchedulerBrowser shows all registered schedule entries with their status,
 interval/time, last run, and next run. Select an entry to see details.
-Use the Enable/Disable button to switch a schedule on or off, Delete to remove it.
+Use the Enable/Disable button to switch a schedule on or off, Delete to remove it
+(Ctrl+Z in the window brings it back).
 
 ### Dial view
 The Dial tab turns the right pane into a 24-hour clock face (midnight at the
@@ -820,13 +837,6 @@ firing schedule flashes its marker, which then travels to its next run.
 
   private async doDelete(entry: ScheduleEntry): Promise<void> {
     if (!this.schedulerId) return;
-    const confirmed = await this.confirm({
-      title: 'Delete Schedule',
-      message: `Delete schedule "${entry.description}"?`,
-      confirmLabel: 'Delete',
-      destructive: true,
-    });
-    if (!confirmed) return;
     try {
       await this.request(
         request(this.id, this.schedulerId, 'removeSchedule', { scheduleId: entry.id }),
@@ -836,12 +846,34 @@ firing schedule flashes its marker, which then travels to its next run.
       await this.loadEntries();
       await this.updateDetail('Select a schedule', '', '', '');
       await this.applyRightPane();
-      await this.notify('Schedule deleted', 'success');
+      await this.notify(`Deleted schedule ${entry.description}. Ctrl+Z to undo`, 'success');
     } catch (err) {
       log.warn('Failed to delete schedule:', err);
       this.playEffect('shake');
       await this.notify('Delete failed', 'error');
     }
+  }
+
+  /**
+   * Undo or redo this window's last schedule change through the Scheduler,
+   * then show the list as it now stands, with the entry the step touched
+   * selected.
+   */
+  private async forwardScheduleUndo(action: UndoAction): Promise<UndoResult> {
+    const result = await this.forwardUndo([this.schedulerId], action);
+    if (result.ok && this.windowId) {
+      const scheduleId = typeof result.scheduleId === 'string' ? result.scheduleId : undefined;
+      const keep = scheduleId ?? this.entries[this.selectedIndex]?.id;
+      await this.loadEntries();
+      this.selectedIndex = keep ? this.entries.findIndex((e) => e.id === keep) : -1;
+      if (this.listWidgetId) {
+        try {
+          await this.request(request(this.id, this.listWidgetId, 'update', { selectedIndex: this.selectedIndex }));
+        } catch { /* widget gone */ }
+      }
+      await this.showDetail();
+    }
+    return result;
   }
 
   // -- Views --

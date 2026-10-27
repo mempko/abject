@@ -6,12 +6,15 @@
  * (open, delete, new) as requests back to ChatManager. No persistence, no
  * lifecycle — all state lives in ChatManager. An onboarding flag lets the
  * browser auto-open once on a fresh workspace so users discover the feature.
+ * Ctrl+Z in its window undoes the last deletion made here: ChatManager keeps
+ * the step (this browser is the caller that made it), the browser forwards.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { undoMethods, type UndoAction, type UndoResult, type UndoState } from '../core/undo.js';
 import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { PersistedConversation } from './chat-manager.js';
@@ -49,6 +52,8 @@ export class ChatBrowser extends Abject {
    *  never spawn overlapping window rebuilds that flood the render queue. */
   private refreshInFlight = false;
   private refreshPending = false;
+  /** Conversation titles as last listed, for the delete toast. */
+  private titles = new Map<string, string>();
 
   constructor() {
     super({
@@ -84,6 +89,7 @@ export class ChatBrowser extends Abject {
                 visible: { kind: 'primitive', primitive: 'boolean' },
               } },
             },
+            ...undoMethods('the last conversation deleted from this window (ChatManager keeps it)'),
           ],
           events: [],
         },
@@ -167,6 +173,24 @@ export class ChatBrowser extends Abject {
     });
 
     this.on('windowCloseRequested', async () => { await this.hide(); });
+
+    this.on('undo', async () => this.undoHere('undo'));
+    this.on('redo', async () => this.undoHere('redo'));
+    this.on('getUndoState', async (): Promise<UndoState> => {
+      if (!this.chatManagerId) return { canUndo: false, canRedo: false };
+      try {
+        return await this.request<UndoState>(request(this.id, this.chatManagerId, 'getUndoState', {}), 5000);
+      } catch {
+        return { canUndo: false, canRedo: false };
+      }
+    });
+  }
+
+  /** Undo or redo this window's last change through ChatManager, then show the roster as it is now. */
+  private async undoHere(action: UndoAction): Promise<UndoResult> {
+    const result = await this.forwardUndo([this.chatManagerId], action);
+    if (result.ok) this.scheduleRefresh();
+    return result;
   }
 
   // ─── Dispatchers to ChatManager ────────────────────────────────────
@@ -193,9 +217,11 @@ export class ChatBrowser extends Abject {
 
   private async requestDeleteConversation(conversationId: string): Promise<void> {
     if (!this.chatManagerId) return;
+    const title = this.titles.get(conversationId);
     try {
-      await this.request(request(this.id, this.chatManagerId, 'deleteConversation', { conversationId }), 5000);
-      await this.notify('Conversation deleted', 'success');
+      // Generous: the conversation's cards are set aside with it.
+      await this.request(request(this.id, this.chatManagerId, 'deleteConversation', { conversationId }), 60_000);
+      await this.notify(`Deleted ${title ? `"${title}"` : 'the conversation'}. Ctrl+Z to undo`, 'success');
     } catch (err) {
       log.warn(`deleteConversation failed: ${String(err)}`);
       this.playEffect('shake');
@@ -469,6 +495,7 @@ export class ChatBrowser extends Abject {
 
   /** One list row per conversation, with its history as searchable text. */
   private async listItems(rows: PersistedConversation[]): Promise<ListItem[]> {
+    this.titles = new Map(rows.map(c => [c.conversationId, c.title]));
     return Promise.all(
       rows.map(async (c) => {
         const historyText = await this.fetchConversationHistory(c.conversationId);

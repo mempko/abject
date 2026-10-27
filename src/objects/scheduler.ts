@@ -7,6 +7,13 @@
  *
  * This is infrastructure, not LLM-generated code. It uses Timer
  * internally for ticking and is always available per workspace.
+ *
+ * Adding, removing, enabling and disabling a schedule can be undone by the
+ * caller that did it: each caller has its own in-memory history of steps,
+ * each step one entry before and after. Undo puts back that one entry with
+ * its own id, never the whole list, and only while the entry still holds
+ * what the step left (firing times moving on does not count as a change).
+ * A one-shot that already fired stays gone.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -14,6 +21,7 @@ import { Abject } from '../core/abject.js';
 import { require as precondition, requireNonEmpty, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods, type UndoAction, type UndoResult } from '../core/undo.js';
 
 const log = new Log('Scheduler');
 
@@ -52,6 +60,20 @@ export interface ScheduleEntry {
   owner: string;
 }
 
+/** One undoable change to one entry: absent before (added) or after (removed). */
+interface ScheduleStep {
+  id: string;
+  before?: ScheduleEntry;
+  after?: ScheduleEntry;
+}
+
+/** An entry as its owner set it up: the firing times the tick moves are left out. */
+function userView(entry: ScheduleEntry | undefined): Omit<ScheduleEntry, 'lastRun' | 'nextRun'> | undefined {
+  if (!entry) return undefined;
+  const { lastRun: _lastRun, nextRun: _nextRun, ...rest } = entry;
+  return rest;
+}
+
 export class Scheduler extends Abject {
   private storageId?: AbjectId;
   private timerId?: AbjectId;
@@ -61,6 +83,12 @@ export class Scheduler extends Abject {
   /** Schedules whose job is still running; they are not fired again until it ends. */
   private running = new Set<string>();
   private entryCounter = 0;
+  /** Each caller's schedule changes, for this session. */
+  private history = new UndoHistories<ScheduleStep>({ mergeMs: 0 });
+  /** The live id each caller last changed schedules from, to tell it its undo state moved. */
+  private historyCallers = new Map<string, AbjectId>();
+  /** One-shots that fired this session: undo never brings one back. */
+  private firedOnce = new Set<string>();
 
   constructor() {
     super({
@@ -155,7 +183,9 @@ export class Scheduler extends Abject {
                 { kind: 'primitive', primitive: 'null' },
               ] },
             },
+            ...undoMethods('your last add, remove, enable or disable of a schedule (the entry comes back with its own id; the reply carries its scheduleId)'),
           ],
+          events: UNDO_EVENTS,
         },
         tags: ['system', 'scheduling'],
       },
@@ -219,6 +249,7 @@ export class Scheduler extends Abject {
       this.entries.set(id, entry);
       await this.persistToStorage();
       this.changed('scheduleAdded', { scheduleId: id, description });
+      await this.recordStep(msg, `Add schedule ${description}`, { id, after: { ...entry } });
       log.info(`Added interval schedule "${description}" (${intervalMs}ms) -> ${id}`);
       return { scheduleId: id };
     });
@@ -252,6 +283,7 @@ export class Scheduler extends Abject {
       this.entries.set(id, entry);
       await this.persistToStorage();
       this.changed('scheduleAdded', { scheduleId: id, description });
+      await this.recordStep(msg, `Add schedule ${description}`, { id, after: { ...entry } });
       log.info(`Added daily schedule "${description}" at ${hour}:${String(minute).padStart(2, '0')} ${timezone ?? 'local'} -> ${id}`);
       return { scheduleId: id };
     });
@@ -283,40 +315,31 @@ export class Scheduler extends Abject {
       this.entries.set(id, entry);
       await this.persistToStorage();
       this.changed('scheduleAdded', { scheduleId: id, description });
+      await this.recordStep(msg, `Add schedule ${description}`, { id, after: { ...entry } });
       log.info(`Added one-shot schedule "${description}" at ${new Date(runAt).toISOString()} -> ${id}`);
       return { scheduleId: id };
     });
 
     this.on('removeSchedule', async (msg: AbjectMessage) => {
       const { scheduleId } = msg.payload as { scheduleId: string };
+      const prior = this.entries.get(scheduleId);
       const deleted = this.entries.delete(scheduleId);
-      if (deleted) {
+      if (deleted && prior) {
         await this.persistToStorage();
         this.changed('scheduleRemoved', { scheduleId });
         log.info(`Removed schedule ${scheduleId}`);
+        await this.recordStep(msg, `Delete schedule ${prior.description}`, { id: scheduleId, before: { ...prior } });
       }
       return deleted;
     });
 
-    this.on('enableSchedule', async (msg: AbjectMessage) => {
-      const { scheduleId } = msg.payload as { scheduleId: string };
-      const entry = this.entries.get(scheduleId);
-      if (!entry) return false;
-      entry.enabled = true;
-      await this.persistToStorage();
-      this.changed('scheduleUpdated', { scheduleId });
-      return true;
-    });
+    this.on('enableSchedule', async (msg: AbjectMessage) => this.setEnabled(msg, true));
+    this.on('disableSchedule', async (msg: AbjectMessage) => this.setEnabled(msg, false));
 
-    this.on('disableSchedule', async (msg: AbjectMessage) => {
-      const { scheduleId } = msg.payload as { scheduleId: string };
-      const entry = this.entries.get(scheduleId);
-      if (!entry) return false;
-      entry.enabled = false;
-      await this.persistToStorage();
-      this.changed('scheduleUpdated', { scheduleId });
-      return true;
-    });
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) =>
+      this.history.state(await this.undoCallerKey(msg.routing.from)));
 
     this.on('listSchedules', async () => {
       return [...this.entries.values()];
@@ -396,6 +419,7 @@ export class Scheduler extends Abject {
         // One-shot: fire-once-and-delete. The job submitted above runs
         // on; whether or not it succeeds, we don't fire again.
         toDelete.push(entry.id);
+        this.firedOnce.add(entry.id);
       }
 
       dirty = true;
@@ -410,6 +434,113 @@ export class Scheduler extends Abject {
     if (dirty) {
       await this.persistToStorage();
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Enable / disable, undo
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async setEnabled(msg: AbjectMessage, enabled: boolean): Promise<boolean> {
+    const { scheduleId } = msg.payload as { scheduleId: string };
+    const entry = this.entries.get(scheduleId);
+    if (!entry) return false;
+    const before = { ...entry };
+    entry.enabled = enabled;
+    await this.persistToStorage();
+    this.changed('scheduleUpdated', { scheduleId });
+    await this.recordStep(msg, `${enabled ? 'Enable' : 'Disable'} schedule ${entry.description}`,
+      { id: scheduleId, before, after: { ...entry } });
+    return true;
+  }
+
+  /** Keep a step for the caller when the entry really changed. */
+  private async recordStep(msg: AbjectMessage, label: string, step: ScheduleStep): Promise<void> {
+    if (sameValue(userView(step.before), userView(step.after))) return;
+    const caller = await this.undoCallerKey(msg.routing.from);
+    this.history.for(caller).record(label, step);
+    this.historyCallers.set(caller, msg.routing.from);
+    this.tellUndoState(caller);
+  }
+
+  /**
+   * Undo or redo the caller's last step on one entry. The entry must still
+   * hold what the step left, firing times aside; then it is set back (or
+   * forward), re-inserted with its own id, or removed.
+   */
+  private async undoFor(msg: AbjectMessage, action: UndoAction): Promise<UndoResult> {
+    const caller = await this.undoCallerKey(msg.routing.from);
+    const history = this.history.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](async (step) => {
+      const { id } = step.data;
+      const expect = action === 'undo' ? step.data.after : step.data.before;
+      const target = action === 'undo' ? step.data.before : step.data.after;
+      const verb = action === 'undo' ? 'undone' : 'redone';
+      const current = this.entries.get(id);
+      if (expect && !current) {
+        throw new UndoRefused(this.firedOnce.has(id)
+          ? `That one-time schedule already ran, so "${step.label}" can no longer be ${verb}`
+          : `That schedule is gone, so "${step.label}" can no longer be ${verb}`);
+      }
+      if (!expect && current) {
+        throw new UndoRefused(`That schedule exists again, so "${step.label}" can no longer be ${verb}`);
+      }
+      if (current && !sameValue(userView(current), userView(expect))) {
+        throw new UndoRefused(`That schedule changed since, so "${step.label}" can no longer be ${verb}`);
+      }
+
+      if (!target) {
+        this.entries.delete(id);
+        await this.persistToStorage();
+        this.changed('scheduleRemoved', { scheduleId: id });
+      } else if (current) {
+        // Keep where the tick has got to; put back what the owner set.
+        this.entries.set(id, { ...target, lastRun: current.lastRun, nextRun: current.nextRun });
+        await this.persistToStorage();
+        this.changed('scheduleUpdated', { scheduleId: id });
+      } else {
+        this.entries.set(id, this.revived(target, verb, step.label));
+        await this.persistToStorage();
+        this.changed('scheduleAdded', { scheduleId: id, description: target.description });
+      }
+      return { scheduleId: id };
+    });
+    this.historyCallers.set(caller, msg.routing.from);
+    this.tellUndoState(caller);
+    return result;
+  }
+
+  /**
+   * An entry coming back. A one-shot that fired stays gone; an identical
+   * schedule added since would be a duplicate; a recurring one whose next
+   * run passed while it was away waits for its next turn instead of firing
+   * at once.
+   */
+  private revived(entry: ScheduleEntry, verb: string, label: string): ScheduleEntry {
+    if (entry.runAt !== undefined && (this.firedOnce.has(entry.id) || entry.lastRun > 0)) {
+      throw new UndoRefused(`That one-time schedule already ran, so "${label}" can no longer be ${verb}`);
+    }
+    const twin = this.findDuplicate({
+      intervalMs: entry.intervalMs, hour: entry.hour, minute: entry.minute,
+      timezone: entry.timezone, runAt: entry.runAt, jobCode: entry.jobCode,
+    });
+    if (twin) {
+      throw new UndoRefused(`An identical schedule (${twin.id}) exists now, so "${label}" can no longer be ${verb}`);
+    }
+    const back = { ...entry };
+    const now = Date.now();
+    if (back.nextRun < now) {
+      if (back.intervalMs) back.nextRun = now + back.intervalMs;
+      else if (back.hour !== undefined && back.minute !== undefined) {
+        back.nextRun = this.computeNextDailyRun(back.hour, back.minute, back.timezone);
+      }
+    }
+    return back;
+  }
+
+  private tellUndoState(caller: string): void {
+    const to = this.historyCallers.get(caller);
+    if (to) this.send(event(this.id, to, 'undoStateChanged', this.history.state(caller)));
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -629,6 +760,12 @@ Use the Scheduler for ALL recurring/periodic/timed tasks AND one-shot future tas
   await call(await dep('Scheduler'), 'disableSchedule', { scheduleId: 'sched-1' });
   await call(await dep('Scheduler'), 'enableSchedule', { scheduleId: 'sched-1' });
   await call(await dep('Scheduler'), 'removeSchedule', { scheduleId: 'sched-1' });
+
+### Undo
+
+  await call(await dep('Scheduler'), 'undo', {});
+  // Takes back YOUR last add / remove / enable / disable: a removed schedule
+  // returns with its own id. Returns { ok, label, reason, scheduleId }; redo puts it back.
 
 ### List all schedules
 

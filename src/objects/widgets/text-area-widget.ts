@@ -805,23 +805,23 @@ export class TextAreaWidget extends WidgetAbject {
 
     // Ctrl/Meta+Z = undo; Ctrl/Meta+Shift+Z or Ctrl+Y = redo.
     if ((ctrl || meta) && (key === 'z' || key === 'Z') && !shift) {
+      // Nothing of its own to take back: the window's owner undoes its
+      // last change instead.
       const prev = this.history.undo(this.snapshot());
-      if (prev) {
-        this.restoreSnapshot(prev);
-        this.changed('change', this.text);
-        await this.notifySelectionChanged();
-        await this.requestRedraw();
-      }
+      if (!prev) return { consumed: false };
+      this.restoreSnapshot(prev);
+      this.changed('change', this.text);
+      await this.notifySelectionChanged();
+      await this.requestRedraw();
       return { consumed: true };
     }
     if ((ctrl || meta) && (((key === 'z' || key === 'Z') && shift) || key === 'y' || key === 'Y')) {
       const next = this.history.redo(this.snapshot());
-      if (next) {
-        this.restoreSnapshot(next);
-        this.changed('change', this.text);
-        await this.notifySelectionChanged();
-        await this.requestRedraw();
-      }
+      if (!next) return { consumed: false };
+      this.restoreSnapshot(next);
+      this.changed('change', this.text);
+      await this.notifySelectionChanged();
+      await this.requestRedraw();
       return { consumed: true };
     }
 

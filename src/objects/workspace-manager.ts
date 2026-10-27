@@ -22,6 +22,7 @@ import { SIDEBAR_WIDTH, SIDEBAR_COMPACT_WIDTH } from '../core/dock-layout.js';
 import { namesFromTypeIds, nameFromTypeId } from './exposure-selectors.js';
 import { isHostLocalObject } from './host-local-objects.js';
 import { Log } from '../core/timed-log.js';
+import { UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods, type UndoAction, type UndoResult } from '../core/undo.js';
 import {
   DEFAULT_PROFILE, INFRA_OBJECTS, loadWorkspaceProfiles, packageInProfile, type WorkspaceProfile,
 } from './workspace-profiles.js';
@@ -212,10 +213,39 @@ export function parseInviteLink(link: string): InviteLinkRoute | undefined {
   };
 }
 
+/** A workspace's name, description and tags: what undo can put back. */
+interface WorkspaceMetadata {
+  name: string;
+  description: string;
+  tags: string[];
+}
+
+/** One undoable edit of one workspace: the fields it changed, before and after. */
+interface MetadataStep {
+  workspaceId: string;
+  before: Partial<WorkspaceMetadata>;
+  after: Partial<WorkspaceMetadata>;
+}
+
 export class WorkspaceManager extends Abject {
   /** False on an instance with no display (the headless edition): no workspace windows. */
   private display = true;
   private workspaces: Map<string, WorkspaceInfo> = new Map();
+  /**
+   * Each caller's edits of workspace names, descriptions and tags, for this
+   * session. A name, description and tags saved together (one Save in a
+   * settings window) merge into one step. Access mode, whitelist, exposure
+   * and deletion stay final.
+   */
+  private metadataHistory = new UndoHistories<MetadataStep>({
+    merge: (older, newer) => ({
+      workspaceId: older.workspaceId,
+      before: { ...newer.before, ...older.before },
+      after: { ...older.after, ...newer.after },
+    }),
+  });
+  /** The live id each caller last edited from, to tell it its undo state moved. */
+  private metadataCallers = new Map<string, AbjectId>();
   /**
    * Last loaded persisted records, indexed by id. restoreWorkspace reads this
    * to recover fields its call site does not carry (joined/owner/participants).
@@ -503,6 +533,7 @@ export class WorkspaceManager extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              ...undoMethods('your last change to a workspace\'s name, description or tags (one Save of all three is one step). Access, sharing and deletion are final'),
               {
                 name: 'createInviteLink',
                 description: 'Create a shareable invite link for a workspace',
@@ -520,6 +551,7 @@ export class WorkspaceManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
             ],
+            events: UNDO_EVENTS,
           },
         tags: ['system', 'core'],
       },
@@ -562,7 +594,7 @@ export class WorkspaceManager extends Abject {
 
     this.on('renameWorkspace', async (msg: AbjectMessage) => {
       const { workspaceId, name } = msg.payload as { workspaceId: string; name: string };
-      return this.renameWorkspace(workspaceId, name);
+      return this.editMetadata(msg, workspaceId, { name }, () => this.renameWorkspace(workspaceId, name));
     });
 
     this.on('getAccessMode', async (msg: AbjectMessage) => {
@@ -624,7 +656,7 @@ export class WorkspaceManager extends Abject {
 
     this.on('setDescription', async (msg: AbjectMessage) => {
       const { workspaceId, description } = msg.payload as { workspaceId: string; description: string };
-      return this.setDescription(workspaceId, description);
+      return this.editMetadata(msg, workspaceId, { description }, () => this.setDescription(workspaceId, description));
     });
 
     this.on('getTags', async (msg: AbjectMessage) => {
@@ -634,8 +666,13 @@ export class WorkspaceManager extends Abject {
 
     this.on('setTags', async (msg: AbjectMessage) => {
       const { workspaceId, tags } = msg.payload as { workspaceId: string; tags: string[] };
-      return this.setTags(workspaceId, tags);
+      return this.editMetadata(msg, workspaceId, { tags }, () => this.setTags(workspaceId, tags));
     });
+
+    this.on('undo', async (msg: AbjectMessage) => this.undoMetadata(msg, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoMetadata(msg, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) =>
+      this.metadataHistory.state(await this.undoCallerKey(msg.routing.from)));
 
     this.on('refreshTaskbar', async () => {
       return this.refreshTaskbar();
@@ -1505,6 +1542,80 @@ export class WorkspaceManager extends Abject {
     const ws = this.workspaces.get(workspaceId);
     if (!ws) return [];
     return [...ws.tags];
+  }
+
+  // ── Undo of name, description and tags ─────────────────────────
+
+  private metadataOf(ws: WorkspaceInfo, fields: Array<keyof WorkspaceMetadata>): Partial<WorkspaceMetadata> {
+    const out: Partial<WorkspaceMetadata> = {};
+    for (const f of fields) {
+      if (f === 'tags') out.tags = [...ws.tags]; else out[f] = ws[f];
+    }
+    return out;
+  }
+
+  /**
+   * Make an edit of a workspace's name, description or tags and keep it as a
+   * step for the caller, when it changed something. Edits by one caller
+   * within a moment of each other are one step.
+   */
+  private async editMetadata(
+    msg: AbjectMessage, workspaceId: string, change: Partial<WorkspaceMetadata>, apply: () => Promise<boolean>,
+  ): Promise<boolean> {
+    const ws = this.workspaces.get(workspaceId);
+    const fields = Object.keys(change) as Array<keyof WorkspaceMetadata>;
+    const before = ws ? this.metadataOf(ws, fields) : undefined;
+    const name = ws?.name;
+    const ok = await apply();
+    const now = this.workspaces.get(workspaceId);
+    if (!ok || !now || !before) return ok;
+    const after = this.metadataOf(now, fields);
+    if (sameValue(before, after)) return ok;
+    const caller = await this.undoCallerKey(msg.routing.from);
+    const history = this.metadataHistory.for(caller);
+    // A rename just before renames the workspace; the step keeps the name it started with.
+    const top = history.toJSON().done.at(-1);
+    const label = top && top.data.workspaceId === workspaceId && Date.now() - top.at < 1000
+      ? top.label : `Edit workspace ${name}`;
+    history.record(label, { workspaceId, before, after }, { mergeKey: workspaceId });
+    this.metadataCallers.set(caller, msg.routing.from);
+    this.tellMetadataUndoState(caller);
+    return ok;
+  }
+
+  /**
+   * Put a workspace's fields back (or forward) through the same setters an
+   * edit uses, so the same records are saved and the same events go out;
+   * refused when the workspace is gone or a field changed again since.
+   */
+  private async undoMetadata(msg: AbjectMessage, action: UndoAction): Promise<UndoResult> {
+    const caller = await this.undoCallerKey(msg.routing.from);
+    const history = this.metadataHistory.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](async (step) => {
+      const { workspaceId } = step.data;
+      const expect = action === 'undo' ? step.data.after : step.data.before;
+      const target = action === 'undo' ? step.data.before : step.data.after;
+      const verb = action === 'undo' ? 'undone' : 'redone';
+      const ws = this.workspaces.get(workspaceId);
+      if (!ws) throw new UndoRefused(`That workspace is gone, so "${step.label}" can no longer be ${verb}`);
+      const fields = Object.keys(expect) as Array<keyof WorkspaceMetadata>;
+      if (!sameValue(this.metadataOf(ws, fields), expect)) {
+        throw new UndoRefused(`The workspace changed since, so "${step.label}" can no longer be ${verb}`);
+      }
+      if (target.name !== undefined) await this.renameWorkspace(workspaceId, target.name);
+      if (target.description !== undefined) await this.setDescription(workspaceId, target.description);
+      if (target.tags !== undefined) await this.setTags(workspaceId, target.tags);
+      return { workspaceId };
+    });
+    this.metadataCallers.set(caller, msg.routing.from);
+    this.tellMetadataUndoState(caller);
+    return result;
+  }
+
+  private tellMetadataUndoState(caller: string): void {
+    const to = this.metadataCallers.get(caller);
+    if (to) this.send(event(this.id, to, 'undoStateChanged', this.metadataHistory.state(caller)));
   }
 
   async setTags(workspaceId: string, tags: string[]): Promise<boolean> {
@@ -2757,6 +2868,8 @@ export class WorkspaceManager extends Abject {
 - \`listWorkspaces()\` — List all workspaces. Returns [{ id, name }].
 - \`getActiveWorkspace()\` — Get the active workspace. Returns { id, name }.
 - \`renameWorkspace({ workspaceId, name })\` — Rename a workspace.
+- \`setDescription({ workspaceId, description })\`, \`setTags({ workspaceId, tags })\`: Edit a workspace's description and tags.
+- \`undo()\` / \`redo()\`: Take back (or redo) YOUR last name, description or tags edit. Returns { ok, label, reason }.
 - \`getAccessMode({ workspaceId })\` — Get workspace access mode (local, private, public).
 - \`setAccessMode({ workspaceId, accessMode })\` — Set workspace access mode.
 

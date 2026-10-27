@@ -3,11 +3,15 @@
  * FileSystem ($ABJECTS_DATA_DIR/ws-<id>/files). A toolbar (Up / Add / New Folder /
  * Rename / Delete / Refresh) sits above a scrollable list of the current directory. Selecting
  * a folder navigates into it; selecting a file opens it in the FileViewer.
+ * FileSystem keeps the undo history of the changes made here (this object is
+ * the caller); Ctrl+Z in the window forwards undo and redo to it.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
+import { undoMethods } from '../core/undo.js';
+import type { UndoAction, UndoState } from '../core/undo.js';
 import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { IconName } from '../ui/icons.js';
@@ -70,6 +74,7 @@ export class FileManager extends Abject {
             { name: 'show', description: 'Show the file manager window', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
             { name: 'hide', description: 'Hide the file manager window', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
             { name: 'getState', description: 'Get window visibility', parameters: [], returns: { kind: 'object', properties: { visible: { kind: 'primitive', primitive: 'boolean' } } } },
+            ...undoMethods('the last file change made in this window (upload, new folder, rename, delete)'),
           ],
         },
         tags: ['system', 'ui'],
@@ -90,6 +95,12 @@ export class FileManager extends Abject {
     this.on('hide', async () => this.hide());
     this.on('getState', async () => ({ visible: !!this.windowId }));
     this.on('windowCloseRequested', async () => { await this.hide(); });
+    this.on('undo', async () => this.undoRedo('undo'));
+    this.on('redo', async () => this.undoRedo('redo'));
+    this.on('getUndoState', async (): Promise<UndoState> => {
+      if (!this.fileSystemId) return { canUndo: false, canRedo: false };
+      return this.request<UndoState>(request(this.id, this.fileSystemId, 'getUndoState', {}));
+    });
     this.on('fileUploaded', async (msg: AbjectMessage) => {
       const { name, base64 } = msg.payload as { name: string; base64: string };
       await this.handleFileUploaded(name, base64 ?? '');
@@ -256,6 +267,25 @@ export class FileManager extends Abject {
     this.lastUploadBurstAt = 0;
     this.changed('visibility', false);
     return true;
+  }
+
+  // ── Undo ────────────────────────────────────────────────────────────
+
+  /** Undo or redo this window's last file change in FileSystem, then show the result. */
+  private async undoRedo(action: UndoAction): Promise<unknown> {
+    const result = await this.forwardUndo([this.fileSystemId], action);
+    if (result.ok && this.windowId) {
+      // The folder on show may be what the step took away: show the nearest one left.
+      let dir = this.currentDir;
+      while (dir !== '/') {
+        const info = await this.request<FileInfo | null>(
+          request(this.id, this.fileSystemId!, 'stat', { path: dir }), 10000).catch(() => null);
+        if (info?.isDirectory) break;
+        dir = this.parentOf(dir);
+      }
+      await this.loadDir(dir);
+    }
+    return result;
   }
 
   // ── Directory listing ───────────────────────────────────────────────
@@ -438,7 +468,7 @@ export class FileManager extends Abject {
     const dest = parent === '/' ? `/${clean}` : `${parent}/${clean}`;
     try {
       await this.request(request(this.id, this.fileSystemId, 'rename', { from: target.path, to: dest }), 15000);
-      await this.notify(`Renamed to "${clean}"`, 'success');
+      await this.notify(`Renamed to "${clean}". Ctrl+Z to undo`, 'success');
       // If we renamed the folder we're inside, drop to its parent listing.
       await this.loadDir(target.path === this.currentDir ? parent : this.currentDir);
       this.playEffect('flash');
@@ -484,20 +514,12 @@ export class FileManager extends Abject {
     if (!this.fileSystemId) return;
     const target = this.actionTarget();
     if (!target) { this.playEffect('shake'); await this.notify('Select a file, or open a folder, to delete', 'info'); return; }
-    const confirmed = await this.confirm({
-      title: target.isDir ? 'Delete folder?' : 'Delete file?',
-      message: target.isDir
-        ? `"${target.name}" and all of its contents will be permanently removed.`
-        : `"${target.name}" will be permanently removed.`,
-      confirmLabel: 'Delete',
-      destructive: true,
-    });
-    if (!confirmed) return;
+    // No confirm: FileSystem sets what is deleted aside, and Ctrl+Z brings it back.
     if (this.deleteBtnId) this.send(event(this.id, this.deleteBtnId, 'update', { busy: true }));
     try {
       // `remove` handles both files and (recursively) directories.
       await this.request(request(this.id, this.fileSystemId, 'remove', { path: target.path }), 30000);
-      await this.notify(`Deleted "${target.name}"`, 'success');
+      await this.notify(`Deleted "${target.name}". Ctrl+Z to undo`, 'success');
       // If we deleted the folder we're inside, drop to its parent listing.
       await this.loadDir(target.path === this.currentDir ? this.parentOf(this.currentDir) : this.currentDir);
     } catch (err) {

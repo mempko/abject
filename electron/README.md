@@ -39,7 +39,9 @@ desktop edition of the Node backend (compiled to `dist-server/` by
     `DevToolsActivePort`) so WebBrowser can drive the app's own Chromium
     through Playwright, and turns off the `AutomationControlled` blink
     feature.
-  - Builds the menu: File, Edit, View, Window, and Help (Abject Website; in a
+  - Builds the menu: File, Edit (its Undo and Redo type Ctrl/Cmd+Z and
+    Ctrl/Cmd+Shift+Z into the page, which routes them to the focused window;
+    the rest are the standard roles), View, Window, and Help (Abject Website; in a
     packaged app, Check for Updates, which emits `abjects:check-for-updates`
     on `app` for AppUpdater, and Install the abject Command).
   - `claimDataDir()`: when `instance.json` names a live headless backend on

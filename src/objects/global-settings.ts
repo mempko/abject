@@ -15,6 +15,7 @@ import { Abject } from '../core/abject.js';
 import { event, request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 import { require as contractRequire, ensure } from '../core/contracts.js';
+import { undoMethods, type UndoAction, type UndoResult, type UndoState } from '../core/undo.js';
 import { chromeCase, shapeOf } from '../core/theme-data.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import { LLMProviderDescription, servesChat } from '../llm/provider.js';
@@ -492,6 +493,7 @@ export class GlobalSettings extends Abject {
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              ...undoMethods('the last change made in this window to the AI settings or a saved preset (SettingsManager keeps the history)'),
             ],
           },
         tags: ['system', 'ui', 'settings'],
@@ -514,6 +516,10 @@ The settings themselves live in SettingsManager, which this window loads from an
 
   await this.call(this.dep('GlobalSettings'), 'show', {});
   await this.call(this.dep('GlobalSettings'), 'hide', {});
+
+### Undo
+undo() / redo() take back the last change made in this window to the AI settings or a saved preset
+(Ctrl+Z in the window does the same). Credentials, the login and permissions are never undone.
 
 ### IMPORTANT
 - Changing settings is the person's call: open the window for them, or ask them.
@@ -637,6 +643,18 @@ The settings themselves live in SettingsManager, which this window loads from an
 
     this.on('getState', async () => {
       return { visible: !!this.windowId };
+    });
+
+    // Ctrl+Z in the window: SettingsManager keeps the history of this
+    // window's changes; take back the newest and show what it left.
+    this.on('undo', async () => this.undoSettings('undo'));
+    this.on('redo', async () => this.undoSettings('redo'));
+    this.on('getUndoState', async (): Promise<UndoState> => {
+      try {
+        return await this.request<UndoState>(request(this.id, this.settingsManagerId!, 'getUndoState', {}), 5000);
+      } catch {
+        return { canUndo: false, canRedo: false };
+      }
     });
 
     // DialogBroker hands this window the permission questions to draw, one at
@@ -2958,6 +2976,30 @@ The settings themselves live in SettingsManager, which this window loads from an
       default: await this.showPermissionSettings(); break;
     }
     await this.setStatus('Settings changed elsewhere; showing the saved values.', this.theme.textDescription);
+  }
+
+  /**
+   * Undo or redo this window's last settings change through SettingsManager,
+   * then repaint the AI tab (the only one undo touches) from what it holds.
+   */
+  private async undoSettings(action: UndoAction): Promise<UndoResult> {
+    // The change comes back as settingsChanged; this repaint answers it.
+    const prior = this.lastOwnSave;
+    this.lastOwnSave = { section: 'ai', at: Date.now() };
+    const result = await this.forwardUndo([this.settingsManagerId], action);
+    if (!result.ok) this.lastOwnSave = prior;
+    if (!result.ok || !this.windowId) return result;
+    await this.loadFromManager();
+    await this.refreshPresetOptions();
+    await this.showAiSettings();
+    if (this.learningBudgetInputId) {
+      try { await this.request(request(this.id, this.learningBudgetInputId, 'update', { text: String(this.learningBudget) })); } catch { /* widget gone */ }
+    }
+    if (this.learningBudgetHintId) {
+      try { await this.request(request(this.id, this.learningBudgetHintId, 'update', { text: this.learningBudgetHint(this.learningBudget) })); } catch { /* widget gone */ }
+    }
+    await this.setStatus(`${action === 'undo' ? 'Undid' : 'Redid'} ${result.label ?? 'the last change'}.`, this.theme.statusSuccess);
+    return result;
   }
 
   private async showAuthSettings(): Promise<void> {

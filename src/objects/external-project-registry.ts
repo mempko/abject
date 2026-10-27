@@ -31,14 +31,39 @@ import * as path from 'path';
 import * as os from 'os';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty, invariant } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import {
+  UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods,
+  type UndoAction, type UndoHistoryJSON, type UndoResult, type UndoStep,
+} from '../core/undo.js';
 
 const log = new Log('ExternalProjectRegistry');
 
 const EXTERNAL_PROJECT_REGISTRY_INTERFACE: InterfaceId = 'abjects:external-projects';
 const STORAGE_KEY = 'external-projects:registry';
+/** Each caller's undo history, kept on disk for the session and three days after. */
+const UNDO_STORAGE_KEY = 'external-projects:undo';
+const UNDO_KEEP_MS = 3 * 24 * 60 * 60_000;
+
+/**
+ * The fields an undo of an edit puts back. Trust and autonomy are not among
+ * them, nor the root (trust follows it) or the protected paths (taking an
+ * added one back would let agents write there): undoing those could hand
+ * out more than the project has now, so changes to them stay final.
+ */
+const UNDO_FIELDS = ['description', 'checkCommand', 'verifyCommand', 'formatCommand', 'setupCommand', 'sharedPaths', 'isolation', 'vcs'] as const;
+/** What a project is, apart from trust and timestamps: how a step tells whether it changed since. */
+const IDENTITY_FIELDS = ['name', 'root', 'protectedPaths', ...UNDO_FIELDS] as const;
+
+/**
+ * One undoable change: a project record appearing, disappearing or being
+ * replaced (`put`, from add and remove), or plain fields of one edited.
+ */
+type ProjectUndoStep =
+  | { kind: 'put'; name: string; before: ExternalProject | null; after: ExternalProject | null }
+  | { kind: 'fields'; name: string; fields: string[]; before: Record<string, unknown>; after: Record<string, unknown> };
 
 /** How a task's file changes are kept apart from the user's working tree. */
 export type IsolationMode = 'none' | 'worktree';
@@ -168,6 +193,21 @@ export class ExternalProjectRegistry extends Abject {
   private activeTasks = new Map<string, Map<string, ActiveTask>>();
   /** A task that has said nothing for this long is presumed gone. */
   private static readonly ACTIVE_TASK_TTL_MS = 2 * 60 * 60_000;
+  /** Each caller's adds, edits and removals, so its own undo takes them back. */
+  private undoHistories = new UndoHistories<ProjectUndoStep>({
+    maxSteps: 50,
+    maxBytes: 512 * 1024,
+    merge: (older, newer) => older.kind === 'fields' && newer.kind === 'fields'
+      ? {
+          kind: 'fields', name: older.name,
+          fields: [...new Set([...older.fields, ...newer.fields])],
+          before: { ...newer.before, ...older.before },
+          after: { ...older.after, ...newer.after },
+        }
+      : newer,
+  }, 32);
+  /** The live id each caller last changed projects from, to tell it its undo state moved. */
+  private undoCallers = new Map<string, AbjectId>();
 
   constructor() {
     super({
@@ -236,7 +276,7 @@ export class ExternalProjectRegistry extends Abject {
             },
             {
               name: 'removeProject',
-              description: 'Forget a project. Nothing on disk is touched.',
+              description: 'Forget a project. Nothing on disk is touched. Your undo brings the record back, untrusted.',
               parameters: [
                 { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Project handle' },
               ],
@@ -323,8 +363,10 @@ export class ExternalProjectRegistry extends Abject {
               ],
               returns: { kind: 'array', elementType: { kind: 'object' } },
             },
+            ...undoMethods('your last add, edit or removal of a project. Trust and autonomy are never undone: a project brought back returns untrusted, at "ask"'),
           ],
           events: [
+            ...UNDO_EVENTS,
             { name: 'projectsChanged', description: 'The set of registered projects changed', payload: { kind: 'object' } },
             { name: 'activeTasksChanged', description: 'The set of tasks working in a project changed', payload: { kind: 'object' } },
           ],
@@ -340,6 +382,7 @@ export class ExternalProjectRegistry extends Abject {
     this.storageId = await this.discoverDep('Storage') ?? undefined;
     this.hostFsId = await this.discoverDep('HostFileSystem') ?? undefined;
     await this.loadFromStorage();
+    await this.loadUndo();
     // Grant every remembered root up front, so a restored project does not
     // prompt again on first use.
     for (const p of this.projects.values()) await this.grantRoot(p.root);
@@ -386,6 +429,12 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
 Several tasks may work in one project at once. \`activeTasks({ name })\` lists them
 with the files each has written so far; agents report through \`taskStarted\`,
 \`filesTouched\`, and \`taskFinished\`. This is awareness, not a lock.
+
+### Undo
+\`undo()\` / \`redo()\` take back your own last addProject, updateProject or removeProject;
+\`getUndoState()\` says what they would do. An edit's description, commands, shared
+paths, isolation and vcs go back; trust, autonomy, root and protected paths stay as
+they are. A project brought back (an undone removal) returns untrusted at "ask".
 
 ### Answering questions
 - "which project is X?" → resolveProject accepts a handle or any path inside one.
@@ -438,7 +487,12 @@ with the files each has written so far; agents report through \`taskStarted\`,
         return { success: false, error: `addProject requires "root" (absolute path to the directory; "path" is accepted too). Received: ${JSON.stringify(raw).slice(0, 200)}` };
       }
       const byAuthority = await this.isTrustAuthority(msg.routing.from);
-      return this.addProject({ ...(raw as Partial<ExternalProject>), name, root }, byAuthority);
+      const replaced = this.projects.get(name) ?? null;
+      const result = await this.addProject({ ...(raw as Partial<ExternalProject>), name, root }, byAuthority);
+      if (result.success && result.project) {
+        await this.recordUndo(msg, `Add project ${name}`, { kind: 'put', name, before: replaced, after: { ...result.project } });
+      }
+      return result;
     });
 
     this.on('updateProject', async (msg: AbjectMessage) => {
@@ -467,20 +521,33 @@ with the files each has written so far; agents report through \`taskStarted\`,
       await this.persist();
       this.changed('projectsChanged', { projects: this.list() });
       this.checkInvariants();
+      const fields = UNDO_FIELDS.filter(k => !sameValue(existing[k], updated[k]));
+      if (fields.length > 0) {
+        const pick = (p: ExternalProject) => Object.fromEntries(fields.map(k => [k, p[k]]));
+        await this.recordUndo(msg, `Edit project ${name}`,
+          { kind: 'fields', name, fields: [...fields], before: pick(existing), after: pick(updated) }, `fields:${name}`);
+      }
       return { success: true, project: updated };
     });
 
     this.on('removeProject', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
       requireNonEmpty(name, 'name');
+      const existing = this.projects.get(name);
       const had = this.projects.delete(name);
       if (had) {
         await this.persist();
         this.changed('projectsChanged', { projects: this.list() });
+        await this.recordUndo(msg, `Remove project ${name}`, { kind: 'put', name, before: { ...existing! }, after: null });
       }
       this.checkInvariants();
       return { success: had };
     });
+
+    this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg, 'undo'));
+    this.on('redo', async (msg: AbjectMessage) => this.undoFor(msg, 'redo'));
+    this.on('getUndoState', async (msg: AbjectMessage) =>
+      this.undoHistories.state(await this.undoCallerKey(msg.routing.from)));
 
     this.on('listProjects', async () => this.listAnnotated());
 
@@ -762,6 +829,115 @@ with the files each has written so far; agents report through \`taskStarted\`,
       // A capability that refuses the grant is not fatal: the user is simply
       // prompted per path the first time, which is the old behavior.
       log.warn(`could not pre-grant ${root}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Undo
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async recordUndo(msg: AbjectMessage, label: string, data: ProjectUndoStep, mergeKey?: string): Promise<void> {
+    const caller = await this.undoCallerKey(msg.routing.from);
+    // A record appearing or going is its own step; only edits merge.
+    this.undoHistories.for(caller).record(label, data, { mergeKey: mergeKey ?? `put:${Date.now()}:${Math.random()}` });
+    this.undoCallers.set(caller, msg.routing.from);
+    await this.saveUndo();
+    this.tellUndoState(caller);
+  }
+
+  private async undoFor(msg: AbjectMessage, action: UndoAction): Promise<UndoResult> {
+    const caller = await this.undoCallerKey(msg.routing.from);
+    const history = this.undoHistories.get(caller);
+    if (!history) return { ok: false, reason: action === 'undo' ? 'Nothing to undo' : 'Nothing to redo' };
+    const result = await history[action](step => this.applyUndoStep(step, action));
+    this.undoCallers.set(caller, msg.routing.from);
+    await this.saveUndo();
+    this.tellUndoState(caller);
+    return result;
+  }
+
+  /**
+   * Put a step's other side back, only while the project still holds what
+   * the step left. A record brought back (an undone removal, a redone add)
+   * returns untrusted at `ask` and with no root grant asked for: undo hands
+   * out nothing, and the person trusts it again from the project window.
+   */
+  private async applyUndoStep(step: UndoStep<ProjectUndoStep>, action: UndoAction): Promise<{ note?: string }> {
+    const data = step.data;
+    const verb = action === 'undo' ? 'undone' : 'redone';
+    const current = this.projects.get(data.name) ?? null;
+    const changedSince = (): never => {
+      throw new UndoRefused(`Project '${data.name}' changed since, so "${step.label}" can no longer be ${verb}`);
+    };
+    let note: string | undefined;
+    if (data.kind === 'put') {
+      const expect = action === 'undo' ? data.after : data.before;
+      const target = action === 'undo' ? data.before : data.after;
+      if (expect ? !current || !this.sameIdentity(current, expect) : current) changedSince();
+      if (target) {
+        const restored: ExternalProject = { ...target, trusted: false, autonomy: 'ask', updatedAt: Date.now() };
+        delete restored.rootMissing;
+        if (restored.isolation === 'worktree' && restored.vcs !== 'git') restored.isolation = 'none';
+        this.projects.set(data.name, restored);
+        if (target.trusted) note = `${data.name} is back untrusted. Trust it again to let work there run without asking.`;
+      } else {
+        this.projects.delete(data.name);
+      }
+    } else {
+      const expect = action === 'undo' ? data.after : data.before;
+      const target = action === 'undo' ? data.before : data.after;
+      if (!current) changedSince();
+      const record = current as unknown as Record<string, unknown>;
+      for (const key of data.fields) if (!sameValue(record[key], expect[key])) changedSince();
+      const updated: Record<string, unknown> = { ...current, updatedAt: Date.now() };
+      for (const key of data.fields) {
+        if (target[key] === undefined) delete updated[key]; else updated[key] = target[key];
+      }
+      const next = updated as unknown as ExternalProject;
+      if (next.isolation === 'worktree' && next.vcs !== 'git') {
+        throw new UndoRefused(`"${step.label}" would put ${data.name} in worktree isolation without git`);
+      }
+      this.projects.set(data.name, next);
+    }
+    await this.persist();
+    this.changed('projectsChanged', { projects: this.list() });
+    this.checkInvariants();
+    return note ? { note } : {};
+  }
+
+  private sameIdentity(a: ExternalProject, b: ExternalProject): boolean {
+    const record = (p: ExternalProject) => p as unknown as Record<string, unknown>;
+    return IDENTITY_FIELDS.every(k => sameValue(record(a)[k], record(b)[k]));
+  }
+
+  private tellUndoState(caller: string): void {
+    const to = this.undoCallers.get(caller);
+    if (to) this.send(event(this.id, to, 'undoStateChanged', this.undoHistories.state(caller)));
+  }
+
+  private async saveUndo(): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      await this.request(request(this.id, this.storageId, 'set', {
+        key: UNDO_STORAGE_KEY,
+        value: { savedAt: Date.now(), histories: this.undoHistories.toJSON() },
+      }));
+    } catch (err) {
+      log.warn(`failed to persist undo history: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Histories from earlier sessions, minus steps older than three days. */
+  private async loadUndo(): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      const saved = await this.request<{ histories?: Record<string, UndoHistoryJSON<ProjectUndoStep>> } | null>(
+        request(this.id, this.storageId, 'get', { key: UNDO_STORAGE_KEY }));
+      this.undoHistories.load(saved?.histories);
+      const cutoff = Date.now() - UNDO_KEEP_MS;
+      this.undoHistories.prune(s => (s.undoneAt ?? s.at) >= cutoff);
+    } catch (err) {
+      log.warn(`failed to load undo history: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
