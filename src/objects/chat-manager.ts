@@ -19,7 +19,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { AbjectId, AbjectMessage, InterfaceId, TypeId, SpawnResult } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { captureConversation, type ContextMessage } from '../core/conversation-context.js';
+import { captureConversation, forkConversationEntries, type ContextMessage } from '../core/conversation-context.js';
 import { describeMessages, protocolText } from '../core/protocol-description.js';
 import { Log } from '../core/timed-log.js';
 import { invariant, require as precondition } from '../core/contracts.js';
@@ -149,6 +149,19 @@ export class ChatManager extends Abject {
               parameters: [
                 { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Optional starting title', optional: true },
                 { name: 'show', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Open its window (default true; ignored without a display)', optional: true },
+              ],
+              returns: { kind: 'object', properties: {
+                conversationId: { kind: 'primitive', primitive: 'string' },
+                chatId: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+            {
+              name: 'forkConversation',
+              description: 'Copy a conversation up to and including one message into a new conversation, leaving the original untouched. The new conversation carries the copied transcript as its history, so it can be talked to from there. Opens its window on a desktop unless show is false.',
+              parameters: [
+                { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'The conversation to copy from' },
+                { name: 'throughMessageId', type: { kind: 'primitive', primitive: 'string' }, description: 'The message the fork ends at (included)' },
+                { name: 'show', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Open the new conversation window (default true; ignored without a display)', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 conversationId: { kind: 'primitive', primitive: 'string' },
@@ -341,6 +354,15 @@ export class ChatManager extends Abject {
     this.on('newConversation', async (msg: AbjectMessage) => {
       const payload = (msg.payload ?? {}) as { title?: string; show?: boolean };
       return this.createConversation(payload.title, payload.show !== false);
+    });
+
+    this.on('forkConversation', async (msg: AbjectMessage) => {
+      const payload = (msg.payload ?? {}) as { conversationId?: string; throughMessageId?: string; show?: boolean };
+      precondition(typeof payload.conversationId === 'string' && payload.conversationId.length > 0,
+        'forkConversation: a conversation id is required');
+      precondition(typeof payload.throughMessageId === 'string' && payload.throughMessageId.length > 0,
+        'forkConversation: the message the fork ends at is required');
+      return this.forkConversation(payload.conversationId, payload.throughMessageId, payload.show !== false);
     });
 
     this.on('openConversation', async (msg: AbjectMessage) => {
@@ -583,7 +605,25 @@ export class ChatManager extends Abject {
 
   // ─── Conversation operations ───────────────────────────────────────
 
-  private async createConversation(title: string | undefined, show: boolean): Promise<{ conversationId: string; chatId: AbjectId }> {
+  /**
+   * Copy a conversation through one message into a new conversation. The
+   * original keeps its transcript and roster row untouched; the copy starts
+   * life with the same prefix as its own history, so the agent resumes there.
+   */
+  private async forkConversation(
+    sourceId: string, throughMessageId: string, show: boolean,
+  ): Promise<{ conversationId: string; chatId: AbjectId }> {
+    const source = this.conversations.get(sourceId);
+    if (!source) throw new Error('Conversation unavailable');
+    const entries = await this.storageGet(historyKey(sourceId));
+    if (!Array.isArray(entries)) throw new Error('Conversation history unavailable');
+    const seed = forkConversationEntries(sourceId, entries as ContextMessage[], throughMessageId);
+    return this.createConversation(`${source.title} (fork)`, show, seed);
+  }
+
+  private async createConversation(
+    title: string | undefined, show: boolean, seed?: ContextMessage[],
+  ): Promise<{ conversationId: string; chatId: AbjectId }> {
     await this.ensurePeerId();
     await this.ensureWorkspaceId();
     const conversationId = uuidv4();
@@ -597,10 +637,17 @@ export class ChatManager extends Abject {
       lastActiveAt: now,
     };
 
+    // A fork's copied transcript must be on disk before its Chat starts: Chat
+    // reads its history once, in onInit, and never looks again.
+    if (seed && seed.length > 0) await this.storageSet(historyKey(conversationId), seed);
+
     // A conversation joins the roster only once its Chat is running: a failed
     // spawn used to leave a "New chat" row behind that nothing could open.
     const chatId = await this.spawnChatFor(c);
-    if (!chatId) throw new Error('Failed to create conversation: its Chat could not start');
+    if (!chatId) {
+      if (seed && seed.length > 0) await this.storageDelete(historyKey(conversationId));
+      throw new Error('Failed to create conversation: its Chat could not start');
+    }
     this.conversations.set(conversationId, c);
     await this.persistRoster();
 

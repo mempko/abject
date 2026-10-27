@@ -53,6 +53,10 @@ const ATTACH_GLYPH = '📎'; // 📎
 const PAUSE_GLYPH = '||';          // pause the running goal
 const RESUME_GLYPH = '\u25B6';     // ▶ resume the paused goal
 const STOP_GLYPH = '\u25A0';       // ■ stop the goal entirely
+/** The "fork from here" control under a message: copy the chat through it into a new one. */
+const FORK_GLYPH = '\u2442';        // ⑂
+const FORK_BUTTON_WIDTH = 28;
+const FORK_BUTTON_HEIGHT = 20;
 const SEND_BTN_SIZE = 44;
 const INPUT_MIN_HEIGHT = 44;
 // What the empty input invites, by what the conversation is doing.
@@ -171,6 +175,8 @@ export class ChatWindow extends Abject {
   private cardSlots = new Map<AbjectId, { typeId: string; height: number }>();
   /** "Pin to desktop" links, by the card each pins. */
   private pinButtons = new Map<AbjectId, string>();
+  /** "Fork from here" controls under messages, by the message each forks. */
+  private forkButtons = new Map<AbjectId, string>();
   private abjectStoreId?: AbjectId;
   /** The placeholder the input shows now. */
   private placeholderShown = PLACEHOLDER_DEFAULT;
@@ -425,6 +431,13 @@ export class ChatWindow extends Abject {
       const pinned = aspect === 'click' ? this.pinButtons.get(fromId) : undefined;
       if (pinned) {
         await this.pinCard(pinned);
+        return;
+      }
+
+      // A tap on a message's fork control copies the conversation through it.
+      const forking = aspect === 'click' ? this.forkButtons.get(fromId) : undefined;
+      if (forking) {
+        await this.forkFrom(forking);
         return;
       }
 
@@ -807,6 +820,7 @@ export class ChatWindow extends Abject {
     this.goalControlsShown = false;
     this.messageLabelIds = [];
     this.shownMessageIds.clear();
+    this.forkButtons.clear();
     this.messageMetadata.clear();
     this.choiceRows.clear();
     this.choiceButtons.clear();
@@ -842,9 +856,65 @@ export class ChatWindow extends Abject {
     await this.removeWelcomeState();
     // The message's own time; 0 means it was saved before times were kept.
     await this.appendBubble(m.role, m.sender, m.text, m.markdown, m.at > 0 ? m.at : undefined, live);
+    if (m.id) await this.addForkControl(m.id, m.role);
     if (m.card?.typeId) await this.addCardSlot(m.card.typeId);
     if (m.id && m.choices && m.choices.length > 0 && !m.answered) await this.addChoices(m.id, m.choices, live);
     await this.keepActivityLast();
+  }
+
+  /**
+   * A small "fork from here" control under a message: it copies this chat up to
+   * and including that message into a conversation of its own. Quiet by design
+   * (flat, muted, a hover tooltip) so it does not compete with the words.
+   */
+  private async addForkControl(messageId: string, role: BubbleRole): Promise<void> {
+    if (!this.messageLogId || !this.windowId || !this.widgetManagerId) return;
+    if (role === 'activity' || role === 'error') return;
+    const align = this.bubbleStyleForRole(role).align;
+    let forkId: AbjectId;
+    try {
+      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId, 'create', {
+          specs: [{
+            type: 'button', windowId: this.windowId, text: FORK_GLYPH,
+            style: {
+              flat: true, color: this.theme.textMeta, fontSize: 13,
+              tooltip: 'Fork the conversation here: copy it through this message into a new chat',
+            },
+          }],
+        })
+      );
+      forkId = widgetIds[0];
+    } catch { return; /* no widgets, no control */ }
+    this.forkButtons.set(forkId, messageId);
+    this.send(request(this.id, forkId, 'addDependent', {}));
+    await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
+      widgetId: forkId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: FORK_BUTTON_WIDTH, height: FORK_BUTTON_HEIGHT },
+      alignment: align,
+    }));
+    this.messageLabelIds.push(forkId);
+  }
+
+  /** Copy the conversation through one message into a new chat and open it. */
+  private async forkFrom(messageId: string): Promise<void> {
+    const chatManagerId = await this.discoverDep('ChatManager');
+    if (!chatManagerId) {
+      log.warn('fork: no ChatManager to ask');
+      this.playEffect('shake');
+      return;
+    }
+    try {
+      await this.request(request(this.id, chatManagerId, 'forkConversation', {
+        conversationId: this.conversationId ?? '',
+        throughMessageId: messageId,
+        show: true,
+      }), 60_000);
+    } catch (err) {
+      log.warn(`fork failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.playEffect('shake');
+    }
   }
 
   /** A card under its message: a slot showing the card's own object. */
@@ -1876,6 +1946,7 @@ export class ChatWindow extends Abject {
       this.send(request(this.id, labelId, 'destroy', {}));
     }
     this.messageLabelIds = [];
+    this.forkButtons.clear();
     this.messageMetadata.clear();
     this.choiceRows.clear();
     this.choiceButtons.clear();

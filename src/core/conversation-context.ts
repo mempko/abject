@@ -21,6 +21,21 @@ export function identifyMessages<T extends ContextMessage>(conversationId: strin
   return entries.map((entry, index) => ({ ...entry, id: entry.id ?? `${conversationId}:legacy:${index}` }));
 }
 
+/**
+ * The entries a fork keeps: everything up to and including `throughMessageId`,
+ * copied so the new conversation owns its own rows. Entries saved before ids
+ * were kept get their deterministic legacy id first, exactly as a reader does.
+ * Throws when the boundary is not part of this conversation.
+ */
+export function forkConversationEntries<T extends ContextMessage>(
+  conversationId: string, entries: T[], throughMessageId: string,
+): T[] {
+  const identified = identifyMessages(conversationId, entries);
+  const end = identified.findIndex(m => m.id === throughMessageId);
+  if (end < 0) throw new Error('Conversation message unavailable');
+  return identified.slice(0, end + 1).map(entry => ({ ...entry }));
+}
+
 export function captureConversation(conversationId: string, entries: ContextMessage[], throughMessageId?: string): ConversationContext {
   const identified = identifyMessages(conversationId, entries);
   const end = throughMessageId === undefined ? identified.length - 1 : identified.findIndex(m => m.id === throughMessageId);
