@@ -1,5 +1,19 @@
 [
   {
+    "version": "0.16.1",
+    "date": "2026-10-27",
+    "title": "Fork a conversation from any message",
+    "summary": "You can now branch a chat at any point: pick a message, and the conversation up to that message is copied into a new conversation you can take in another direction. The original stays exactly as it was.",
+    "highlights": [
+      "Fork a conversation from any message: a small fork control sits under every one of your messages and every agent reply (hover over it to see what it does). Tap it and a new conversation opens holding a copy of everything up to and including that message.",
+      "A fork is an ordinary conversation: it is titled after the original, shows up in your conversation list, is saved like any other, and you can keep talking in it right away.",
+      "The original conversation is untouched: it keeps its full transcript, its title and its place in the list.",
+      "A fork starts clean: it gets the copied transcript only, so cards and any goal running in the original stay behind.",
+      "If creating a fork fails partway, nothing half-made is left behind."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.16.0",
     "date": "2026-10-27",
     "title": "Every Change Can Be Taken Back",
