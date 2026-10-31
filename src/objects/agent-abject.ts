@@ -24,6 +24,8 @@ import { request, event } from '../core/message.js';
 import { requireDefined, requireNonEmpty } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
 import { PROFILE_TAG } from '../core/knowledge.js';
+import type { EntryEvidence } from '../core/learning.js';
+import { confidenceOf, contextKey, isReadOperation, type Confidence } from '../core/surprise.js';
 import type { ContentPart } from '../llm/provider.js';
 import { truncateText, conversationTextChars, enforceConversationCharBudget, isContextOverflowError, promptTokensOf, anchoredConversationChars } from '../llm/provider.js';
 import type { ContextAnchor } from '../llm/provider.js';
@@ -55,9 +57,11 @@ export interface AgentAction {
   expect?: string;
   /** Optional machine-checkable expectation, separate from domain success. */
   expectOutcome?: 'success' | 'failure';
+  /** How sure the agent is of `expect`: 'sure' | 'likely' | 'guess' (read with confidenceOf). */
+  confidence?: string;
   /** The agent's reading of its previous prediction, now that the result is in view. */
   lastPrediction?: { verdict?: string; learned?: string };
-  /** Knowledge entries this action's expectation rests on, by id, with why. */
+  /** Knowledge entries this action's expectation rests on, by label (K1, P2) or id, with why. */
   basis?: Array<{ id: string; why: string }>;
   [key: string]: unknown;
 }
@@ -259,6 +263,24 @@ export interface PredictionRecord {
   missed?: boolean;
   /** Short rendering of the actual result, so the reviewer sees both sides. */
   actual?: string;
+  /** How sure the agent said it was, beside `expect`. */
+  confidence?: Confidence;
+  /** The context the prediction was made in (surprise.ts contextKey), for the learning curve. */
+  contextKey?: string;
+  /**
+   * For a prediction that cited no basis: the shown entries and selected
+   * patterns whose words overlap its expectation most, as leads for the
+   * reviewer when it has to say which belief a miss came from.
+   */
+  basisCandidates?: BasisCandidate[];
+}
+
+/** A belief an uncited prediction may have rested on, found by word overlap. */
+export interface BasisCandidate {
+  id: string;
+  kind: 'entry' | 'pattern';
+  knowledgeRef?: string;
+  score: number;
 }
 
 export interface AgentTaskState {
@@ -547,6 +569,20 @@ interface TaskEntry {
   /** Receipts for pattern content actually delivered, never model-authored. */
   patternSelections?: Record<string, string>;
   /**
+   * Short labels for the knowledge shown in this task's prompt, label to
+   * entry id: `K1`, `K2`, ... for entries and `P1`, ... for patterns. A model
+   * copies `K2` reliably where it garbles a long id, so citations use the
+   * labels and the runtime maps them back before anything is recorded.
+   */
+  knowledgeLabels?: Record<string, string>;
+  /**
+   * Set for a check task (dispatch data `check: true`): a step the planner
+   * staged to test a belief before acting on it. It may only read; the
+   * runtime refuses its actions that change things, and JobManager and
+   * PermissionBroker read this through getTaskStatus.
+   */
+  readOnly?: boolean;
+  /**
    * Patterns the goal's plan assigned to this task, with the planner's reason.
    * They reach the prompt beside the woven ones, so the agent applies them
    * knowingly and its declarations carry a selection receipt.
@@ -560,7 +596,7 @@ interface TaskEntry {
    * through getTaskTranscript.
    */
   predictions?: PredictionRecord[];
-  pendingPrediction?: { step: number; action: AgentAction; at: number };
+  pendingPrediction?: { step: number; action: AgentAction; at: number; confidence?: Confidence; contextKey?: string; basisCandidates?: BasisCandidate[] };
   /** Whether the last observe callback declared its observation as bulk. */
   observationChunkable?: boolean;
   /** Whether the last observe callback declared its observation as state-only (ObserveReply.current). */
@@ -931,6 +967,69 @@ function assignedPatternsOf(raw: unknown): Array<{ id: string; why: string }> | 
   return out.length ? out : undefined;
 }
 
+/**
+ * How a knowledge entry's claim has fared when predictions rested on it, in a
+ * few words for the prompt: "held 9 of 10", "untested", or a warning when its
+ * misses outnumber its holds. Empty when the KnowledgeBase sent no evidence.
+ */
+function evidenceNote(evidence: EntryEvidence | undefined): string {
+  if (!evidence || typeof evidence !== 'object') return '';
+  const held = Number(evidence.held) || 0, missed = Number(evidence.missed) || 0;
+  if (evidence.flagged) return `flagged: often wrong, held ${held} of ${held + missed}`;
+  return held + missed === 0 ? 'untested' : `held ${held} of ${held + missed}`;
+}
+
+/** Words too common to say what an expectation is about. */
+const OVERLAP_STOPWORDS = new Set([
+  'about', 'after', 'again', 'also', 'back', 'been', 'before', 'being', 'come', 'comes', 'does', 'done', 'each',
+  'even', 'every', 'from', 'have', 'here', 'into', 'just', 'like', 'made', 'make', 'more', 'most', 'much', 'must',
+  'only', 'other', 'over', 'same', 'should', 'show', 'shows', 'some', 'such', 'than', 'that', 'their', 'them',
+  'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'until', 'very', 'want', 'were', 'what',
+  'when', 'where', 'which', 'while', 'will', 'with', 'within', 'without', 'would', 'your', 'returns', 'return',
+  'result', 'results', 'call', 'expect', 'expected', 'still', 'least', 'already', 'using', 'used',
+]);
+
+/** The distinct content words of a text: lower case, four letters or more, stopwords and plurals folded. */
+function contentWords(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of text.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 4 || OVERLAP_STOPWORDS.has(raw) || /^\d+$/.test(raw)) continue;
+    out.add(raw.length > 4 && raw.endsWith('s') && !raw.endsWith('ss') ? raw.slice(0, -1) : raw);
+  }
+  return out;
+}
+
+/**
+ * Rank candidate beliefs by how many content words they share with an
+ * expectation. Those below `minShared` are left out; the score is the share
+ * of the expectation's words a candidate covers, so it reads the same for a
+ * short expectation and a long one.
+ */
+function rankByOverlap<T extends { text: string }>(expect: string, candidates: T[], minShared: number, limit: number): Array<T & { score: number }> {
+  const want = contentWords(expect);
+  if (!want.size) return [];
+  return candidates
+    .map((c, order) => {
+      const have = contentWords(c.text);
+      let shared = 0;
+      for (const w of want) if (have.has(w)) shared++;
+      return { c, shared, order };
+    })
+    .filter(r => r.shared >= minShared)
+    .sort((a, b) => b.shared - a.shared || a.order - b.order)
+    .slice(0, limit)
+    .map(r => ({ ...r.c, score: Math.round((r.shared / want.size) * 100) / 100 }));
+}
+
+/** Runtime verbs a check step keeps: they read, or something downstream enforces their effect. */
+const READ_ONLY_RUNTIME_VERBS = new Set(['replan', 'recall', 'read_chunk', 'read_context', 'submit_job']);
+/** Shell actions: PermissionBroker judges their effect for a check step. */
+const SHELL_ACTIONS = new Set(['shell', 'bash']);
+/** Agent actions that only look, beyond the names isReadOperation recognizes. */
+const LOOKING_ACTIONS = new Set(['navigate', 'look', 'scroll', 'screenshot', 'hover', 'hover_at', 'wait', 'extract', 'go_back', 'go_forward']);
+/** Names isReadOperation would read as reads that change a form instead. */
+const FORM_ACTIONS = new Set(['check', 'uncheck']);
+
 /** Fields of an action that say how it went or why, not what it does. */
 const ACTION_ASIDES = new Set(['action', 'target', 'method', 'expect', 'reasoning', 'learned', 'note', 'say']);
 
@@ -1147,6 +1246,7 @@ export class AgentAbject extends Abject {
                 { name: 'initialMessages', type: { kind: 'array', elementType: { kind: 'object', properties: {} } }, description: 'Initial conversation messages', optional: true },
                 { name: 'config', type: { kind: 'object', properties: {} }, description: 'Per-task config overrides: { maxSteps?: number (default 25), timeout?: number (default 300000ms) }', optional: true },
                 { name: 'responseSchema', type: { kind: 'object', properties: {} }, description: 'JSON Schema for structured result', optional: true },
+                { name: 'readOnly', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Run the task as a read-only check step: actions that change things are refused. Queued tasks get this from dispatch data `check: true`.', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 ticketId: { kind: 'primitive', primitive: 'string' },
@@ -1170,7 +1270,7 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'getTaskStatus',
-              description: 'Get status of a task',
+              description: 'Get status of a task. readOnly is true for a check step (dispatch data `check: true`), which may only read.',
               parameters: [
                 { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task ID' },
               ],
@@ -1179,6 +1279,7 @@ export class AgentAbject extends Abject {
                 step: { kind: 'primitive', primitive: 'number' },
                 error: { kind: 'primitive', primitive: 'string' },
                 agentId: { kind: 'primitive', primitive: 'string' },
+                readOnly: { kind: 'primitive', primitive: 'boolean' },
               } },
             },
             {
@@ -1226,6 +1327,14 @@ export class AgentAbject extends Abject {
                   outcome: { kind: 'primitive', primitive: 'string' },
                   missed: { kind: 'primitive', primitive: 'boolean' },
                   actual: { kind: 'primitive', primitive: 'string' },
+                  confidence: { kind: 'primitive', primitive: 'string' },
+                  contextKey: { kind: 'primitive', primitive: 'string' },
+                  basisCandidates: { kind: 'array', elementType: { kind: 'object', properties: {
+                    id: { kind: 'primitive', primitive: 'string' },
+                    kind: { kind: 'primitive', primitive: 'string' },
+                    knowledgeRef: { kind: 'primitive', primitive: 'string' },
+                    score: { kind: 'primitive', primitive: 'number' },
+                  } } },
                 } } },
                 transcript: { kind: 'primitive', primitive: 'string' },
               } },
@@ -1605,7 +1714,7 @@ The registered object must implement these handlers to participate in the agent 
       status: entry.settling && outstandingOperation ? 'partial' : entry.state.phase === 'done' && entry.candidateAccepted ? 'accepted' : entry.state.phase === 'error' ? 'partial' : 'running',
       snapshot: encodeAgentState({ state: entry.state, config: entry.config, systemPrompt: entry.systemPrompt,
         taskPrompt: entry.taskPrompt, responseSchema: entry.responseSchema, dispatchTupleId: entry.dispatchTupleId, predictions: entry.predictions,
-        injectedKnowledge: entry.injectedKnowledge, knowledgeScopes: entry.knowledgeScopes, refreshKnowledgePrompt: entry.refreshKnowledgePrompt, patternSelections: entry.patternSelections, payloads: entry.payloads, archivedPayloads: entry.archivedPayloads, payloadSeq: entry.payloadSeq, pendingPrediction: entry.pendingPrediction, goalNotes: entry.goalNotes, goalNotesShown: entry.goalNotesShown, specialist,
+        injectedKnowledge: entry.injectedKnowledge, knowledgeScopes: entry.knowledgeScopes, refreshKnowledgePrompt: entry.refreshKnowledgePrompt, patternSelections: entry.patternSelections, knowledgeLabels: entry.knowledgeLabels, readOnly: entry.readOnly, payloads: entry.payloads, archivedPayloads: entry.archivedPayloads, payloadSeq: entry.payloadSeq, pendingPrediction: entry.pendingPrediction, goalNotes: entry.goalNotes, goalNotesShown: entry.goalNotesShown, specialist,
         children: [...this.delegations.values()].filter(d=>d.parentTaskId===entry.state.id) }),
       outstandingOperation, ...(usage?{usage}:{}),
       ...(entry.delivery ? { outbox: [entry.delivery] } : {}),
@@ -1891,6 +2000,7 @@ The registered object must implement these handlers to participate in the agent 
         const entry: TaskEntry = { state, agentId: agent.agentId, callerId: agent.agentId, config: mergeConfig(agent.config, { ...stored.config, completionMethod: agent.config.completionMethod, snapshotMethod: agent.config.snapshotMethod, restoreMethod: agent.config.restoreMethod }),
           systemPrompt: stored.systemPrompt, taskPrompt: stored.taskPrompt, responseSchema: stored.responseSchema,
           goalId: current.goalId, dispatchTupleId: stored.dispatchTupleId, parentTaskId: current.parentId, predictions: stored.predictions, injectedKnowledge: stored.injectedKnowledge, patternSelections: stored.patternSelections,
+          knowledgeLabels: stored.knowledgeLabels, readOnly: stored.readOnly === true ? true : undefined,
           knowledgeScopes: stored.knowledgeScopes, refreshKnowledgePrompt: stored.refreshKnowledgePrompt,
           payloads: stored.payloads, archivedPayloads: stored.archivedPayloads, payloadSeq: stored.payloadSeq, pendingPrediction: undefined, goalNotes: stored.goalNotes, goalNotesShown: stored.goalNotesShown, sessionId: p.id, sessionRevision: resumed.session.revision };
         for (const child of stored.children ?? []) this.delegations.set(child.taskId,{...child,status:child.status==='done'?'done':'error',error:child.status==='done'?undefined:'Interrupted child: inspect its session before continuing'});
@@ -2016,6 +2126,11 @@ The registered object must implement these handlers to participate in the agent 
         goalId,
         dispatchTupleId: this.delegations.has(taskId) ? undefined : dispatchTupleId,
         assignedPatterns: assignedPatternsOf(queued?.data?.patterns),
+        // A check step reads only. The flag only restricts, so the dispatch
+        // data (or the caller's own word) is enough; a child delegated from
+        // a check step is held to the same rule.
+        ...(queued?.data?.check === true || (msg.payload as { readOnly?: unknown }).readOnly === true
+          || (delegation && this.taskEntries.get(delegation.parentTaskId)?.readOnly) ? { readOnly: true } : {}),
       };
 
       this.taskEntries.set(taskId, entry);
@@ -2190,6 +2305,7 @@ The registered object must implement these handlers to participate in the agent 
         step: entry.state.step,
         error: entry.state.error,
         agentId: entry.agentId,
+        ...(entry.readOnly ? { readOnly: true } : {}),
       };
     });
 
@@ -2923,7 +3039,9 @@ The registered object must implement these handlers to participate in the agent 
     const pending = entry.pendingPrediction;
     if (pending && !entry.predictions?.some(p => p.step === pending.step)) {
       (entry.predictions ??= []).push({ step: pending.step, action: pending.action.action,
-        expect: typeof pending.action.expect === 'string' ? pending.action.expect : '',
+        expect: typeof pending.action.expect === 'string' ? pending.action.expect.trim().slice(0, AgentAbject.MAX_EXPECT_CHARS) : '',
+        ...(pending.confidence ? { confidence: pending.confidence } : {}), ...(pending.contextKey ? { contextKey: pending.contextKey } : {}),
+        ...(pending.basisCandidates?.length ? { basisCandidates: pending.basisCandidates } : {}),
         predictedAt: pending.at, outcome: 'unknown', verdict: 'unresolved', semanticVerdict: 'unresolved',
         patterns: Array.isArray(pending.action.patterns) ? pending.action.patterns : [],
         actual: 'No completed observation was recorded. Cancellation or interruption does not prove whether the action took effect.' });
@@ -3698,7 +3816,10 @@ The registered object must implement these handlers to participate in the agent 
             // whole job rejected because the sandbox's source scan found
             // `fetch(` inside the payload, and any action text could reshape
             // the code around it. As data it is inert.
-            const actResult = await this.executeStep(
+            // A check step's actions that change things never reach the agent.
+            const refusal = this.readOnlyRefusal(entry, task.action);
+            if (refusal) log.info(`[${agentName}] Step ${task.step + 1}: check step refused ${task.action?.action}`);
+            const actResult: AgentActionResult = refusal ? { success: false, error: refusal } : await this.executeStep(
               entry,
               `[${agentName}] ${desc} (step ${task.step + 1})`,
               `return await call('${entry.agentId}', 'agentAct', { taskId: '${task.id}', step: ${task.step}, action: __agentAction, batchRemaining: ${entry.pendingActions?.length ?? 0} })`,
@@ -4143,6 +4264,9 @@ The registered object must implement these handlers to participate in the agent 
       const jobMgrId = await this.cachedDepOrThrow('JobManager', this.jobManagerId);
       const submitMsg = request(this.id, jobMgrId, 'submitJob', {
         description, taskId: entry.state.id,
+        // The loop's own observe/think/act dispatch, not agent-authored code:
+        // the action it carries was already held to a check step's rule here.
+        runtimeStep: true,
         code: fullCode,
         context: { ...(jobContext ?? {}), taskId: entry.state.id },
         queue: `${entry.config.queueName ?? 'agent'}:${entry.state.id}`,
@@ -4251,7 +4375,7 @@ The registered object must implement these handlers to participate in the agent 
   private static recentSteps(entry: TaskEntry, n = 8, resultChars = 300): Array<Record<string, unknown>> {
     return (entry.predictions ?? []).slice(-n).map(p => ({
       step: p.step, action: p.action, outcome: p.outcome,
-      ...(p.expect ? { expect: p.expect.slice(0, 160) } : {}),
+      ...(p.expect ? { expect: p.expect.slice(0, AgentAbject.MAX_EXPECT_CHARS) } : {}),
       ...(p.actual ? { result: p.actual.slice(0, resultChars) } : {}),
     }));
   }
@@ -5077,11 +5201,14 @@ When an observation or a result is too big to sit in the conversation, you get a
 **The reader is for locating and inspecting**, when you want a specific thing rather than all of them: \`grep\` to jump to it, \`outline\` to see the structure when you are unsure what to search for, \`offset\`/\`length\` to read a region in order. A grep that reports further matches it did not show is telling you the question was an all-of-them question; switch to code rather than paging on.
 
 The preview often answers the question on its own — when it does, just act.`, true);
-    add('prediction', '\n\n## Prediction\nEvery action carries an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. Comparing what you expected with what happened is how this system learns, so predict routine steps too. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"). The expectation comes from what you know: your own understanding, the knowledge and patterns in this prompt, and what earlier steps showed.\n\nThe real result comes back beside your expectation. Your next action carries your reading of it as one more field, `"lastPrediction": {"verdict": "held" | "missed" | "unclear", "learned": "one line"}`, in the same JSON object as its `action` and `expect`: your honest reading of the previous expectation against that result, and on a miss, what you now believe instead. One action, one object, for example `{"action": "<your next action>", "expect": "<what it will show>", "lastPrediction": {"verdict": "held", "learned": "<one line>"}}`. Operation success alone does not make a free-text prediction hold, and an expected rejection can. Optionally add `"expectOutcome": "success" | "failure"` for the operation outcome itself.\n\nWhen an expectation rests on a knowledge entry shown in this prompt, cite it in the same action: `"basis": [{"id": "<entry id>", "why": "what it told you"}]`, for example `{"action": "...", "expect": "the call lists the three saved items", "basis": [{"id": "<id from Relevant Knowledge>", "why": "it says saved items are listed newest first"}]}`. A citation is how a wrong entry gets corrected: when a cited expectation misses, the reviewer fixes the entry that misled you; an uncited miss can only be put down to your own judgment, and the entry stays as it was. When you apply a pattern, declare it: `"patterns": [{"id": "<pattern id>", "why": "how its Therefore shapes this action"}]`; seeing a pattern is different from using it. The runtime tracks versions, so leave revision numbers out. Predictions, your readings of them and their citations are kept for Scrum replanning and retrospective learning. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
+    add('prediction', '\n\n## Prediction\nEvery action carries an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. Comparing what you expected with what happened is how this system learns, so predict routine steps too. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"). The expectation comes from what you know: your own understanding, the knowledge and patterns in this prompt, and what earlier steps showed.\n\nBeside `expect`, say how sure you are: `"confidence": "sure" | "likely" | "guess"`. Sure means a miss would surprise you; likely means it probably holds; guess means it could go either way. Honest confidence is what makes a miss informative: a sure expectation that misses marks exactly the belief that needs correcting.\n\nThe real result comes back beside your expectation. Your next action carries your reading of it as one more field, `"lastPrediction": {"verdict": "held" | "missed" | "unclear", "learned": "one line"}`, in the same JSON object as its `action` and `expect`: your honest reading of the previous expectation against that result, and on a miss, what you now believe instead. One action, one object, for example `{"action": "<your next action>", "expect": "<what it will show>", "confidence": "likely", "lastPrediction": {"verdict": "held", "learned": "<one line>"}}`. Operation success alone does not make a free-text prediction hold, and an expected rejection can. Optionally add `"expectOutcome": "success" | "failure"` for the operation outcome itself.\n\nKnowledge shown in this prompt carries a short label, `K1`, `K2`, ... for entries and `P1`, `P2`, ... for patterns. When an expectation rests on an entry, cite it by its label in the same action: `"basis": [{"id": "K2", "why": "what it told you"}]`, for example `{"action": "...", "expect": "the call lists the three saved items", "confidence": "sure", "basis": [{"id": "K2", "why": "it says saved items are listed newest first"}]}`. A citation is how a wrong entry gets corrected: when a cited expectation misses, the reviewer fixes the entry that misled you; an uncited miss can only be put down to your own judgment, and the entry stays as it was. When you apply a pattern, declare it by its label: `"patterns": [{"id": "P1", "why": "how its Therefore shapes this action"}]`; seeing a pattern is different from using it. The runtime tracks versions, so leave revision numbers out. Predictions, your readings of them and their citations are kept for Scrum replanning and retrospective learning. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
 
     // Per-task addendum from the caller (task hints, the browsing goal): the
     // reason `systemPrompt` can stay identical across an agent's tasks.
     add('task-prompt', entry.taskPrompt, false);
+    if (entry.readOnly) {
+      add('check-step', '\n\n## Check step\nThis task is a read-only check step: the plan staged it to test a belief before the goal acts on it. Read, list, look and ask as the check needs, and leave everything as you found it. Finish with your done action, and say plainly whether the belief held, with the evidence you read.', false);
+    }
     if (entry.responseSchema) {
       add('response-schema', `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`, false);
     }
@@ -5106,7 +5233,7 @@ The preview often answers the question on its own — when it does, just act.`, 
     try {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (knowledgeBaseId) {
-        type KEntry = { id: string; title: string; type: string; content: string; archived?: boolean; origin?: string; usefulCount?: number; updatedAt?: number; knowledgeRef?: string; patternRef?: string; pattern?: { learning?: { revision?: number } }; counterexamples?: Array<{ verdict: string; evidence: string }> };
+        type KEntry = { id: string; title: string; type: string; content: string; archived?: boolean; origin?: string; usefulCount?: number; updatedAt?: number; knowledgeRef?: string; patternRef?: string; pattern?: { learning?: { revision?: number } }; counterexamples?: Array<{ verdict: string; evidence: string }>; evidence?: EntryEvidence };
         // Recall in the user's words as well as the task's: a goal's own text
         // and the caller's conversation context join the task text, so a
         // follow-up question or a planner's paraphrase still finds what the
@@ -5150,10 +5277,20 @@ The preview often answers the question on its own — when it does, just act.`, 
           if (useful !== 0) return useful;
           return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
         });
+        // Each shown entry carries a short label (K1, K2, ...; patterns P1,
+        // ...) to cite it by, its id for messages that need one, and how its
+        // claim has fared when predictions rested on it.
+        const tag = (e: KEntry, kind: 'K' | 'P', type?: string): string => {
+          const note = evidenceNote(e.evidence);
+          return `[${this.knowledgeLabel(entry, e.id, kind)}] (${type ? `${type}; ` : ''}id=${e.id}${note ? `; ${note}` : ''})`;
+        };
+        const profileLine = (e: KEntry, label: string): string =>
+          `- **${e.title}** ${label}: ${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP))}\n`;
         const profile: KEntry[] = [];
         let budget = AgentAbject.PROFILE_BLOCK_CHAR_BUDGET;
         for (const e of ranked) {
-          const line = `- **${e.title}** [id=${e.id}]: ${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP))}\n`;
+          // Measured with a placeholder so entries that do not fit take no label.
+          const line = profileLine(e, `[K00] (id=${e.id}${evidenceNote(e.evidence) ? `; ${evidenceNote(e.evidence)}` : ''})`);
           if (line.length > budget) break;
           budget -= line.length;
           profile.push(e);
@@ -5162,7 +5299,7 @@ The preview often answers the question on its own — when it does, just act.`, 
         if (profile.length > 0) {
           let block = '\n\n## About the User\nDurable facts about the user. Apply them without asking the user to repeat them.\n';
           for (const e of profile) {
-            block += `- **${e.title}** [id=${e.id}]: ${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP))}\n`;
+            block += profileLine(e, tag(e, 'K'));
           }
           const omitted = (profileAll?.length ?? 0) - profile.length;
           if (omitted > 0) {
@@ -5191,7 +5328,7 @@ The preview often answers the question on its own — when it does, just act.`, 
         if (relevant.length > 0) {
           let kb = '\n\n## Relevant Knowledge\nHistorical claims from previous agents follow. For mutable facts such as scripts, branches, or current capabilities, consult the owning Abject and prefer current observations. Where an entry says which object or agent handles a kind of work, read it as a record of what happened once, not as a rule: capabilities move as skills and tools are installed, and the agent that wrote the note is often the one it names. Decide that question from the live roster and by asking. Use remember(title, content, type, tags) to save new insights.\n';
           for (const e of relevant) {
-            kb += `- **${e.title}** (${e.type}; id=${e.id}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}): ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
+            kb += `- **${e.title}** ${tag(e, 'K', e.type)}: ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
           }
           add('knowledge', kb, false);
         }
@@ -5200,7 +5337,7 @@ The preview often answers the question on its own — when it does, just act.`, 
           let block = '\n\n## Patterns\nThis workspace\'s generative pattern language (Alexander/Coplien-style): proven shapes for how work here gets done. Each pattern\'s Context section says when it applies, its Forces say what goes wrong naively, and its Therefore resolves them; patterns marked "linked-from" arrived through the Links of a matched pattern, and patterns marked "assigned by the plan" are the ones the goal\'s plan chose for this task. Apply the patterns whose context holds for this task, and declare each one on the actions it shapes.\n';
           for (const e of patterns) {
             const via = e.via && e.via !== 'matched' ? ` (${e.via})` : '';
-            block += `\n### PATTERN: ${e.title}${via} [id=${e.id}]\n${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP))}\n`;
+            block += `\n### PATTERN: ${e.title}${via} ${tag(e, 'P')}\n${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP))}\n`;
             // Recent uses where following it did not help: weigh them before applying it.
             if (e.counterexamples?.length) block += `Recent counterexamples: ${e.counterexamples.map(c => `${c.verdict}: ${sanitizeInjectedFact(c.evidence.slice(0, 200))}`).join(' | ')}\n`;
           }
@@ -5840,6 +5977,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   private async performRuntimeAction(entry: TaskEntry, agentName = 'An agent'): Promise<{ result: AgentActionResult; message: string }> {
     const task = entry.state;
     const action = task.action!;
+    const refusal = this.readOnlyRefusal(entry, action);
+    if (refusal) return { result: { success: false, error: refusal }, message: `[${action.action}] ${refusal}` };
     if (action.action === 'ask_user') {
       const question = typeof action.question === 'string' ? action.question.trim() : '';
       if (!question) throw new Error('ask_user needs a question');
@@ -5915,7 +6054,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       return { result: { success: true, data: saved }, message: `[Remember] Saved ${saved.id}. Continue with the task.` };
     }
     if (action.action !== 'recall') throw new Error(`Unknown runtime action: ${action.action}`);
-    const id = action.id as string | undefined, pattern = action.pattern as string | undefined;
+    const id = typeof action.id === 'string' ? this.resolveKnowledgeLabel(entry, action.id) : undefined;
+    const pattern = action.pattern as string | undefined;
     const query = action.query as string | undefined, tags = action.tags as string[] | undefined;
     const limit = Math.min(typeof action.limit === 'number' ? action.limit : 5, 10);
     let rendered: string;
@@ -5925,7 +6065,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       if (e?.patternRef) (entry.patternSelections ??= {})[id] = e.patternRef;
       if (e) await this.recordKnowledgeSelection(entry, { ...e, id }, (e.content?.length ?? 0) <= this.chunkLimit(entry));
       rendered = e
-        ? `**${e.title}** (${e.type}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}; ${(e.content ?? '').length} chars): ${(e.content ?? '').slice(0, this.chunkLimit(entry))}${(e.content?.length ?? 0) > this.chunkLimit(entry) ? '\n[Incomplete claim: content exceeds the recall display limit.]' : ''}`
+        ? `**${e.title}** [${this.knowledgeLabel(entry, id, e.type === 'pattern' ? 'P' : 'K')}] (${e.type}; id=${id}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}; ${(e.content ?? '').length} chars): ${(e.content ?? '').slice(0, this.chunkLimit(entry))}${(e.content?.length ?? 0) > this.chunkLimit(entry) ? '\n[Incomplete claim: content exceeds the recall display limit.]' : ''}`
         : `No entry with id "${id}".`;
     } else if (pattern) {
       const hits = await this.request<Array<{ id: string; title: string; type: string; content: string; knowledgeRef?: string; patternRef?: string }>>(
@@ -5933,7 +6073,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       for (const h of hits) await this.recordKnowledgeSelection(entry, { ...h, content: h.content.slice(0, 300) });
       for (const h of hits) if (h.patternRef) (entry.patternSelections ??= {})[h.id] = h.patternRef;
       rendered = hits.length
-        ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.content.slice(0, 300)}`).join('\n')
+        ? hits.map(h => `- [${this.knowledgeLabel(entry, h.id, h.type === 'pattern' ? 'P' : 'K')}] ${h.id} (${h.type}) ${h.title}: ${h.content.slice(0, 300)}`).join('\n')
         : `No entries match pattern "${pattern}".`;
     } else if (query || tags?.length) {
       const hits = await this.request<Array<{ id: string; title: string; type: string; snippet?: string }>>(
@@ -6028,12 +6168,128 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const shown = new Map((entry.injectedKnowledge ?? []).map(k => [k.id, k.knowledgeRef]));
     const out: NonNullable<PredictionRecord['basis']> = [];
     for (const b of raw.slice(0, 8)) {
-      if (!b || typeof b !== 'object' || typeof (b as { id?: unknown }).id !== 'string') continue;
-      const { id, why } = b as { id: string; why?: unknown };
+      const cited = this.citation(entry, b);
+      if (!cited) continue;
+      const { id, why } = cited;
       if (out.some(o => o.id === id) || !(shown.has(id) || entry.patternSelections?.[id])) continue;
-      out.push({ id, why: typeof why === 'string' ? why.slice(0, 500) : '', ...(shown.get(id) ? { knowledgeRef: shown.get(id) } : {}) });
+      out.push({ id, why: why.slice(0, 500), ...(shown.get(id) ? { knowledgeRef: shown.get(id) } : {}) });
     }
     return out;
+  }
+
+  /**
+   * One cited belief as the model wrote it: a label or an id, alone or as
+   * `{id, why}`. Labels map back to the entry ids they were shown for.
+   */
+  private citation(entry: TaskEntry, raw: unknown): { id: string; why: string } | undefined {
+    if (typeof raw === 'string') return raw.trim() ? { id: this.resolveKnowledgeLabel(entry, raw), why: '' } : undefined;
+    if (!raw || typeof raw !== 'object' || typeof (raw as { id?: unknown }).id !== 'string') return undefined;
+    const { id, why } = raw as { id: string; why?: unknown };
+    if (!id.trim()) return undefined;
+    return { id: this.resolveKnowledgeLabel(entry, id), why: typeof why === 'string' ? why : '' };
+  }
+
+  /**
+   * The short label an entry is shown under in this task: the one it already
+   * has, or the next free `K<n>` / `P<n>`. Labels are never reused within a
+   * task, so a citation made before a prompt refresh still means the same entry.
+   */
+  private knowledgeLabel(entry: TaskEntry, id: string, kind: 'K' | 'P'): string {
+    requireNonEmpty(id, 'knowledge id');
+    const labels = (entry.knowledgeLabels ??= {});
+    for (const [label, known] of Object.entries(labels)) if (known === id && label[0] === kind) return label;
+    let n = 1;
+    while (labels[`${kind}${n}`] !== undefined) n++;
+    const label = `${kind}${n}`;
+    labels[label] = id;
+    return label;
+  }
+
+  /** The entry id a citation names: a label shown in this task maps back; anything else passes through. */
+  private resolveKnowledgeLabel(entry: TaskEntry, raw: string): string {
+    const text = raw.trim();
+    const labelled = /^[KkPp]\d{1,3}$/.test(text) ? entry.knowledgeLabels?.[text.toUpperCase()] : undefined;
+    return labelled ?? text;
+  }
+
+  /**
+   * Leads for a prediction that cited no basis: the shown entries whose words
+   * overlap its expectation most (at most 3, two shared words or more) and
+   * the selected patterns that overlap it at all (at most 2, leaving out the
+   * ones it declared). The reviewer weighs them when it has to say which
+   * belief a miss came from; they are never treated as a citation.
+   */
+  private basisCandidatesFor(entry: TaskEntry, expect: string, declaredPatterns: string[] = []): BasisCandidate[] {
+    if (!expect.trim()) return [];
+    const shown = entry.injectedKnowledge ?? [];
+    const entries = rankByOverlap(expect,
+      shown.filter(k => k.source !== 'pattern').map(k => ({ id: k.id, knowledgeRef: k.knowledgeRef, text: `${k.title} ${k.content ?? ''}` })), 2, 3);
+    const patterns = rankByOverlap(expect,
+      shown.filter(k => k.source === 'pattern' && !declaredPatterns.includes(k.id))
+        .map(k => ({ id: k.id, knowledgeRef: k.knowledgeRef, text: `${k.title} ${k.content ?? ''}` })), 1, 2);
+    const out: BasisCandidate[] = [];
+    for (const [kind, list] of [['entry', entries], ['pattern', patterns]] as const) {
+      for (const c of list) if (!out.some(o => o.id === c.id)) out.push({ id: c.id, kind, ...(c.knowledgeRef ? { knowledgeRef: c.knowledgeRef } : {}), score: c.score });
+    }
+    return out;
+  }
+
+  /** The stated confidence and the context key of an action's prediction. */
+  private predictionContext(entry: TaskEntry, action: AgentAction | undefined): { confidence?: Confidence; contextKey: string } {
+    const confidence = confidenceOf(action?.confidence);
+    const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v : undefined);
+    const key = contextKey({
+      agent: this.registeredAgents.get(entry.agentId)?.name,
+      action: str(action?.action) ?? 'unknown',
+      target: str(action?.target) ?? str(action?.object),
+      method: str(action?.method),
+    });
+    return { ...(confidence ? { confidence } : {}), contextKey: key };
+  }
+
+  /**
+   * Why a check step may not take this action, or undefined when it may. A
+   * check step reads only: it keeps its terminal and progress actions, the
+   * runtime verbs that read (submit_job too: JobManager holds its calls to
+   * reads), shell actions (PermissionBroker holds their effect to reads),
+   * calls whose method reads, questions to objects that are not agents, and
+   * agent actions that only look. Remembering, asking the person, questions
+   * to other agents, and everything that changes something are refused.
+   */
+  private readOnlyRefusal(entry: TaskEntry, action: AgentAction | undefined): string | undefined {
+    if (!entry.readOnly || !action) return undefined;
+    const verb = String(action.action ?? '');
+    const str = (v: unknown) => (typeof v === 'string' ? v : '');
+    let allowed: boolean;
+    let what = verb;
+    if (verb === 'remember' || verb === 'ask_user') allowed = false;
+    else if (entry.config.terminalActions[verb] || entry.config.intermediateActions.includes(verb)) allowed = true;
+    else if (READ_ONLY_RUNTIME_VERBS.has(verb) || SHELL_ACTIONS.has(verb)) allowed = true;
+    else if (verb === 'call') {
+      const method = str(action.method);
+      const args = action.payload ?? action.args;
+      what = `${str(action.object) || str(action.target) || 'call'}.${method || '?'}`;
+      allowed = isReadOperation(method, args && typeof args === 'object' ? args as Record<string, unknown> : undefined);
+    } else if (verb === 'ask') {
+      const target = str(action.object) || str(action.target) || str(action.agent);
+      what = `ask ${target || '(no one)'}`;
+      allowed = !!target && !this.isRegisteredAgent(target);
+    } else if (verb === 'http') {
+      allowed = isReadOperation('request', { method: str(action.method) || 'GET' });
+    } else {
+      allowed = !FORM_ACTIONS.has(verb) && (LOOKING_ACTIONS.has(verb) || isReadOperation(verb));
+    }
+    if (allowed) return undefined;
+    return `This task is a check step, and check steps read only, so "${what}" was left undone. `
+      + 'Gather what the check needs with actions that read (calls whose method reads, recall, read_chunk, a job of reading calls), '
+      + 'then finish with your done action and report what you found and whether the belief held.';
+  }
+
+  /** Whether a name or id belongs to a registered agent (a question to one can set it to work). */
+  private isRegisteredAgent(nameOrId: string): boolean {
+    if (this.registeredAgents.has(nameOrId as AbjectId)) return true;
+    for (const a of this.registeredAgents.values()) if (a.name === nameOrId) return true;
+    return false;
   }
 
   /**
@@ -6074,8 +6330,10 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const declared = Array.isArray(action.patterns) ? action.patterns : [];
     const applications: NonNullable<PredictionRecord['patterns']> = [];
     action.patterns = applications; // Discard model-supplied provenance before any await or cancellation.
-    for (const p of declared) {
-      if (!p || typeof p.id !== 'string' || typeof p.why !== 'string') continue;
+    for (const raw of declared) {
+      // A label (P1) or an id, alone or as {id, why}; labels map back to ids.
+      const p = this.citation(entry, raw);
+      if (!p) continue;
       if (applications.some(a => a.id === p.id)) continue;
       const applied: NonNullable<PredictionRecord['patterns']>[number] = { id: p.id, why: p.why.slice(0, 1000) };
       applications.push(applied);
@@ -6096,11 +6354,22 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     }
     action.patterns = applications;
     action.basis = this.citedBasis(entry, action.basis);
+    // Confidence and context for the learning curve; for an uncited
+    // expectation, the beliefs it most likely rested on.
+    const pending = entry.pendingPrediction;
+    const { confidence, contextKey: key } = this.predictionContext(entry, action);
+    if (confidence) pending.confidence = confidence;
+    pending.contextKey = key;
+    const expectText = typeof action.expect === 'string' ? action.expect.trim() : '';
+    const candidates = expectText && !action.basis.length ? this.basisCandidatesFor(entry, expectText, applications.map(a => a.id)) : [];
+    if (candidates.length) pending.basisCandidates = candidates;
     if (goalId && this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
       goalId, operationId: `${task.id}:${task.step + 1}:prediction`,
       observation: { taskId: task.id, kind: 'prediction', step: task.step + 1, action: task.action?.action,
         expect: task.action?.expect ?? null, expectOutcome: task.action?.expectOutcome ?? null,
-        patterns: action.patterns ?? [], basis: action.basis, execution: task.execution, predictedAt: entry.pendingPrediction.at },
+        patterns: action.patterns ?? [], basis: action.basis, execution: task.execution, predictedAt: pending.at,
+        ...(confidence ? { confidence } : {}), contextKey: key,
+        ...(candidates.length ? { basisCandidates: candidates } : {}) },
     }));
   }
 
@@ -6120,6 +6389,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const stored = `${task.id}:step:${task.step + 1}`;
     // Observations live in the goal evidence ledger, not the five-slot bulk cache.
     const patterns = Array.isArray(action?.patterns) ? action.patterns.filter((p: any) => p && typeof p.id === 'string' && typeof p.why === 'string').map((p: any) => ({ id: p.id, applicationRef: predicted ? p.applicationRef : undefined, provenanceError: predicted ? p.provenanceError : 'No pre-action provenance captured', why: p.why.slice(0, 1000) })) : [];
+    const context = predicted?.contextKey ? { confidence: predicted.confidence, contextKey: predicted.contextKey } : this.predictionContext(entry, action);
     (entry.predictions ??= []).push({
       execution: task.execution,
       step: task.step + 1, action: String(task.action?.action ?? 'unknown'),
@@ -6128,6 +6398,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       ...(predicted && Array.isArray(predicted.action.basis) && predicted.action.basis.length ? { basis: predicted.action.basis as NonNullable<PredictionRecord['basis']> } : {}),
       ...(verdict === 'contradicted' ? { missed: true } : {}),
       actual: actual.slice(0, 2000), actualRef: stored,
+      ...(context.confidence ? { confidence: context.confidence } : {}), contextKey: context.contextKey,
+      ...(predicted?.basisCandidates?.length ? { basisCandidates: predicted.basisCandidates } : {}),
     });
     const goalId = entry.goalId ?? entry.incomingGoalId;
     if (goalId && this.goalManagerId) {

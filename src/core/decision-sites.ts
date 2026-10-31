@@ -55,6 +55,7 @@ export const DECISION_SITES: Record<string, DecisionSite> = {
   // ── Chat, planning, and the goal lifecycle ──
   'chat.route': site('Does a user message need a goal, a direct answer, a clarification, or remembering?', 'act', 'native-only'),
   'chat.audit': site('Does a goal-less reply claim unobserved outcomes, absences, or unkept promises?', 'act', 'allowed'),
+  'chat.reaction': site('Is the person\'s message after a result satisfied, a correction, a redirect, or unhappy?', 'act', 'allowed'),
   'scrum.quick-dispatch': site('Is a new goal one step one roster agent clearly owns?', 'act', 'native-only'),
   'scrum.one-shot': site('Is a quick-dispatched result an answer, a grounded action, or an unsupported claim?', 'act', 'allowed'),
   'scrum.interjection': site('Does a note typed mid-goal change the in-flight plan?', 'act', 'allowed'),
@@ -64,6 +65,7 @@ export const DECISION_SITES: Record<string, DecisionSite> = {
   'goal.failure': site('Why did a task fail? The class is recorded beside the error for the planner.', 'advise', 'allowed'),
   'goal.produces': site('Does each declared output deliver what its description promises?', 'act', 'allowed'),
   'goal.health': site('Is a quiet goal progressing, waiting, looping, or stalled?', 'act', 'allowed'),
+  'goal.assumption': site('Did the person\'s answer confirm or correct the assumption the goal stated?', 'act', 'allowed'),
   'registry.find': site('Which registered object performs a requested capability?', 'act', 'allowed'),
 
   // ── Specialist agents ──
@@ -91,6 +93,7 @@ export const DECISION_SITES: Record<string, DecisionSite> = {
   'reviewer.predictions': site('Were each episode\'s predictions supported or contradicted?', 'act', 'allowed'),
   'reviewer.fidelity': site('Does the user-facing summary match the verification record?', 'act', 'allowed'),
   'reviewer.patterns': site('Did an applied pattern help, harm, or stay inconclusive?', 'act', 'allowed'),
+  'reviewer.blame': site('Which belief does a missed prediction trace back to?', 'act', 'allowed'),
   'reviewer.privacy': site('Does an authored skill carry workspace-specific detail?', 'advise', 'allowed'),
   'reviewer.dedupe': site('Is a new knowledge entry a duplicate or refinement of an existing one?', 'act', 'allowed'),
 };

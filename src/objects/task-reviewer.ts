@@ -53,6 +53,9 @@ import { criterion, instruction } from '../core/decision-questions.js';
 import type { DecisionMode } from '../core/decision-sites.js';
 import { Log } from '../core/timed-log.js';
 import { parseRuntimeFault } from '../core/runtime-fault.js';
+import { ATTRIBUTION_SOURCES, MAX_ASSUMPTIONS_PER_GOAL, confidenceOf, isNegativeReaction, reactionKindOf, surpriseBits,
+  type AttributionSource, type Assumption, type Confidence, type Reaction } from '../core/surprise.js';
+import type { EntryEvidence } from '../core/learning.js';
 
 const log = new Log('TASK-REVIEWER');
 
@@ -102,8 +105,8 @@ const GOAL_TRANSCRIPT_BUDGET = 40000;
  */
 const EXECUTION_RECORD_CAP = 4000;
 const PATTERN_LANGUAGE_BUDGET = 6000;
-/** Predictions that missed, with what they rested on: where the learning is. */
-const SURPRISES_BUDGET = 4000;
+/** Predictions that missed, with what they rested on: where the learning is. Whole rows, fewer when over. */
+const SURPRISES_BUDGET = 6000;
 /** The patterns this goal used, plan- and task-level, with their evidence. */
 const PATTERN_APPLICATIONS_BUDGET = 4000;
 /** Patterns matched directly by the weave (links add up to twice as many). */
@@ -149,6 +152,18 @@ const DEDUPE_ACT_P = 0.85;
 const MAX_CONFIRMATIONS = 8;
 /** reviewer.dedupe: a relation this sure to a candidate-pattern lesson counts as its recurrence. */
 const RECURRENCE_MIN_P = 0.5;
+/** reviewer.blame (act): a verdict this sure attributes a miss the reviewer left without attribution. */
+const AUTO_BLAME_MIN_P = 0.75;
+/** Missed episodes judged in one reviewer.blame request. */
+const MAX_BLAMED_EPISODES = 16;
+/** Entry observations (observe_entry) one review journals. */
+const MAX_ENTRY_OBSERVATIONS = 24;
+/** The review report's episode list: whole expectations, fewer episodes when over. */
+const REPORT_EPISODES_BUDGET = 24000;
+/** The person's reactions and the goal's assumptions, at the top of the dossier. */
+const PERSON_BUDGET = 4000;
+/** Flagged entries (misses outnumber holds) offered for narrowing or dispute. */
+const FLAGGED_BUDGET = 1500;
 
 interface TaskCompletedEvent {
   taskId: string;
@@ -203,6 +218,17 @@ interface ReviewJudgments {
   fidelity?: { mode: DecisionMode; verdict: 'consistent' | 'misreported' | 'unverifiable'; finding?: string; p: number; probabilities?: Record<string, number>; emulated: boolean; deterministic?: boolean };
   /** Keyed `<taskId>:<step>:<patternId>`. */
   patterns?: { mode: DecisionMode; byApplication: Record<string, Judgment> };
+  /** Keyed `<taskId>:<step>`: which belief each missed episode traces back to (site reviewer.blame). */
+  blame?: { mode: DecisionMode; byEpisode: Record<string, Judgment & { attribution: Attribution; label: string }> };
+}
+
+/** Which belief a miss traced back to, as an assessment records it. */
+interface Attribution { source: AttributionSource; id?: string; note?: string }
+
+/** What the person said and what the goal assumed about them: the review's first evidence. */
+interface PersonEvidence {
+  reactions: Reaction[];
+  assumptions: Assumption[];
 }
 
 /** How much a finished goal or task could teach (site reviewer.worth). */
@@ -255,6 +281,16 @@ interface ReviewTaskExtra {
   assessments?: Record<string, { verdict: string; explanation?: string }>;
   applicationAssessments?: Record<string, string>;
   lastResult?: string;
+  /** Assessments a previous review of this goal recorded: already confirmed and observed, never re-assessed. */
+  previouslyAssessed?: string[];
+  /** Entry observations journaled so far, `<entryId>@<episode>`, so a second completion pass adds none twice. */
+  observedEntries?: string[];
+  /** The person's reactions and the goal's assumptions, as read at launch. */
+  person?: PersonEvidence;
+  /** A review the person's reaction asked for: its ack carries `reaction: true`. */
+  reaction?: boolean;
+  /** A reaction review that also stands for the goal's pending routine review: both are acknowledged. */
+  settlesReview?: boolean;
   /** The reviewed tasks to release from AgentAbject once this review ends. */
   reviewedTaskIds?: string[];
   kind: 'review' | 'curation' | 'repair';
@@ -271,6 +307,8 @@ interface ShownEntry {
   tags?: string[];
   content?: string;
   knowledgeRef?: string;
+  /** How predictions and assumptions resting on the entry fared (KnowledgeBase evidence counters). */
+  evidence?: EntryEvidence;
   pattern?: {
     links?: string[];
     therefore?: string;
@@ -318,12 +356,16 @@ interface ReviewBriefing {
   outcome?: 'completed' | 'failed';
   /** Tasks whose records are on the goal's evidence ledger (learning/task/<id>). */
   evidenceTaskIds?: string[];
+  /** The person's reactions to the goal and the assumptions it stated: the top of the dossier. */
+  person?: PersonEvidence;
 }
 
 interface PendingGoalReview {
   goalId: string;
   outcome: 'completed' | 'failed';
   detail?: string;
+  /** `reaction`: the person reacted to this goal; reviewed ahead of routine work, even when reviewed before. */
+  kind?: 'reaction';
 }
 
 // ── Decision questions (file-local; shared ones live in src/core/decision-questions.ts) ──
@@ -344,7 +386,7 @@ function worthQuestions(): Record<string, DecisionQuestion> {
     learning_value: {
       type: 'choice',
       instructions: instruction('How much could a learning review of this finished work teach the workspace?', {
-        focus: 'Judge from `goal`, `user_result`, `tasks` (their contradicted predictions, failed actions and retries), `injected_knowledge` and `verification`. Owner evidence such as task outcomes, errors and verification receipts outranks what a task says about itself.',
+        focus: 'Judge from `goal`, `user_result`, `person_reactions` and `corrected_assumptions` when present, `tasks` (their contradicted and sure-but-missed predictions, failed actions and retries), `injected_knowledge` and `verification`. The person\'s own reaction outranks everything; owner evidence such as task outcomes, errors and verification receipts outranks what a task says about itself.',
         notFor: 'How long or hard the work was: a long goal that went exactly as predicted is still routine.',
       }),
       criteria: {
@@ -356,7 +398,7 @@ function worthQuestions(): Record<string, DecisionQuestion> {
           notFor: 'The same step failing repeatedly, a failed goal, or claims about permissions or access (valuable).',
           examples: ['A typo in a command, fixed on the next step.', 'One timeout, retried once and then fine.'],
         }),
-        valuable: criterion('Something worth learning: a contradicted prediction, repeated retries, a failed goal, a claim about permissions or access, owner evidence that contradicts an injected knowledge claim, or a user-facing result that misreports the record.', {
+        valuable: criterion('Something worth learning: a contradicted prediction (above all one stated as sure, counted in `sure_misses`), a correction, redirect or unhappy reaction from the person (`person_reactions`), an assumption the person corrected, repeated retries, a failed goal, a claim about permissions or access, owner evidence that contradicts an injected knowledge claim, or a user-facing result that misreports the record.', {
           notFor: 'A single slip recovered on the next step (minor).',
           examples: ['The knowledge said the project has no test suite, and the verification ran 198 tests.', 'The summary quotes 285 passing while the newest run counted 290.'],
         }),
@@ -467,6 +509,68 @@ function patternQuestions(count: number): Record<string, DecisionQuestion> {
     };
   }
   return out;
+}
+
+/**
+ * reviewer.blame: the beliefs one missed episode could trace back to, each a
+ * choice option. The entries and patterns it cited come first, then the ones
+ * it was only shown (its basis candidates), then the assumptions the goal
+ * stated about the person, then the agent's own prior, a changed world, and
+ * the runtime. `options` maps each option to the attribution it records.
+ */
+function blameOptions(r: TranscriptResponse, p: PredictionRecord, assumptions: Assumption[]): {
+  criteria: Record<string, Record<string, unknown>>; options: Record<string, { attribution: Attribution; label: string }>;
+} {
+  const shown = new Map((r.injectedKnowledge ?? []).map(k => [k.id, k]));
+  const criteria: Record<string, Record<string, unknown>> = {};
+  const options: Record<string, { attribution: Attribution; label: string }> = {};
+  const seen = new Set<string>();
+  let entries = 0, patterns = 0;
+  const belief = (kind: 'entry' | 'pattern', id: string, cited: boolean, why?: string): void => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    const k = shown.get(id);
+    const title = clipText(k?.title ?? id, 120);
+    const how = cited ? `which the agent cited for this prediction${why ? ` ("${clipText(why, 160)}")` : ''}` : 'shown in the agent\'s prompt though not cited';
+    const key = kind === 'entry' ? `entry_${entries++}` : `pattern_${patterns++}`;
+    options[key] = { attribution: { source: kind, id }, label: `${kind} ${id} ("${clipText(title, 60)}"${cited ? '' : ', shown only'})` };
+    criteria[key] = kind === 'entry'
+      ? criterion(`The knowledge entry "${title}" [${id}], ${how}, makes a claim the result disproves.${k?.content ? ` It says: "${clipText(k.content.replace(/\s+/g, ' '), 300)}"` : ''}`, {
+        notFor: 'An entry that held when written while the world changed since (world), or an entry the expectation did not rest on.',
+        examples: ['The entry says the project has no test suite; the run found 198 tests.'],
+      })
+      : criterion(`Following the pattern "${title}" [${id}], ${how}, led the agent to this expectation, and the pattern does not fit this context.`, {
+        notFor: 'A pattern followed correctly whose step failed for an unrelated reason (the belief behind that reason).',
+        examples: ['The pattern said a retry clears the error; the error was a permanent permission refusal.'],
+      });
+  };
+  for (const b of p.basis ?? []) belief('entry', b.id, true, b.why);
+  for (const d of p.patterns ?? []) belief('pattern', d.id, true, d.why);
+  for (const c of extrasOf(p).basisCandidates) belief(c.kind, c.id, false);
+  assumptions.slice(0, MAX_ASSUMPTIONS_PER_GOAL).forEach((a, i) => {
+    const settled = a.status !== 'open' ? `, now ${a.status}${a.answer ? `: "${clipText(a.answer, 160)}"` : ''}` : '';
+    options[`assumption_${i}`] = { attribution: { source: 'assumption', id: a.id }, label: `assumption ${a.id} ("${clipText(a.claim, 60)}")` };
+    criteria[`assumption_${i}`] = criterion(`The goal's assumption ${a.id} about ${a.about} ("${clipText(a.claim, 200)}", stated as ${a.confidence}${settled}) was wrong, and the expectation followed from it.`, {
+      notFor: 'A miss about how a tool or system behaves rather than about what the person wanted or the situation the goal assumed.',
+      examples: ['The goal assumed the person wanted every file renamed; they wanted only the drafts, and the step expected to touch all of them.'],
+    });
+  });
+  options.prior = { attribution: { source: 'prior' }, label: 'the agent\'s own prior' };
+  criteria.prior = criterion('The agent\'s own expectation was wrong, resting on none of the entries, patterns or assumptions listed as other options.', {
+    notFor: 'A claim one of the listed beliefs made (choose that one), or a belief that held until the world changed (world).',
+    examples: ['Expected a command to print JSON by default; it prints a table, and nothing shown said otherwise.'],
+  });
+  options.world = { attribution: { source: 'world' }, label: 'a changed world' };
+  criteria.world = criterion('The belief held when it was formed, and the world changed under it: a file moved, data was updated, a service changed its answer.', {
+    notFor: 'A belief that was never true (the entry, pattern, assumption or prior that held it).',
+    examples: ['The entry said the report lives in docs/; it was moved to reports/ yesterday.'],
+  });
+  options.runtime = { attribution: { source: 'runtime' }, label: 'the runtime' };
+  criteria.runtime = criterion('The system itself ended or disturbed the step (an inactivity watchdog, a plan that superseded the task, a worker that died); the miss says nothing about the world.', {
+    notFor: 'A tool or service that returned an error of its own (the belief about it, or the world).',
+    examples: ['The task was cut off by the inactivity watchdog before its command returned.'],
+  });
+  return { criteria, options };
 }
 
 /** reviewer.privacy: `generic` or the most prominent kind of workspace detail, in one answer. */
@@ -595,6 +699,22 @@ function judgmentFrom(answer: { choice: string; probabilities: Record<string, nu
   return { choice: answer.choice, p: answer.probabilities[answer.choice] ?? 0, probabilities: answer.probabilities, emulated };
 }
 
+/**
+ * The agreement rule: when the prediction judge is short of its threshold
+ * but leans one way (that side at least 0.5 and above the other), and the
+ * agent's own reading agrees (held with supported, missed with
+ * contradicted), the two readings together decide. Undefined otherwise,
+ * and the episode stays unresolved.
+ */
+function agreementVerdict(j: Judgment, p: PredictionRecord): 'supported' | 'contradicted' | undefined {
+  const ps = j.probabilities.supported ?? 0, pc = j.probabilities.contradicted ?? 0;
+  const lean = ps >= 0.5 && ps > pc ? 'supported' : pc >= 0.5 && pc > ps ? 'contradicted' : undefined;
+  const reading = p.selfAssessment?.verdict;
+  if (lean === 'supported' && reading === 'held') return 'supported';
+  if (lean === 'contradicted' && reading === 'missed') return 'contradicted';
+  return undefined;
+}
+
 /** "decision model, p=0.93" with the emulation noted: the provenance line on every automated record. */
 function provenance(j: { p: number; emulated: boolean }): string {
   return `decision model${j.emulated ? ', emulated' : ''}, p=${fmtP(j.p)}`;
@@ -605,6 +725,134 @@ function observedLine(p: PredictionRecord): string {
   const exit = /"exitCode"\s*:\s*(-?\d+)|exit(?:\s+code)?\s*[:=]?\s*(-?\d+)/i.exec(typeof p.actual === 'string' ? p.actual : '');
   const code = exit ? exit[1] ?? exit[2] : undefined;
   return `outcome=${p.outcome}${code !== undefined ? ` (exit ${code})` : ''}`;
+}
+
+/** A basis candidate: an entry or pattern the agent was shown and did not cite, ranked by overlap with its expectation. */
+interface BasisCandidate { id: string; kind: 'entry' | 'pattern'; knowledgeRef?: string; score?: number }
+
+/**
+ * What a prediction record carries beyond the fields every runtime writes:
+ * the stated confidence and the shown beliefs it may have rested on. Read
+ * defensively, since records kept from older runs lack them.
+ */
+function extrasOf(p: PredictionRecord): { confidence?: Confidence; basisCandidates: BasisCandidate[] } {
+  const raw = p as PredictionRecord & { confidence?: unknown; basisCandidates?: unknown };
+  const basisCandidates = Array.isArray(raw.basisCandidates)
+    ? (raw.basisCandidates as unknown[]).filter((c): c is BasisCandidate => !!c && typeof c === 'object'
+      && typeof (c as BasisCandidate).id === 'string' && !!(c as BasisCandidate).id
+      && ((c as BasisCandidate).kind === 'entry' || (c as BasisCandidate).kind === 'pattern'))
+    : [];
+  return { confidence: confidenceOf(raw.confidence), basisCandidates };
+}
+
+/** An attribution read from untrusted reviewer output, or undefined when it names no known source. */
+function attributionOf(raw: unknown): Attribution | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const { source, id, note } = raw as { source?: unknown; id?: unknown; note?: unknown };
+  if (!(ATTRIBUTION_SOURCES as readonly unknown[]).includes(source)) return undefined;
+  return { source: source as AttributionSource,
+    ...(typeof id === 'string' && id.trim() ? { id: id.trim().slice(0, 300) } : {}),
+    ...(typeof note === 'string' && note.trim() ? { note: note.trim().slice(0, 500) } : {}) };
+}
+
+/** Whether a predicted episode looks like a miss to anyone: the agent, the status comparison, or a decision model. */
+function looksMissed(p: PredictionRecord, judged?: Judgment): boolean {
+  return p.selfAssessment?.verdict === 'missed' || p.verdict === 'contradicted'
+    || p.decisionVerdict?.verdict === 'contradicted' || (!!judged && judged.choice === 'contradicted' && judged.p >= 0.5);
+}
+
+/**
+ * How surprising a miss was, in bits, by the confidence it was stated with.
+ * A prediction stated without a confidence counts as `likely`, between a
+ * guess and a sure claim.
+ */
+function missSurprise(p: PredictionRecord): number {
+  return surpriseBits(extrasOf(p).confidence ?? 'likely', false);
+}
+
+/** A whole expectation, never cut: every reader of a prediction compares against all of it. */
+/** The shortest an expectation is ever shown in the index: enough to read the claim. */
+const INDEX_EXPECT_FLOOR = 240;
+/** The whole prediction index: full rows, then short ones. */
+const INDEX_SECTION_BUDGET = 24000;
+
+function expectText(p: PredictionRecord): string {
+  return p.expect?.trim() || '(missing)';
+}
+
+/** The full result of an episode: `read_evidence` with this `ref` returns it whole. */
+function observationRef(taskId: string, p: PredictionRecord): string {
+  return p.actualRef ?? `${taskId}:step:${p.step}`;
+}
+
+/** An entry's evidence counters in a few words: "cited held 2, missed 5; shown held 1, missed 0; confidence 0.31, flagged". */
+function evidenceLine(e: EntryEvidence): string {
+  return `cited held ${e.held ?? 0}, missed ${e.missed ?? 0}; shown held ${e.shownHeld ?? 0}, missed ${e.shownMissed ?? 0}`
+    + `${typeof e.confidence === 'number' ? `; confidence ${fmtP(e.confidence)}` : ''}${e.flagged ? ', flagged' : ''}`;
+}
+
+/** Entries the KnowledgeBase flags (misses outnumber holds after enough tests): candidates to narrow or dispute. */
+function renderFlagged(entries: Array<ShownEntry | null | undefined>): string {
+  const flagged = entries.filter((e): e is ShownEntry => !!e?.evidence?.flagged && e.type !== 'pattern');
+  if (!flagged.length) return '';
+  return `Entries whose evidence is flagged (predictions resting on them missed more often than they held): candidates to narrow (narrow_entry, with the scope where the claim still holds) or dispute (dispute_entry), after reading the misses behind them:\n`
+    + flagged.slice(0, 8).map(e => `- ${clipText(e.title, 100)} [id=${e.id}]: ${evidenceLine(e.evidence!)}`).join('\n');
+}
+
+/** One observe_entry effect, with the key that dedupes it within a review. */
+type EntryObservation = Record<string, unknown> & { key: string; evidenceRefs: string[] };
+
+/**
+ * The observe_entry effects a review owes (see TaskReviewer.observeEntries):
+ * judged episodes over their cited entries (cited: true) and basis-candidate
+ * entries (cited: false), then settled assumptions over their basis entries
+ * (cited: true). Patterns are left out, an entry is observed once per
+ * episode (cited first), anything a previous pass or review observed is
+ * skipped, and at most MAX_ENTRY_OBSERVATIONS are returned.
+ */
+function entryObservations(extra: ReviewTaskExtra): EntryObservation[] {
+  const out: EntryObservation[] = [];
+  const done = new Set(extra.observedEntries ?? []);
+  const previously = new Set(extra.previouslyAssessed ?? []);
+  const push = (id: string, episode: string, o: Record<string, unknown> & { evidenceRefs: string[] }): void => {
+    const key = `${id}@${episode}`;
+    if (out.length >= MAX_ENTRY_OBSERVATIONS || done.has(key)) return;
+    done.add(key);
+    out.push({ action: 'observe_entry', id, key, ...o });
+  };
+  for (const r of extra.records ?? []) {
+    const patternIds = new Set((r.injectedKnowledge ?? []).filter(k => k.source === 'pattern').map(k => k.id));
+    for (const p of r.predictions ?? []) {
+      const episode = `${r.taskId}:${p.step}`;
+      const verdict = extra.assessments?.[episode]?.verdict;
+      if ((verdict !== 'supported' && verdict !== 'contradicted') || previously.has(episode) || !isPredicted(p)) continue;
+      const outcome = verdict === 'supported' ? 'held' : 'missed';
+      for (const d of p.patterns ?? []) patternIds.add(d.id);
+      const evidenceRefs = [`learning/assessment/${episode}`];
+      const evidence = (cited: boolean) => `${cited ? 'A prediction citing this entry' : 'A prediction made with this entry in view, not citing it,'} ${outcome}: expected "${expectText(p)}" (${episode})`;
+      for (const b of p.basis ?? []) {
+        if (patternIds.has(b.id)) continue;
+        push(b.id, episode, { outcome, cited: true, evidence: evidence(true), evidenceRefs, ...(b.knowledgeRef ? { knowledgeRef: b.knowledgeRef } : {}) });
+      }
+      for (const c of extrasOf(p).basisCandidates) {
+        if (c.kind !== 'entry' || patternIds.has(c.id)) continue;
+        push(c.id, episode, { outcome, cited: false, evidence: evidence(false), evidenceRefs, ...(c.knowledgeRef ? { knowledgeRef: c.knowledgeRef } : {}) });
+      }
+    }
+  }
+  // An assumption has no episode of its own; its observation cites the
+  // goal's task records, which carry the plan that rested on it.
+  const taskRefs = (extra.evidenceTaskIds ?? []).slice(0, 6).map(id => `learning/task/${id}`);
+  for (const a of extra.person?.assumptions ?? []) {
+    const outcome = a.status === 'confirmed' || a.status === 'held' ? 'held' : a.status === 'corrected' || a.status === 'missed' ? 'missed' : undefined;
+    if (!outcome || !taskRefs.length) continue;
+    const how = a.status === 'confirmed' || a.status === 'corrected' ? `the person ${a.status} it` : `a read-only check found it ${a.status === 'held' ? 'holds' : 'does not hold'}`;
+    for (const id of a.basis ?? []) {
+      push(id, `assumption:${a.id}`, { outcome, cited: true, evidenceRefs: taskRefs,
+        evidence: `The goal's assumption ${a.id} ("${clipText(a.claim, 160)}") rested on this entry, and ${how}${a.answer ? `: "${clipText(a.answer, 160)}"` : ''}` });
+    }
+  }
+  return out;
 }
 
 export class TaskReviewer extends Abject {
@@ -638,6 +886,8 @@ export class TaskReviewer extends Abject {
   private preparingReview = false;
   private drainingLearning = false;
   private recoveredLegacyReviews = false;
+  /** Set once the reactions GoalManager holds pending were queued after this start. */
+  private recoveredReactions = false;
   private reviewPoll?: ReturnType<typeof setInterval>;
 
   protected override async onStop(): Promise<void> {
@@ -662,6 +912,14 @@ export class TaskReviewer extends Abject {
     if (!this.underDailyCap()) { await this.drainLearningDecisions(false); return; }
     if (recoverLegacy && !this.recoveredLegacyReviews) await this.recoverLegacyReviews().catch(err => log.warn(`Legacy learning recovery deferred: ${String(err)}`));
     await this.drainLearningDecisions();
+    if (this.inFlight) return;
+    if (!this.recoveredReactions) await this.recoverReactionReviews().catch(err => log.warn(`Reaction review recovery deferred: ${String(err)}`));
+    // Reviews the person's reactions asked for go first, ahead of routine
+    // work. Each is tried once per pass (one still waiting is queued again).
+    for (let n = this.pendingGoalReviews.filter(r => r.kind === 'reaction').length; n > 0 && !this.inFlight && !this.preparingReview
+      && this.pendingGoalReviews[0]?.kind === 'reaction'; n--) {
+      await this.onGoalTerminal(this.pendingGoalReviews.shift()!);
+    }
     if (this.inFlight) return;
     const pending = await this.request<PendingGoalReview[]>(request(this.id, this.goalManagerId, 'pendingReviews', {}));
     for (const review of this.worthByGoal.size && await this.worthOrdering() ? this.sortByWorth(pending) : pending) {
@@ -699,6 +957,16 @@ export class TaskReviewer extends Abject {
                 reviewsToday: { kind: 'primitive', primitive: 'number' },
                 busy: { kind: 'primitive', primitive: 'boolean' },
               } },
+            },
+            {
+              name: 'goalReaction',
+              description: 'GoalManager\'s notification that the person reacted to a goal (a correction, a redirect, an unhappy reaction). The goal is reviewed again ahead of routine work, even when it was reviewed before, and the review is acknowledged with reaction: true. Only GoalManager\'s notification is honored.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'The goal the person reacted to' },
+                { name: 'kind', type: { kind: 'primitive', primitive: 'string' }, description: 'The reaction kind: correction, redirect or unhappy', optional: true },
+                { name: 'negative', type: { kind: 'primitive', primitive: 'boolean' }, description: 'True for a reaction worth a review of its own', optional: true },
+              ],
+              returns: { kind: 'primitive', primitive: 'undefined' },
             },
           ],
           events: [
@@ -843,6 +1111,17 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         .catch(err => log.warn(`goal review failed: ${err instanceof Error ? err.message : String(err)}`));
     });
 
+    // The person reacted to a goal (GoalManager.changed('goalReaction')):
+    // the most valuable surprise there is, so the goal is reviewed again,
+    // ahead of routine work, whether or not it was reviewed before.
+    this.on('goalReaction', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.goalManagerId) return;
+      const { goalId, kind } = msg.payload as { goalId?: string; kind?: string; negative?: boolean };
+      if (typeof goalId !== 'string' || !goalId) return;
+      this.onGoalReaction(goalId, kind)
+        .catch(err => log.warn(`reaction review failed: ${err instanceof Error ? err.message : String(err)}`));
+    });
+
     // Terminal result of a review/curation task this object started.
     this.onDelivery('taskResult', async (msg: AbjectMessage) => {
       if(msg.routing.from!==this.agentAbjectId)throw new Error('Task result must come from AgentAbject');
@@ -852,7 +1131,9 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       const extra = this.taskExtras.get(ticketId);
       const succeeded = (msg.payload as { success?: boolean }).success === true;
       if (extra?.goalId && this.goalManagerId && extra.kind !== 'repair') {
-        await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: extra.goalId, report: this.learningReport(extra, !succeeded || extra.cancelled === true) }));
+        const report = this.learningReport(extra, !succeeded || extra.cancelled === true);
+        await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: extra.goalId, report, ...(extra.reaction ? { reaction: true } : {}) }));
+        if (extra.reaction && extra.settlesReview) await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: extra.goalId, report }));
       }
       this.inFlight = undefined; this.taskExtras.delete(ticketId);
       if (extra?.kind === 'repair') void this.settleRepairSpend().catch(() => undefined);
@@ -1311,8 +1592,13 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     } finally { this.drainingLearning = false; }
   }
 
-  /** Shared validation and receipts for individual actions and completion batches. */
-  private async applyReviewAction(taskId: string, action: AgentAction) {
+  /**
+   * Shared validation and receipts for individual actions and completion
+   * batches. `internal` is set only by this object's own automated records
+   * (never from a model's action): an assessment the agreement rule decided
+   * carries `origin: 'agreement'`.
+   */
+  private async applyReviewAction(taskId: string, action: AgentAction, internal: { origin?: 'agreement' } = {}) {
     let result: { success: boolean; data?: unknown; error?: string; duplicateOf?: string };
     let advice: string[] = [];
     let rewrittenFrom: AgentAction | undefined;
@@ -1366,7 +1652,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         const context = action.action === 'learn' ? (action.context ?? {}) as Record<string, unknown> : { evidence: action.evidence ?? app?.evidence, evidenceRefs: action.evidenceRefs ?? (app?.taskId ? [`learning/task/${app.taskId}`] : planWide), assessmentRefs: app?.taskId && app.step ? [`learning/assessment/${app.taskId}:${app.step}`] : undefined, scope: action.scope };
         const decision = await this.proposeLearning(taskId, action.action === 'learn' && Array.isArray(action.effects) ? action.effects : [action], context);
         result = { success: decision.effects.every(e => e.state === 'applied'), data: decision, error: decision.effects.find(e => e.state !== 'applied')?.error };
-      } else result = await this.handleAct(taskId, action);
+      } else result = await this.handleAct(taskId, action, internal);
     }
     catch (err) { result = { success: false, error: err instanceof Error ? err.message : String(err) }; }
     if (advice.length) {
@@ -1505,6 +1791,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     // Assessments recorded so far confirm what they rested on, on every pass,
     // so a review that ends before its correction keeps them.
     if (!extra.cancelled && extra.kind === 'review') await this.confirmCitedKnowledge(taskId, extra);
+    if (!extra.cancelled && extra.kind === 'review') await this.observeEntries(taskId, extra);
     let missing = this.missingAssessments(extra);
     // Judged episodes still missing an assessment are recorded from the
     // decision model's verdicts instead of an extra model turn: confident
@@ -1544,9 +1831,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         parts.push(`This work met again knowledge that earlier goals met too:\n${seen}\n${RECURRING_PROBLEM} Knowledge met in goal after goal is an instance of such a problem. For each, name the problem it is an instance of in terms that reach beyond the object or tool it was met in: the context where it arises, the forces that defeat the obvious approach, and the resolution that holds however the details vary. When a pattern already names that problem, update_pattern it (its Evidence gains this instance; addLinks where it leads next). When none does, write it with save_pattern: Context, Forces and Therefore for the general problem, the goals behind it in Evidence, the concrete details in Program. Archive an instance with archive_entry only when the pattern now holds everything it says. When the entry is a fact about one thing rather than an instance of a recurring problem, it stays as it is and needs no update. Send only these updates, together with anything else this correction asks for.`);
       }
       if (missing.length) {
-        const budget = Math.max(0, Math.floor(12000 / missing.length) - 160);
-        const gaps = missing.map(({ taskId, p }) => `${taskId} step ${p.step}: expected=${p.expect.slice(0, budget / 2)}; actual=${String(p.actual ?? '').slice(0, budget / 2)}`).join('\n');
-        parts.push(`${missing.length} predictions still lack semantic assessments:\n${gaps}\nIn your next done action, include only missing assessments in result: {assessments:[{taskId,step,verdict,explanation}]}. Compare expected and actual evidence; successful operation status does not establish the prediction. Use read_evidence with taskId and step for full observations, or unresolved with a specific evidence gap. No new reusable lesson is required. If the material cannot be assessed, include unresolvedReason.`);
+        // Whole expectations; the observed excerpts share what is left of the budget.
+        const budget = Math.max(80, Math.floor(12000 / missing.length) - 200 - Math.max(...missing.map(({ p }) => expectText(p).length)));
+        const gaps = missing.map(({ taskId, p }) => `${taskId} step ${p.step}: expected=${expectText(p)}; actual=${clipText(String(p.actual ?? ''), budget)}; ref=${observationRef(taskId, p)}`).join('\n');
+        parts.push(`${missing.length} predictions still lack semantic assessments:\n${gaps}\nIn your next done action, include only missing assessments in result: {assessments:[{taskId,step,verdict,explanation}]}. Compare expected and actual evidence; successful operation status does not establish the prediction. Use read_evidence with ref for an episode's whole result (a cut excerpt is a reason to read it), or unresolved with a specific evidence gap. No new reusable lesson is required. If the material cannot be assessed, include unresolvedReason.`);
       }
       if (fidelityMissing) {
         parts.push('The result has no summaryFidelity verdict. Include summaryFidelity: { verdict: "consistent" | "misreported" | "unverifiable", explanation } in your next done result, comparing the user-facing result with the newest verification record.');
@@ -1576,7 +1864,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     if (!kb) return;
     const cited = new Map<string, { knowledgeRef: string; refs: string[]; expects: string[] }>();
     for (const r of extra.records ?? []) for (const p of r.predictions ?? []) {
-      if (extra.assessments?.[`${r.taskId}:${p.step}`]?.verdict !== 'supported') continue;
+      if (extra.assessments?.[`${r.taskId}:${p.step}`]?.verdict !== 'supported' || extra.previouslyAssessed?.includes(`${r.taskId}:${p.step}`)) continue;
       for (const b of p.basis ?? []) {
         if (!b.knowledgeRef || extra.confirmedEntries?.includes(b.id)) continue;
         const c = cited.get(b.id) ?? { knowledgeRef: b.knowledgeRef, refs: [], expects: [] };
@@ -1599,6 +1887,27 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       await this.proposeLearning(taskId, effects, { evidence: 'Held predictions that cited these entries',
         assessmentRefs: [...new Set(effects.flatMap(e => e.evidenceRefs))] });
     } catch (err) { log.warn(`confirmations of cited knowledge not journaled: ${err instanceof Error ? err.message : String(err)}`); }
+  }
+
+  /**
+   * Evidence counters on the entries judged episodes rested on (observe_entry,
+   * journaled like the confirmations above, deterministic, no model): each
+   * supported or contradicted episode counts held or missed on the entries it
+   * cited and, as weaker evidence, on the entries it was only shown (its basis
+   * candidates); each assumption the person confirmed or corrected, or a
+   * check held or missed, counts on the entries it rested on. The counters
+   * never change a claim; they show which entries keep holding and which
+   * need narrowing. Patterns are judged through their applications instead.
+   */
+  private async observeEntries(taskId: string, extra: ReviewTaskExtra): Promise<void> {
+    if (!extra.goalId || !this.goalManagerId) return;
+    const effects = entryObservations(extra);
+    if (!effects.length) return;
+    (extra.observedEntries ??= []).push(...effects.map(e => e.key));
+    try {
+      await this.proposeLearning(taskId, effects.map(({ key: _key, ...effect }) => effect), { evidence: 'Episodes and assumptions that rested on these entries, judged',
+        assessmentRefs: [...new Set(effects.flatMap(e => e.evidenceRefs).filter(ref => ref.startsWith('learning/assessment/')))] });
+    } catch (err) { log.warn(`entry observations not journaled: ${err instanceof Error ? err.message : String(err)}`); }
   }
 
   /**
@@ -1693,18 +2002,36 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       const text = typeof v === 'string' ? v : v === undefined ? '' : JSON.stringify(v);
       return text.length > max ? `${text.slice(0, max)}… (${text.length} chars)` : text;
     };
-    const episodesWithLearning = [...episodes].map(([key, prediction]) => {
+    // Expectations are kept whole; the budget is kept by listing fewer
+    // episodes, the most valuable first: contradicted, missed by the agent's
+    // own reading, then the most confident.
+    const value = ([key, p]: readonly [string, PredictionRecord]): number => {
+      const confidence = extrasOf(p).confidence;
+      return (assessments[key]?.verdict === 'contradicted' ? 100 : 0) + (p.selfAssessment?.verdict === 'missed' ? 50 : 0)
+        + (confidence === 'sure' ? 20 : confidence === 'likely' ? 10 : 0) + (assessments[key] ? 0 : 5);
+    };
+    const ranked = [...episodes].map((e, i) => ({ e, i, v: value(e) })).sort((a, b) => b.v - a.v || a.i - b.i).map(x => x.e);
+    const allEpisodes = ranked.map(([key, prediction]) => {
       const assessmentRef = `learning/assessment/${key}`;
       const decisions = (extra?.decisions ?? []).filter(d =>
         (Array.isArray(d.context.assessmentRefs) && d.context.assessmentRefs.includes(assessmentRef))
         || Object.hasOwn(d.evidence, assessmentRef));
       const assessment = assessments[key];
-      return { episode: key, expected: clip(prediction.expect), observationRef: prediction.actualRef,
+      return { episode: key, expected: prediction.expect, ...(extrasOf(prediction).confidence ? { confidence: extrasOf(prediction).confidence } : {}), observationRef: prediction.actualRef,
         actual: clip(prediction.actual), appliedPatterns: (prediction.patterns ?? []).map(p => p.id),
         assessment: assessment ? { verdict: assessment.verdict, explanation: clip(assessment.explanation, 600) } : { verdict: 'unresolved', explanation: 'No recorded assessment' },
         assessmentRef, consideredBy: decisions.map(d => ({ decisionId: d.id,
           effects: d.effects.map(e => ({ effectId: e.id, action: e.input.action, knowledgeId: e.input.id, state: e.state })) })) };
     });
+    const episodesWithLearning: typeof allEpisodes = [];
+    let reportChars = 0;
+    for (const episode of allEpisodes) {
+      const size = JSON.stringify(episode).length;
+      if (episodesWithLearning.length && reportChars + size > REPORT_EPISODES_BUDGET) break;
+      episodesWithLearning.push(episode);
+      reportChars += size;
+    }
+    const omittedEpisodes = allEpisodes.slice(episodesWithLearning.length).map(e => e.episode);
     const learningEffects = (extra?.decisions ?? []).flatMap(d => d.effects.map(e => ({ decisionId: d.id, id: e.id, state: e.state, action: e.input.action, knowledgeId: e.input.id })));
     const brief = (u: LearningUpdate) => ({ key: u.key, action: u.action.action, status: u.status, error: u.error ? clip(u.error, 300) : undefined });
     const allSaved = [...saved.map(brief), ...learningEffects.filter(e => e.state === 'applied')];
@@ -1713,7 +2040,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return { status, interrupted, saved: allSaved, pending: allPending,
       decisions: (extra?.decisions ?? []).map(d => ({ id: d.id, effects: d.effects.map(e => ({ id: e.id, state: e.state, action: e.input.action, knowledgeId: e.input.id })) })),
       attempts: updates.map(brief), limitations: extra?.completionIssues ?? [],
-      predictions: { total: episodes.size, ...counts, unassessed, episodes: episodesWithLearning },
+      predictions: { total: episodes.size, ...counts, unassessed, episodes: episodesWithLearning, ...(omittedEpisodes.length ? { omittedEpisodes } : {}) },
       patterns: { ...patternCounts, unassessed: unassessedApplications, ...(extra?.observedWithoutRecordedUse ? { observedWithoutRecordedUse: extra.observedWithoutRecordedUse } : {}) },
       summary: `Learning review ${status}: ${allSaved.length} updates saved, ${allPending.length} pending. Predictions: ${counts.supported} supported, ${counts.contradicted} contradicted, ${counts.unresolved} unresolved. Pattern applications: ${patternCounts.helpful} helpful, ${patternCounts.harmful} harmful, ${patternCounts.inconclusive} inconclusive, ${patternCounts.unresolved} unassessed.` };
   }
@@ -1879,7 +2206,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     // as a task past the daily cap does.
     const worth = await this.judgeWorth(undefined, () => this.worthState([record]));
     if (worth) {
-      const plan = this.worthPlan(worth, record.phase === 'error');
+      const plan = this.worthPlan(worth, record.phase === 'error', undefined, this.hasSureMiss([record]));
       this.logWorth(`task ${record.taskId.slice(0, 8)}`, worth, plan);
       if (worth.mode === 'act' && plan === 'routine') {
         this.send(request(this.id, this.agentAbjectId!, 'releaseTask', { taskId: ev.taskId }));
@@ -1918,12 +2245,62 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     try { await this.prepareGoalReview(review); } finally { this.preparingReview = false; }
   }
 
-  /** Hold a goal review until the in-flight one finishes; GoalManager keeps it durable beyond this queue. */
+  /**
+   * Hold a goal review until the in-flight one finishes; GoalManager keeps it
+   * durable beyond this queue. A review the person's reaction asked for goes
+   * to the front, taking the place of a routine one for the same goal; when
+   * the queue is full, routine reviews make room (GoalManager still holds them).
+   */
   private queueGoalReview(review: PendingGoalReview): void {
-    if (this.pendingGoalReviews.length < MAX_PENDING_GOAL_REVIEWS
-        && !this.pendingGoalReviews.some(p => p.goalId === review.goalId)) {
+    const queued = this.pendingGoalReviews.findIndex(p => p.goalId === review.goalId);
+    if (review.kind === 'reaction') {
+      if (queued >= 0) this.pendingGoalReviews.splice(queued, 1);
+      this.pendingGoalReviews.unshift(review);
+      while (this.pendingGoalReviews.length > MAX_PENDING_GOAL_REVIEWS) {
+        const routine = this.pendingGoalReviews.map(p => p.kind).lastIndexOf(undefined);
+        this.pendingGoalReviews.splice(routine >= 0 ? routine : this.pendingGoalReviews.length - 1, 1);
+      }
+      return;
+    }
+    if (this.pendingGoalReviews.length < MAX_PENDING_GOAL_REVIEWS && queued < 0) {
       this.pendingGoalReviews.push(review);
     }
+  }
+
+  /** A reaction review of a goal, its outcome read from GoalManager. */
+  private async reactionReview(goalId: string): Promise<PendingGoalReview> {
+    const goal = await this.request<{ status?: string; error?: string } | null>(
+      request(this.id, this.goalManagerId!, 'getGoal', { goalId }), 10000).catch(() => null);
+    const failed = goal?.status === 'failed' || !!goal?.error;
+    return { goalId, outcome: failed ? 'failed' : 'completed', kind: 'reaction', ...(goal?.error ? { detail: goal.error } : {}) };
+  }
+
+  /**
+   * Reactions recorded while this object was down (GoalManager keeps them
+   * pending): queued once per start, the way unfinished learning is
+   * recovered. A failed read is retried on the next poll.
+   */
+  private async recoverReactionReviews(): Promise<void> {
+    const pending = await this.request<Array<{ goalId?: string }>>(request(this.id, this.goalManagerId!, 'pendingReactionReviews', {}), 10000);
+    for (const item of Array.isArray(pending) ? pending : []) {
+      if (typeof item?.goalId === 'string' && item.goalId) this.queueGoalReview(await this.reactionReview(item.goalId));
+    }
+    this.recoveredReactions = true;
+  }
+
+  /**
+   * The person reacted to a goal: review it again with priority. The goal's
+   * outcome comes from GoalManager; the review starts now when nothing else
+   * runs, and otherwise waits at the front of the queue.
+   */
+  private async onGoalReaction(goalId: string, kind?: string): Promise<void> {
+    requireNonEmpty(goalId, 'goalId');
+    log.info(`The person reacted to goal ${goalId.slice(0, 8)} (${kind ?? 'reaction'}); reviewing it ahead of routine work`);
+    this.queueGoalReview(await this.reactionReview(goalId));
+    this.clearStuckReview();
+    if (this.inFlight || this.preparingReview) return;
+    const next = this.pendingGoalReviews.shift();
+    if (next) await this.onGoalTerminal(next);
   }
 
   private async prepareGoalReview(review: PendingGoalReview): Promise<void> {
@@ -1934,16 +2311,45 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       return;
     }
     await this.refreshBudget();
-    if (!this.underDailyCap()) return;
+    if (!this.underDailyCap()) {
+      // A reaction is not durable at GoalManager's pending list; it waits here for tomorrow's budget.
+      if (review.kind === 'reaction') this.queueGoalReview(review);
+      return;
+    }
     // Judged low in value and deferred already: it waits out the day's
     // reserved slots without fetching its evidence again (reviewer.worth, act).
-    if (this.worthByGoal.get(review.goalId)?.deferred && this.inReserveZone()
+    if (review.kind !== 'reaction' && this.worthByGoal.get(review.goalId)?.deferred && this.inReserveZone()
         && await this.decisionSiteMode('reviewer.worth') === 'act') return;
 
     const goal = await this.request<{ title?: string; description?: string; result?: string; scratchpad?: Record<string, unknown> } | null>(
       request(this.id, this.goalManagerId!, 'getGoal', { goalId: review.goalId }),
       10000,
     ).catch(() => null);
+    // A reaction still waiting for its review (GoalManager marks it pending)
+    // makes any review of the goal a reaction review.
+    if (goal?.scratchpad?.['learning/reactionReview'] === 'pending') review = { ...review, kind: 'reaction' };
+    const reaction = review.kind === 'reaction';
+    // A reaction review of a goal whose routine review is still pending does
+    // both at once; its ack settles both (a reaction ack alone leaves it pending).
+    const settlesReview = reaction && goal?.scratchpad?.['learning/review'] === 'pending';
+    const person = await this.personEvidence(review.goalId, goal?.scratchpad ?? {});
+    // The person's word outranks every other signal: a negative reaction or
+    // a corrected assumption is always worth a review, never settled as routine.
+    const personSurprise = person.reactions.some(r => isNegativeReaction(r.kind))
+      || person.assumptions.some(a => a.status === 'corrected' || a.status === 'missed');
+    // Assessments an earlier review of this goal recorded stand; a reaction
+    // review reads them and assesses only what is still open.
+    const priorAssessments: Record<string, { verdict: string; explanation?: string }> = {};
+    for (const [key, value] of Object.entries(goal?.scratchpad ?? {})) {
+      if (!key.startsWith('learning/assessment/') || !value || typeof value !== 'object') continue;
+      const a = value as { verdict?: unknown; explanation?: unknown };
+      if (typeof a.verdict === 'string') priorAssessments[key.slice('learning/assessment/'.length)] = { verdict: a.verdict, ...(typeof a.explanation === 'string' ? { explanation: a.explanation } : {}) };
+    }
+    const ack = async (reason: string) => {
+      if (!this.goalManagerId) return;
+      await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: review.goalId, reason, ...(reaction ? { reaction: true } : {}) }));
+      if (settlesReview) await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: review.goalId, reason }));
+    };
 
     // ScrumMaster's execution record (what ran, who ran it, what failed) is
     // the distilled shape of how the goal was actually done: the raw
@@ -1985,13 +2391,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       .sort((a, b) => b.score - a.score).slice(0, MAX_TASKS_PER_GOAL_REVIEW).map(x => x.r);
     this.reportRuntimeFaults(review.goalId, all);
     if (records.length === 0) {
-      if (this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: review.goalId, reason: 'No execution evidence; no pattern claims made' }));
+      // Learning cites recorded task evidence, so a goal without any has nothing to journal against.
+      await ack('No execution evidence; no pattern claims made');
       return;
     }
 
     const combined = records.reduce((sum, r) => sum + r.transcript.length, 0);
-    if (combined < MIN_TRANSCRIPT_CHARS && records.every(r => !r.predictions?.length)) {
-      if (this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: review.goalId, reason: 'Compact evidence retained; insufficient material for a durable lesson' }));
+    if (!reaction && !personSurprise && combined < MIN_TRANSCRIPT_CHARS && records.every(r => !r.predictions?.length)) {
+      await ack('Compact evidence retained; insufficient material for a durable lesson');
       for (const id of goalTaskIds) {
         this.send(request(this.id, this.agentAbjectId!, 'releaseTask', { taskId: id }));
       }
@@ -2005,9 +2412,11 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const verification = verificationRecordOf(goal?.scratchpad ?? {});
     const userResult = typeof goal?.result === 'string' ? goal.result : undefined;
     const failed = review.outcome === 'failed' || all.some(r => r.phase === 'error');
-    const worthState = () => this.worthState(all, { title: goal?.title, outcome: review.outcome, detail: review.detail, userResult }, verification);
+    // A prediction stated as sure that missed is as valuable as a contradicted one.
+    const valuable = reaction || personSurprise || this.hasSureMiss(all);
+    const worthState = () => this.worthState(all, { title: goal?.title, outcome: review.outcome, detail: review.detail, userResult }, verification, person);
     const subject = `goal ${review.goalId.slice(0, 8)}`;
-    let worth = this.inReserveZone() ? await this.judgeWorth(review.goalId, worthState) : undefined;
+    let worth = this.inReserveZone() && !valuable ? await this.judgeWorth(review.goalId, worthState) : undefined;
     if (worth?.mode === 'act' && worth.valuableP < 0.5 && !this.routineVerdict(worth, failed)) {
       this.markDeferred(review.goalId);
       this.logWorth(subject, worth, 'defer');
@@ -2015,11 +2424,11 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     }
     const [judgedWorth, judgments] = await Promise.all([
       worth ? Promise.resolve(worth) : this.judgeWorth(review.goalId, worthState),
-      this.judgeReviewEvidence(review.goalId, all, review.outcome, verification, userResult),
+      this.judgeReviewEvidence(review.goalId, all, review.outcome, verification, userResult, person.assumptions, new Set(Object.keys(priorAssessments))),
     ]);
     worth = judgedWorth;
     if (worth) {
-      const plan = this.worthPlan(worth, failed, judgments);
+      const plan = this.worthPlan(worth, failed, judgments, valuable);
       this.logWorth(subject, worth, plan);
       if (worth.mode === 'act' && plan === 'routine') {
         await this.settleRoutineReview(review, goalTaskIds, all, worth, judgments);
@@ -2028,12 +2437,12 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (worth.mode === 'act' && plan === 'defer') { this.markDeferred(review.goalId); return; }
     }
     // Another review may have started while the judgments ran; this one waits its turn.
-    if ((worth || judgments) && this.inFlight) { this.queueGoalReview(review); return; }
+    if ((worth || judgments || reaction) && this.inFlight) { this.queueGoalReview(review); return; }
 
     // Split the transcript budget across tasks, larger tasks trimmed first.
     const perTask = Math.max(6000, Math.floor(await this.transcriptBudget() / records.length));
     let material =
-      `## Goal under review\n` +
+      `## Goal under review${reaction ? ' (again: the person reacted to its result)' : ''}\n` +
       `Title: ${goal?.title ?? '(unknown)'}\n` +
       `Description: ${(goal?.description ?? '').slice(0, 1500)}\n` +
       `Outcome: ${review.outcome}${review.detail ? ` (${review.detail.slice(0, 500)})` : ''}\n` +
@@ -2057,17 +2466,48 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     // record trails the transcripts and stays complete through read_evidence.
     material += `\n\n### Plan revisions and observations\n${JSON.stringify(Object.fromEntries(Object.entries(goal?.scratchpad ?? {}).filter(([k]) => k === 'learning/plans' || k.startsWith('learning/observation/')))).slice(0, 16000)}\n`;
 
+    if (Object.keys(priorAssessments).length) material += `\n### Assessments an earlier review recorded\nThey stand as recorded (read_evidence key learning/reviewOutcome holds that review's report); assess only the episodes still open.\n${Object.entries(priorAssessments).map(([k, a]) => `${k}: ${a.verdict}${a.explanation ? `, ${clipText(a.explanation, 200)}` : ''}`).join('\n').slice(0, 4000)}\n`;
+
     this.worthByGoal.delete(review.goalId);
     await this.launchReview(
-      `Review the ${review.outcome} goal "${(goal?.title ?? review.goalId).slice(0, 60)}" and capture durable learnings.`,
+      reaction
+        ? `Review the ${review.outcome} goal "${(goal?.title ?? review.goalId).slice(0, 60)}" again: the person reacted to its result. Learn what they wanted and which assumption failed.`
+        : `Review the ${review.outcome} goal "${(goal?.title ?? review.goalId).slice(0, 60)}" and capture durable learnings.`,
       material,
       goalTaskIds,   // durable records retain evidence after transcript release
       review.goalId, all, { worth, judgments },
       { focus: [goal?.title, goal?.description?.slice(0, 1500)].filter(Boolean).join('\n') || undefined, executionRecord,
         plans: Array.isArray(goal?.scratchpad?.['learning/plans']) ? goal!.scratchpad!['learning/plans'] as RecordedPlan[] : [],
         outcome: review.outcome,
-        evidenceTaskIds: Object.keys(goal?.scratchpad ?? {}).filter(k => k.startsWith('learning/task/')).map(k => k.slice('learning/task/'.length)) },
+        evidenceTaskIds: Object.keys(goal?.scratchpad ?? {}).filter(k => k.startsWith('learning/task/')).map(k => k.slice('learning/task/'.length)),
+        person },
+      { reaction, settlesReview, priorAssessments },
     );
+  }
+
+  /**
+   * The person's side of a goal: their reactions (learning/reaction/*, oldest
+   * first) and the assumptions the goal stated about them (GoalManager
+   * getAssumptions). Both are optional evidence; a goal with neither reads
+   * as empty.
+   */
+  private async personEvidence(goalId: string, scratchpad: Record<string, unknown>): Promise<PersonEvidence> {
+    const reactions = Object.entries(scratchpad)
+      .filter(([key, value]) => key.startsWith('learning/reaction/') && !!value && typeof value === 'object')
+      .map(([, value]) => value as Partial<Reaction>)
+      .filter((r): r is Reaction => !!reactionKindOf(r.kind) && typeof r.text === 'string')
+      .sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+    const raw = this.goalManagerId
+      ? await this.request<unknown>(request(this.id, this.goalManagerId, 'getAssumptions', { goalId }), 5000).catch(() => [])
+      : [];
+    const assumptions = (Array.isArray(raw) ? raw : []).filter((a): a is Assumption =>
+      !!a && typeof a === 'object' && typeof (a as Assumption).id === 'string' && typeof (a as Assumption).claim === 'string');
+    return { reactions, assumptions };
+  }
+
+  /** Whether any episode stated as sure missed by any reading: a surprise worth a review. */
+  private hasSureMiss(records: TranscriptResponse[]): boolean {
+    return records.some(r => (r.predictions ?? []).some(p => isPredicted(p) && extrasOf(p).confidence === 'sure' && looksMissed(p)));
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -2103,20 +2543,26 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return await this.decisionSiteMode('reviewer.worth') === 'act';
   }
 
-  /** Valuable reviews first, deferred ones last, unjudged ones between; stable, in place. */
-  private sortByWorth<T extends { goalId: string }>(reviews: T[]): T[] {
-    const rank = (goalId: string): number => {
-      const w = this.worthByGoal.get(goalId);
+  /** Reviews the person's reactions asked for first, then valuable ones; deferred ones last, unjudged ones between; stable, in place. */
+  private sortByWorth<T extends { goalId: string; kind?: string }>(reviews: T[]): T[] {
+    const rank = (review: T): number => {
+      if (review.kind === 'reaction') return 3;
+      const w = this.worthByGoal.get(review.goalId);
       return !w ? 1 : w.valuableP >= 0.5 ? 2 : w.deferred ? 0 : 1;
     };
-    return reviews.sort((a, b) => rank(b.goalId) - rank(a.goalId));
+    return reviews.sort((a, b) => rank(b) - rank(a));
   }
 
   /** What a learning-value judgment sees: outcomes, counts and names, never whole transcripts. */
-  private worthState(records: TranscriptResponse[], goal?: { title?: string; outcome: string; detail?: string; userResult?: string }, verification: VerificationRecordEntry[] = []): Record<string, unknown> {
+  private worthState(records: TranscriptResponse[], goal?: { title?: string; outcome: string; detail?: string; userResult?: string }, verification: VerificationRecordEntry[] = [],
+    person?: PersonEvidence): Record<string, unknown> {
     return {
       goal: goal ? { title: clipText(goal.title ?? '(unknown)', 200), outcome: goal.outcome, detail: goal.detail ? clipText(goal.detail, 300) : null } : null,
       user_result: goal ? clipText(goal.userResult ?? '(none recorded)', 800) : null,
+      ...(person ? {
+        person_reactions: person.reactions.map(r => ({ kind: r.kind, words: clipText(r.text, 200) })),
+        corrected_assumptions: person.assumptions.filter(a => a.status === 'corrected' || a.status === 'missed').length,
+      } : {}),
       tasks: records.slice(0, 12).map(r => {
         const predictions = r.predictions ?? [];
         return {
@@ -2125,6 +2571,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           predictions: predictions.length,
           // A judged verdict, where the runtime made one, over the operation-status comparison.
           contradicted_predictions: predictions.filter(p => (p.decisionVerdict?.verdict ?? p.verdict) === 'contradicted').length,
+          // Stated as sure and missed by any reading: the largest surprises.
+          sure_misses: predictions.filter(p => isPredicted(p) && extrasOf(p).confidence === 'sure' && looksMissed(p)).length,
           failed_actions: predictions.filter(p => p.outcome === 'failure').length,
           retries: predictions.filter((p, i) => i > 0 && predictions[i - 1].outcome === 'failure' && predictions[i - 1].action === p.action).length,
         };
@@ -2167,16 +2615,22 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * the full review: those are separate decisions, each by its own answer,
    * and they can only add a review, never skip one.
    */
-  private routineVerdict(worth: WorthVerdict, failed: boolean, judgments?: ReviewJudgments): boolean {
-    if (failed || worth.routineP < ROUTINE_MIN_P) return false;
+  private routineVerdict(worth: WorthVerdict, failed: boolean, judgments?: ReviewJudgments, valuable = false): boolean {
+    if (failed || valuable || worth.routineP < ROUTINE_MIN_P) return false;
     const f = judgments?.fidelity;
     if (f && !f.deterministic && f.verdict === 'misreported') return false;
     return !Object.values(judgments?.predictions?.byEpisode ?? {}).some(j => j.choice === 'contradicted' && j.p >= 0.5);
   }
 
-  private worthPlan(worth: WorthVerdict, failed: boolean, judgments?: ReviewJudgments): 'routine' | 'defer' | 'priority' | 'review' {
-    if (this.routineVerdict(worth, failed, judgments)) return 'routine';
-    if (worth.valuableP >= 0.5) return 'priority';
+  /**
+   * `valuable` is evidence that decides on its own, whatever the model's
+   * verdict: the person's reaction, a corrected assumption, or a prediction
+   * stated as sure that missed. Such work is reviewed first, never settled
+   * as routine or deferred.
+   */
+  private worthPlan(worth: WorthVerdict, failed: boolean, judgments?: ReviewJudgments, valuable = false): 'routine' | 'defer' | 'priority' | 'review' {
+    if (this.routineVerdict(worth, failed, judgments, valuable)) return 'routine';
+    if (valuable || worth.valuableP >= 0.5) return 'priority';
     return this.inReserveZone() ? 'defer' : 'review';
   }
 
@@ -2220,14 +2674,21 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   }
 
   /** Predictions, summary fidelity and pattern applications, judged together when a goal review launches. */
-  private async judgeReviewEvidence(goalId: string, records: TranscriptResponse[], outcome: 'completed' | 'failed', verification: VerificationRecordEntry[], userResult?: string): Promise<ReviewJudgments | undefined> {
-    const [predictions, fidelity, patterns] = await Promise.all([
-      this.judgePredictions(goalId, records).catch(() => undefined),
+  /**
+   * Blame (reviewer.blame) follows the prediction verdicts it builds on, so
+   * it runs after them, alongside fidelity and patterns. `assessed` holds
+   * episodes an earlier review already assessed; they are not judged again.
+   */
+  private async judgeReviewEvidence(goalId: string, records: TranscriptResponse[], outcome: 'completed' | 'failed', verification: VerificationRecordEntry[], userResult?: string,
+    assumptions: Assumption[] = [], assessed: Set<string> = new Set()): Promise<ReviewJudgments | undefined> {
+    const [[predictions, blame], fidelity, patterns] = await Promise.all([
+      this.judgePredictions(goalId, records, assessed).catch(() => undefined)
+        .then(async p => [p, await this.judgeBlame(goalId, records, p, assumptions, assessed).catch(() => undefined)] as const),
       this.judgeFidelity(goalId, records, verification, userResult).catch(() => undefined),
       this.judgePatterns(goalId, records, outcome).catch(() => undefined),
     ]);
-    if (!predictions && !fidelity && !patterns) return undefined;
-    return { ...(predictions ? { predictions } : {}), ...(fidelity ? { fidelity } : {}), ...(patterns ? { patterns } : {}) };
+    if (!predictions && !fidelity && !patterns && !blame) return undefined;
+    return { ...(predictions ? { predictions } : {}), ...(fidelity ? { fidelity } : {}), ...(patterns ? { patterns } : {}), ...(blame ? { blame } : {}) };
   }
 
   /**
@@ -2235,14 +2696,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * One request covers every episode with a stated prediction and an
    * observed outcome; the rest GoalManager already keeps unresolved.
    */
-  private async judgePredictions(goalId: string, records: TranscriptResponse[]): Promise<ReviewJudgments['predictions']> {
-    const episodes = records.flatMap(r => (r.predictions ?? []).filter(p => p.expect?.trim() && p.outcome !== 'unknown').map(p => ({ r, p })))
+  private async judgePredictions(goalId: string, records: TranscriptResponse[], assessed: Set<string> = new Set()): Promise<ReviewJudgments['predictions']> {
+    const episodes = records.flatMap(r => (r.predictions ?? []).filter(p => p.expect?.trim() && p.outcome !== 'unknown' && !assessed.has(`${r.taskId}:${p.step}`)).map(p => ({ r, p })))
       .slice(0, MAX_JUDGED_EPISODES);
     if (!episodes.length || await this.decisionSiteMode('reviewer.predictions') === 'off') return undefined;
     const perActual = Math.min(2400, Math.max(400, Math.floor(60000 / episodes.length)));
     const state = { episodes: episodes.map(({ r, p }, i) => ({
       i, task: r.taskId, agent: r.agentName, step: p.step, action: p.action,
-      expect: clipText(p.expect, 600), outcome: p.outcome, actual: clipText(p.actual ?? '(no observation recorded)', perActual),
+      expect: expectText(p), outcome: p.outcome, actual: clipText(p.actual ?? '(no observation recorded)', perActual),
       ...(p.decisionVerdict ? { prior: { verdict: p.decisionVerdict.verdict, confidence: p.decisionVerdict.confidence, emulated: p.decisionVerdict.emulated } } : {}),
     })) };
     const outcome = await this.askDecision('reviewer.predictions', boundDecisionState(state), reviewPredictionQuestions(episodes.length), this.decisionScope(goalId));
@@ -2339,9 +2800,74 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   }
 
   /**
+   * Which belief does each missed episode trace back to (site
+   * reviewer.blame)? One choice question per miss, the most surprising
+   * first, its options built from what the prediction rested on (see
+   * blameOptions). The reviewer sees the verdicts as advice; acting, a
+   * confident one attributes a contradicted assessment the reviewer left
+   * without attribution.
+   */
+  private async judgeBlame(goalId: string, records: TranscriptResponse[], predictions: ReviewJudgments['predictions'], assumptions: Assumption[],
+    assessed: Set<string> = new Set()): Promise<ReviewJudgments['blame']> {
+    const missed = records.flatMap(r => (r.predictions ?? [])
+      .filter(p => isPredicted(p) && !assessed.has(`${r.taskId}:${p.step}`) && looksMissed(p, predictions?.byEpisode[`${r.taskId}:${p.step}`]))
+      .map(p => ({ r, p })))
+      .sort((a, b) => missSurprise(b.p) - missSurprise(a.p)).slice(0, MAX_BLAMED_EPISODES);
+    if (!missed.length || await this.decisionSiteMode('reviewer.blame') === 'off') return undefined;
+    const built = missed.map(({ r, p }) => blameOptions(r, p, assumptions));
+    const perActual = Math.min(1600, Math.max(300, Math.floor(30000 / missed.length)));
+    const state = { episodes: missed.map(({ r, p }, i) => ({
+      i, task: r.taskId, agent: r.agentName, step: p.step, action: p.action,
+      expect: expectText(p), confidence: extrasOf(p).confidence ?? null, outcome: p.outcome,
+      actual: clipText(p.actual ?? '(no observation recorded)', perActual),
+      reading: p.selfAssessment?.verdict ?? null, learned: p.selfAssessment?.learned ? clipText(p.selfAssessment.learned, 300) : null,
+      runtime_fault: parseRuntimeFault(r.error)?.code ?? null,
+    })) };
+    const questions: Record<string, DecisionQuestion> = {};
+    built.forEach((b, i) => {
+      questions[`b_${i}`] = {
+        type: 'choice',
+        instructions: instruction(`Which belief does the miss in \`episodes[${i}]\` trace back to?`, {
+          focus: 'Compare `expect` with `actual` and the agent\'s own `reading` and `learned`. The options name the entries and patterns the prediction cited or was shown, and the assumptions the goal stated about the person.',
+          notFor: 'Whether the prediction missed: take the miss as given and find the belief behind it.',
+        }),
+        criteria: b.criteria,
+      };
+    });
+    const outcome = await this.askDecision('reviewer.blame', boundDecisionState(state), questions, this.decisionScope(goalId));
+    if (!outcome) return undefined;
+    const byEpisode: NonNullable<ReviewJudgments['blame']>['byEpisode'] = {};
+    missed.forEach(({ r, p }, i) => {
+      const answer = choiceOf(outcome, `b_${i}`);
+      const option = answer ? built[i].options[answer.choice] : undefined;
+      if (answer && option) byEpisode[`${r.taskId}:${p.step}`] = { ...judgmentFrom(answer, outcome.emulated), ...option };
+    });
+    if (!Object.keys(byEpisode).length) return undefined;
+    log.info(`[decision:${outcome.mode}] reviewer.blame goal ${goalId.slice(0, 8)}: ${Object.entries(byEpisode).map(([k, j]) => `${k}=${j.choice}@${fmtP(j.p)}`).join(' ')}`);
+    return { mode: outcome.mode, byEpisode };
+  }
+
+  /**
+   * The attribution a contradicted assessment records when the reviewer gave
+   * none: the blame verdict when reviewer.blame acts and is confident, and
+   * otherwise `unassigned`, which is counted rather than refused so the
+   * learning funnel shows how much blame goes missing.
+   */
+  private blameFor(extra: ReviewTaskExtra, episode: string): Attribution {
+    const blame = extra.judgments?.blame;
+    const j = blame?.byEpisode[episode];
+    if (blame?.mode === 'act' && j && j.p >= AUTO_BLAME_MIN_P) {
+      return { ...j.attribution, note: `Automated attribution (${provenance(j)}): ${j.label}` };
+    }
+    return { source: 'unassigned', note: j ? `The reviewer named no belief; the decision model leaned to ${j.label} (p=${fmtP(j.p)}), short of acting` : 'The reviewer named no belief' };
+  }
+
+  /**
    * Record assessments the review left missing from the judged verdicts
-   * (site reviewer.predictions, act): confident ones as judged, the rest
-   * unresolved with the probabilities that fell short. Each goes through
+   * (site reviewer.predictions, act): confident ones as judged; one short of
+   * the threshold whose lean the agent's own reading agrees with as that
+   * verdict with origin 'agreement' (agreementVerdict); the rest unresolved
+   * with the probabilities that fell short. Each goes through
    * assess_prediction, so GoalManager's first-assessment lock holds and an
    * assessment already on record is never revised from here.
    */
@@ -2357,11 +2883,15 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       const j = judged.byEpisode[`${episodeTask}:${p.step}`];
       if (!j) continue;
       const confident = j.p >= AUTO_ASSESS_MIN_P;
-      const compared = `expected '${clipText(p.expect, 200)}' vs observed ${observedLine(p)}`;
+      const compared = `expected '${expectText(p)}' vs observed ${observedLine(p)}`;
+      const agreed = confident ? undefined : agreementVerdict(j, p);
       const explanation = confident
         ? `Automated assessment (${provenance(j)}): ${compared}`
-        : `Automated assessment (decision model${j.emulated ? ', emulated' : ''}): insufficient for automated assessment (p_s=${fmtP(j.probabilities.supported ?? 0)}, p_c=${fmtP(j.probabilities.contradicted ?? 0)}); ${compared}`;
-      const r = await this.applyReviewAction(taskId, { action: 'assess_prediction', taskId: episodeTask, step: p.step, verdict: confident ? j.choice : 'unresolved', explanation });
+        : agreed
+          ? `Automated assessment (agreement of two readings): the decision model${j.emulated ? ' (emulated)' : ''} leans ${agreed} (p_s=${fmtP(j.probabilities.supported ?? 0)}, p_c=${fmtP(j.probabilities.contradicted ?? 0)}, short of ${AUTO_ASSESS_MIN_P} alone), and the agent's own reading, given with the whole result in view, was ${p.selfAssessment!.verdict}${p.selfAssessment!.learned ? ` ("${clipText(p.selfAssessment!.learned, 200)}")` : ''}; ${compared}`
+          : `Automated assessment (decision model${j.emulated ? ', emulated' : ''}): insufficient for automated assessment (p_s=${fmtP(j.probabilities.supported ?? 0)}, p_c=${fmtP(j.probabilities.contradicted ?? 0)}); ${compared}`;
+      const r = await this.applyReviewAction(taskId, { action: 'assess_prediction', taskId: episodeTask, step: p.step, verdict: confident ? j.choice : agreed ?? 'unresolved', explanation },
+        agreed ? { origin: 'agreement' } : {});
       if (r.success) recorded++;
     }
     log.info(`[decision:act] reviewer.predictions goal ${extra.goalId?.slice(0, 8) ?? '?'}: recorded ${recorded} of ${missing.length} missing assessments`);
@@ -2615,7 +3145,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
 
   /** Budget the whole dossier; full records remain addressable through this receiver. */
   private async buildLearningDossier(task: string, material: string, records: TranscriptResponse[], knowledgeRefs: Record<string, string> = {}, priors?: string,
-    briefing: ReviewBriefing & { goalId?: string } = {}, recurrences: NonNullable<ReviewTaskExtra['recurrences']> = [],
+    briefing: ReviewBriefing & { goalId?: string; judgments?: ReviewJudgments } = {}, recurrences: NonNullable<ReviewTaskExtra['recurrences']> = [],
     planRecorded: string[] = []): Promise<string> {
     const pieces: string[] = [];
     const executionRecord = briefing.executionRecord?.trim();
@@ -2626,7 +3156,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       const part = text.length > limit ? `${text.slice(0, Math.max(0, limit - 100))}\n[Briefing excerpt; use read_evidence for complete material.]` : text;
       pieces.push(part); remaining -= part.length + 2;
     };
-    append(`Learning dossier: ${records.length} task records. Task success is not prediction accuracy. Missing predictions are unknown, not confirmations.\nUse read_evidence with taskId and optional step for observations, key for learning/plans or learning/observation/<operationId>, or offset/length for complete material.`, 1000);
+    append(`Learning dossier: ${records.length} task records. Task success is not prediction accuracy. Missing predictions are unknown, not confirmations.\nUse read_evidence with ref for one observation's whole result, taskId and optional step for observations, key for learning/plans or learning/observation/<operationId>, or offset/length for complete material.`, 1000);
+    // The person's word first: their reactions and the assumptions the goal made about them.
+    const person = this.renderPerson(briefing.person);
+    if (person) append(person, PERSON_BUDGET);
     append(records.map(r => `${r.taskId}: ${r.agentName}, outcome=${r.phase}; scopes=${JSON.stringify(r.knowledgeScopes ?? (r.knowledgeScope ? [r.knowledgeScope] : []))}; predicted steps=[${(r.predictions ?? []).filter(isPredicted).map(p => p.step).join(',')}]. Every listed step needs an assessment or an explicit evidence gap; steps without a stated expectation are not assessed.`).join('\n'), 6000);
     // Owner-provided completion evidence includes checks that ran before the
     // first model action. They can disprove recalled claims about capabilities.
@@ -2640,14 +3173,41 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     // Index surprises across ALL tasks, including tasks omitted from transcript excerpts.
     const predictions = records.flatMap(r => (r.predictions ?? []).map(p => ({ r, p })));
     predictions.sort((a, b) => Number(b.p.verdict === 'contradicted') - Number(a.p.verdict === 'contradicted'));
-    const predicted = predictions.filter(({ p }) => isPredicted(p));
-    const rowBudget = Math.floor(15500 / Math.max(1, predicted.length));
-    const detailsBudget = Math.max(0, rowBudget - 180);
-    append(`Prediction/feedback index (${predicted.length} predictions; excerpts are not complete evidence):\n` + predicted.map(({ r, p }) =>
-      `${r.taskId} step ${p.step}: operation=${p.outcome}, status comparison=${p.verdict ?? 'unresolved'}, agent's reading=${p.selfAssessment?.verdict ?? 'not given'}; expected=${(p.expect || '(missing)').slice(0, detailsBudget / 2)}; actual excerpt=${(typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)').slice(0, detailsBudget / 2)}`).join('\n'), 16000);
+    // Every expectation is shown whole while the budget lasts, misses and
+    // confident predictions first. Past it, each remaining prediction still
+    // gets its own short row (the reviewer judges every one), its expectation
+    // kept to a readable floor with the ref that reads it whole.
+    const judged = briefing.judgments?.predictions?.byEpisode ?? {};
+    const value = (r: TranscriptResponse, p: PredictionRecord): number => {
+      const confidence = extrasOf(p).confidence;
+      return (looksMissed(p, judged[`${r.taskId}:${p.step}`]) ? 100 + missSurprise(p) * 10 : 0) + (confidence === 'sure' ? 20 : confidence === 'likely' ? 10 : 0);
+    };
+    const predicted = predictions.filter(({ p }) => isPredicted(p)).map(x => ({ ...x, value: value(x.r, x.p) })).sort((a, b) => b.value - a.value);
+    const indexBudget = 14000;
+    const perActual = Math.min(600, Math.max(120, Math.floor(indexBudget / Math.max(1, predicted.length)) - 420));
+    const indexRows: string[] = [];
+    const unlisted: string[] = [];
+    let indexUsed = 0, shortUsed = 0;
+    for (const { r, p } of predicted) {
+      const row = `${r.taskId} step ${p.step}: operation=${p.outcome}, status comparison=${p.verdict ?? 'unresolved'}, agent's reading=${p.selfAssessment?.verdict ?? 'not given'}, confidence=${extrasOf(p).confidence ?? 'not stated'}; expected=${expectText(p)}; actual excerpt=${clipText(typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)', perActual)}; ref=${observationRef(r.taskId, p)}`;
+      if (indexRows.length && indexUsed + row.length + 1 > indexBudget) {
+        // Short rows share what is left of the section; a row that would not
+        // fit whole keeps only its step and ref, so no row is ever cut.
+        const short = `${r.taskId} step ${p.step}: expected=${clipText(expectText(p), INDEX_EXPECT_FLOOR)}; ref=${observationRef(r.taskId, p)}`;
+        const bare = `${r.taskId} step ${p.step}: ref=${observationRef(r.taskId, p)}`;
+        const fits = shortUsed + short.length + 1 <= INDEX_SECTION_BUDGET - indexBudget - 200;
+        unlisted.push(fits ? short : bare);
+        shortUsed += (fits ? short : bare).length + 1;
+        continue;
+      }
+      indexRows.push(row);
+      indexUsed += row.length + 1;
+    }
+    append(`Prediction/feedback index (${predicted.length} predictions, misses and confident ones first; excerpts are not complete evidence, read_evidence ref reads one whole):\n${indexRows.join('\n')}`
+      + (unlisted.length ? `\n${unlisted.length} more predictions, in short (read_evidence ref reads each whole):\n${unlisted.join('\n')}` : ''), INDEX_SECTION_BUDGET);
     // Decision-model priors (advise/act) sit beside the index they annotate.
     if (priors) append(priors, 3500);
-    const surprises = this.renderSurprises(records);
+    const surprises = this.renderSurprises(records, briefing.judgments);
     if (surprises) append(surprises, SURPRISES_BUDGET);
     if (executionRecord) {
       append(`Execution record (ScrumMaster's account of how the goal actually ran, the ore patterns are mined from${executionRecord.length > EXECUTION_RECORD_CAP ? '; read_evidence with key scrum/plan returns it in full' : ''}):\n${executionRecord}`, EXECUTION_RECORD_CAP);
@@ -2672,11 +3232,16 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       ])].slice(0, 12);
       // One read per entry serves both the applications and reconciliation.
       const applied = [...new Set([...trail.keys(), ...predictions.flatMap(({ p }) => (p.patterns ?? []).map(d => d.id))])].slice(0, 12);
-      const fetchIds = [...new Set([...ids, ...applied])];
+      // The entries predictions rested on (cited or only shown), read for their evidence counters.
+      const restedOn = [...new Set(predictions.flatMap(({ p }) => [...(p.basis ?? []).map(b => b.id),
+        ...extrasOf(p).basisCandidates.filter(c => c.kind === 'entry').map(c => c.id)]))].slice(0, 12);
+      const fetchIds = [...new Set([...ids, ...applied, ...restedOn])];
       const fetched = new Map(await Promise.all(fetchIds.map(async id => [id, await this.request<ShownEntry | null>(request(this.id, kb, 'get', { id })).catch(() => null)] as const)));
       const entries = ids.map(id => fetched.get(id) ?? null);
       const applications = this.renderPatternApplications(trail, records, fetched, briefing.goalId, recurrences, knowledgeRefs, planRecorded);
       if (applications) append(applications, PATTERN_APPLICATIONS_BUDGET);
+      const flagged = renderFlagged([...fetched.values()]);
+      if (flagged) append(flagged, FLAGGED_BUDGET);
       append('Knowledge reconciliation: use explicit parent evidenceRefs such as learning/task/<taskId>, learning/observation/<taskId>:<step>, learning/assessment/<taskId>:<step>. Put shared evidence and evidenceRefs alongside knowledgeUpdates in done.result; archive items inherit this shared context. Effects can update_entry, archive_entry (global only), supersede_entry (replacementId, optional scope), dispute_entry, narrow_entry (scope), confirm_entry, save_entry, save_pattern, update_pattern, or no_change. A single learn action uses {context:{evidence,evidenceRefs,scope},effects:[...]}. Connect interpretation to the affected claim; no_change and uncertainty are valid. Compare historical claims with observed actions and completion evidence. Correct obsolete claims even when the task succeeded and no pattern was applied. Injection does not prove usefulness. Excerpts are bounded; use recall by id before replacing a partially shown entry.', 600);
       const perEntry = Math.floor(8400 / Math.max(1, ids.length));
       for (let i = 0; i < ids.length; i++) {
@@ -2688,6 +3253,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           injectedIn: selected.map(k => k.taskId), selectedRefs: selected.map(k => k.knowledgeRef ?? null), knowledgeRef: current?.knowledgeRef,
           shownClaim: selected[0]?.content?.slice(0, claimBudget) ?? '(legacy snapshot: claim text not captured)',
           currentClaim: current?.content?.slice(0, claimBudget) ?? '(unavailable)', claimLength: current?.content?.length, excerpt: (current?.content?.length ?? 0) > claimBudget, type: current?.type,
+          ...((current as ShownEntry | null)?.evidence ? { evidence: evidenceLine((current as ShownEntry).evidence!) } : {}),
         }), perEntry);
       }
     }
@@ -2755,11 +3321,17 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   /**
    * Predictions that missed, with what they rested on. A miss means a belief
    * was wrong: the model's own prior, an entry or pattern it cited, the link
-   * that led to a pattern, or a world that changed under it. Shown with the
-   * agent's own reading, given while the whole result was in view.
+   * that led to a pattern, an assumption about what the person wanted, or a
+   * world that changed under it. Shown with the agent's own reading, given
+   * while the whole result was in view, the confidence it was stated with,
+   * and the blame verdict as advice. The most surprising misses lead (a sure
+   * miss before a guess), every expectation is shown whole, and the budget
+   * is kept by listing fewer rows, never by cutting one. Guesses that held
+   * are named after them: that is where confidence should rise.
    */
-  private renderSurprises(records: TranscriptResponse[]): string {
-    const rows: string[] = [];
+  private renderSurprises(records: TranscriptResponse[], judgments?: ReviewJudgments, budget = SURPRISES_BUDGET): string {
+    const misses: Array<{ bits: number; key: string; row: string }> = [];
+    const risen: string[] = [];
     for (const r of records) {
       const shown = new Map((r.injectedKnowledge ?? []).map(k => [k.id, k.title]));
       // The beliefs in this task's prompt, with ids, so a miss can be blamed
@@ -2769,22 +3341,72 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       const fault = parseRuntimeFault(r.error);
       for (const p of r.predictions ?? []) {
         if (!isPredicted(p)) continue;
+        const key = `${r.taskId}:${p.step}`;
+        const judged = judgments?.predictions?.byEpisode[key];
         const reading = p.selfAssessment?.verdict;
-        const missed = reading === 'missed' || reading === 'unclear' || p.verdict === 'contradicted' || p.decisionVerdict?.verdict === 'contradicted';
-        if (!missed) continue;
+        const { confidence, basisCandidates } = extrasOf(p);
+        const missed = looksMissed(p, judged);
+        if (!missed && reading !== 'unclear') {
+          const held = reading === 'held' || (judged?.choice === 'supported' && judged.p >= 0.5);
+          if (held && confidence === 'guess') risen.push(`${r.taskId} step ${p.step} ("${expectText(p)}")`);
+          continue;
+        }
+        // A miss costs bits by its stated confidence; an unclear reading alone is no miss yet.
+        const bits = missed ? missSurprise(p) : 0;
         const basis = (p.basis ?? []).map(b => `${shown.get(b.id) ?? b.id} [id=${b.id}]${b.why ? ` ("${clipText(b.why, 100)}")` : ''}`);
         const patterns = (p.patterns ?? []).map(d => `${shown.get(d.id) ?? d.id} [id=${d.id}]`);
+        const candidates = basisCandidates.map(c => `${shown.get(c.id) ?? c.id} [id=${c.id}, ${c.kind}]`);
         const actual = typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)';
-        rows.push(`- ${r.taskId} step ${p.step} (${r.agentName}): expected "${clipText(p.expect, 240)}"; actual ${clipText(actual, 300)}`
+        const blame = judgments?.blame?.byEpisode[key];
+        misses.push({ bits, key, row: `- ${r.taskId} step ${p.step} (${r.agentName}), confidence ${confidence ?? 'not stated'}${missed ? `, surprise ${bits.toFixed(1)} bits` : ''}: expected "${expectText(p)}"; actual ${clipText(actual, 240)}; full result: read_evidence ref=${observationRef(r.taskId, p)}`
           + `\n  agent's reading: ${reading ?? 'not given'}${p.selfAssessment?.learned ? `; learned: "${clipText(p.selfAssessment.learned, 200)}"` : ''}`
           + `${p.verdict === 'contradicted' ? '; operation status contradicted' : ''}${p.decisionVerdict?.verdict === 'contradicted' ? `; decision model: contradicted (p=${fmtP(p.decisionVerdict.confidence)})` : ''}`
           + `\n  rested on: ${basis.length ? basis.join(', ') : 'nothing cited'}${patterns.length ? `; patterns: ${patterns.join(', ')}` : ''}`
+          + `${candidates.length ? `\n  shown and closest to the expectation, not cited: ${candidates.join(', ')}` : ''}`
           + `${shownBeliefs.length ? `\n  beliefs in its prompt: ${shownBeliefs.join('; ')}` : ''}`
-          + `${fault ? `\n  the runtime ended this task (${fault.code}): attribute to runtime` : ''}`);
+          + `${blame ? `\n  blame advice (decision model${blame.emulated ? ', emulated' : ''}, p=${fmtP(blame.p)}): ${blame.label}` : ''}`
+          + `${fault ? `\n  the runtime ended this task (${fault.code}): attribute to runtime` : ''}` });
       }
     }
-    if (!rows.length) return '';
-    return `Surprises (${rows.length}): predictions that missed or that the agent could not call. For each, name in assess_prediction's attribution which belief failed (prior, entry, pattern, link, world, or runtime when the system itself ended the task) and act on it: an entry it rested on gets corrected or narrowed, a pattern gets the counterexample, a wrong prior becomes a lesson stating what holds, and a runtime fault leaves the world model as it is.\n${rows.join('\n')}`;
+    if (!misses.length && !risen.length) return '';
+    misses.sort((a, b) => b.bits - a.bits);
+    const header = `Surprises (${misses.length}): predictions that missed or that the agent could not call, the most surprising first (a miss stated as sure costs about 4.3 bits, a missed guess 1 bit). `
+      + `For each, name in assess_prediction's attribution which belief failed (prior, entry, pattern, link, world, assumption with the goal's assumption id such as A2, or runtime when the system itself ended the task; unassigned only when no reading can tell) and act on it: `
+      + `an entry it rested on gets corrected or narrowed, a pattern gets the counterexample, a wrong prior becomes a lesson stating what holds, a failed assumption becomes a preference or an assumption lesson, and a runtime fault leaves the world model as it is. `
+      + `When an excerpt is cut where the comparison matters, read_evidence with the row's ref returns the whole recorded result: judge from it.`;
+    const tail = risen.length
+      ? `\nHeld although stated as a guess (${risen.length}; where confidence should rise: a lesson stating what holds, or a confirmed entry, lets the next prediction here be surer): ${risen.slice(0, 6).join('; ')}${risen.length > 6 ? `; and ${risen.length - 6} more` : ''}`
+      : '';
+    const rows: string[] = [];
+    const omitted: string[] = [];
+    let used = header.length + tail.length + 200;
+    for (const m of misses) {
+      if (rows.length && used + m.row.length + 1 > budget) { omitted.push(m.key); continue; }
+      rows.push(m.row);
+      used += m.row.length + 1;
+    }
+    const more = omitted.length ? `\n${omitted.length} more, smaller surprises (read each with read_evidence ref <taskId>:step:<n>): ${omitted.slice(0, 24).join(', ')}` : '';
+    return `${header}\n${rows.join('\n')}${more}${tail}`;
+  }
+
+  /**
+   * The person's side of the goal, at the top of the dossier: their
+   * reactions in their own words, and the assumptions the goal stated about
+   * them with how each was settled.
+   */
+  private renderPerson(person?: PersonEvidence): string {
+    if (!person || (!person.reactions.length && !person.assumptions.length)) return '';
+    const when = (at?: number) => typeof at === 'number' && Number.isFinite(at) ? new Date(at).toISOString().slice(0, 16).replace('T', ' ') : 'time unknown';
+    const parts: string[] = [];
+    if (person.reactions.length) {
+      parts.push(`The person's reactions (the most valuable surprise of a goal: their word on the result outranks every other reading):\n${person.reactions.map(r =>
+        `- ${r.kind}, ${r.source === 'interjection' ? 'while the goal ran' : 'after the result'}, ${when(r.at)}: "${clipText(r.text, 600)}"${r.wanted ? `; what they wanted: "${clipText(r.wanted, 300)}"` : ''}`).join('\n')}`);
+    }
+    if (person.assumptions.length) {
+      parts.push(`Assumptions the goal stated (about what the person wants and the situation; corrected or missed ones are surprises to attribute with source "assumption" and the id):\n${person.assumptions.map(a =>
+        `- ${a.id} [${a.about}; ${a.confidence}; ${a.costIfWrong} if wrong] ${a.status}: "${clipText(a.claim, 300)}"${a.answer ? `; answer: "${clipText(a.answer, 300)}"` : ''}${a.wanted ? `; wanted: "${clipText(a.wanted, 300)}"` : ''}${a.basis?.length ? `; rested on: ${a.basis.join(', ')}` : ''}`).join('\n')}`);
+    }
+    return parts.join('\n');
   }
 
   /**
@@ -2846,7 +3468,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         if (!isPredicted(p)) continue;
         const reading = p.selfAssessment?.verdict ?? (p.verdict === 'contradicted' ? 'missed' : undefined);
         if (reading === 'held') tally.held++;
-        else if (reading === 'missed') { tally.missed++; if (misses.length < 2) misses.push(`${r.taskId} step ${p.step}: expected "${clipText(p.expect, 100)}"${p.selfAssessment?.learned ? `; learned "${clipText(p.selfAssessment.learned, 100)}"` : ''}`); }
+        else if (reading === 'missed') { tally.missed++; if (misses.length < 2) misses.push(`${r.taskId} step ${p.step}: expected "${expectText(p)}"${p.selfAssessment?.learned ? `; learned "${clipText(p.selfAssessment.learned, 100)}"` : ''}`); }
         else if (reading === 'unclear') tally.unclear++;
         else tally.unread++;
       }
@@ -2875,20 +3497,32 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return scopes.length === 1 ? scopes[0] : undefined;
   }
 
+  /**
+   * @param opts.reaction The person's reaction asked for this review; its ack says so.
+   * @param opts.settlesReview The goal's routine review is pending too; it is acknowledged as well.
+   * @param opts.priorAssessments Assessments an earlier review recorded: they stand, and are
+   *   neither asked for again nor confirmed or observed a second time.
+   */
   private async launchReview(task: string, material: string, reviewedTaskIds: string[], goalId?: string, records: TranscriptResponse[] = [],
-    decisions: { worth?: WorthVerdict; judgments?: ReviewJudgments } = {}, briefing: ReviewBriefing = {}): Promise<void> {
+    decisions: { worth?: WorthVerdict; judgments?: ReviewJudgments } = {}, briefing: ReviewBriefing = {},
+    opts: { reaction?: boolean; settlesReview?: boolean; priorAssessments?: Record<string, { verdict: string; explanation?: string }> } = {}): Promise<void> {
     const taskId = `review-${goalId ?? 'standalone'}-${Date.now()}`;
     this.inFlight = { ticketId: taskId, startedAt: Date.now() };
     const knowledgeScope = this.reviewScope(records);
+    const prior = opts.priorAssessments ?? {};
     this.taskExtras.set(taskId, { kind: 'review', reviewedTaskIds, goalId, records, fullMaterial: material, knowledgeScope,
       ...(decisions.judgments ? { judgments: decisions.judgments } : {}),
+      ...(briefing.person ? { person: briefing.person } : {}),
+      ...(opts.reaction ? { reaction: true } : {}),
+      ...(opts.settlesReview ? { settlesReview: true } : {}),
+      ...(Object.keys(prior).length ? { assessments: { ...prior }, previouslyAssessed: Object.keys(prior) } : {}),
       planPatternIds: [...planPatternTrail(briefing.plans ?? []).keys()],
       ...(briefing.outcome ? { goalOutcome: briefing.outcome } : {}),
       evidenceTaskIds: briefing.evidenceTaskIds ?? [] });
     const refs: Record<string, string> = {};
     const recurrences: NonNullable<ReviewTaskExtra['recurrences']> = [];
     const planRecorded: string[] = [];
-    const dossier = await this.buildLearningDossier(task, material, records, refs, this.renderPriors(decisions.worth, decisions.judgments), { ...briefing, goalId }, recurrences, planRecorded);
+    const dossier = await this.buildLearningDossier(task, material, records, refs, this.renderPriors(decisions.worth, decisions.judgments), { ...briefing, goalId, judgments: decisions.judgments }, recurrences, planRecorded);
     this.taskExtras.get(taskId)!.knowledgeRefs = refs;
     if (await this.getKbId()) this.taskExtras.get(taskId)!.planApplicationsRecorded = planRecorded;
     if (recurrences.length) (this.taskExtras.get(taskId)!.recurrences ??= []).push(...recurrences);
@@ -2967,7 +3601,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   // Actions
   // ═══════════════════════════════════════════════════════════════════
 
-  private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
+  private async handleAct(taskId: string, action: AgentAction, internal: { origin?: 'agreement' } = {}): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const extra = this.taskExtras.get(taskId) ?? { kind: 'review' as const };
     this.taskExtras.set(taskId, extra);
 
@@ -2983,9 +3617,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         case 'assess_prediction': {
           if (!extra.goalId || !this.goalManagerId) throw new Error('A goal review is required to record an assessment');
           if (!extra.records?.some(r => r.taskId === action.taskId && r.predictions?.some(p => p.step === action.step))) throw new Error('Assessment is outside this review evidence');
+          // A miss always names the belief that failed: the reviewer's own
+          // attribution, else the blame verdict, else `unassigned`.
+          const attribution = attributionOf(action.attribution)
+            ?? (action.verdict === 'contradicted' ? this.blameFor(extra, `${action.taskId}:${action.step}`) : undefined);
           const decision = await this.request<{ success: boolean; error?: string; assessment?: { verdict: string; explanation?: string } }>(request(this.id, this.goalManagerId, 'recordPredictionAssessment', {
             goalId: extra.goalId, taskId: action.taskId, step: action.step, verdict: action.verdict, explanation: action.explanation, expectedRevision: action.expectedRevision, evidenceRefs: action.evidenceRefs,
-            ...(action.attribution ? { attribution: action.attribution } : {}),
+            ...(attribution ? { attribution } : {}),
+            ...(internal.origin ? { origin: internal.origin } : {}),
           }), 5000);
           if (!decision.success) throw new Error(decision.error ?? 'Assessment rejected');
           if (decision.assessment) (extra.assessments ??= {})[`${action.taskId}:${action.step}`] = decision.assessment;
@@ -2994,7 +3633,11 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         }
         case 'read_evidence': {
           let text = extra.fullMaterial ?? '';
-          if (action.context === true) {
+          if (typeof action.ref === 'string' && action.ref.trim()) {
+            // One observation's whole recorded result, however long: a cut
+            // excerpt is a reason to read it, never to leave a verdict open.
+            text = await this.readObservation(extra, action.ref.trim());
+          } else if (action.context === true) {
             // Reviews have a budgetGoalId, not an active execution goal. Keep
             // context reads scoped here; GoalManager owns reference validation.
             if (!extra.goalId || !this.goalManagerId) throw new Error('This review has no goal context');
@@ -3003,11 +3646,11 @@ My work is internal maintenance of this workspace's memory. When invited to cont
               goalId: extra.goalId, messageId: action.messageId, sourceGoalId: action.sourceGoalId, key: action.key,
             }))) ?? 'null';
           } else if (typeof action.key === 'string') {
-            if (!extra.goalId || !this.goalManagerId || !(action.key === 'learning/plans' || action.key === 'learning/reviewOutcome' || action.key === 'scrum/plan' || action.key.startsWith('learning/observation/') || action.key.startsWith('learning/assessment/') || action.key.startsWith('verification/'))) throw new Error('Key is outside the review learning evidence; readable keys are learning/plans, learning/reviewOutcome, scrum/plan, learning/observation/*, learning/assessment/* and verification/*');
+            if (!extra.goalId || !this.goalManagerId || !(action.key === 'learning/plans' || action.key === 'learning/reviewOutcome' || action.key === 'scrum/plan' || action.key === 'goal/assumptions' || action.key.startsWith('learning/observation/') || action.key.startsWith('learning/assessment/') || action.key.startsWith('learning/reaction/') || action.key.startsWith('verification/'))) throw new Error('Key is outside the review learning evidence; readable keys are learning/plans, learning/reviewOutcome, scrum/plan, goal/assumptions, learning/observation/*, learning/assessment/*, learning/reaction/* and verification/*');
             text = JSON.stringify(await this.request(request(this.id, this.goalManagerId, 'readGoalData', { goalId: extra.goalId, key: action.key }))) ?? 'null';
           }
-          // A named key is the more specific request; a taskId beside it only repeats which task.
-          if (typeof action.taskId === 'string' && typeof action.key !== 'string') {
+          // A named key or ref is the more specific request; a taskId beside it only repeats which task.
+          if (typeof action.taskId === 'string' && typeof action.key !== 'string' && typeof action.ref !== 'string') {
             const record = extra.records?.find(r => r.taskId === action.taskId);
             if (!record) {
               const held = extra.records?.map(r => r.taskId) ?? [];
@@ -3180,6 +3823,31 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       extra.lastResult = `Error: ${errMsg}`;
       return { success: false, error: errMsg };
     }
+  }
+
+  /**
+   * The whole recorded result of one observed episode (read_evidence ref).
+   * `ref` is the episode's observation reference as the dossier shows it
+   * (`<taskId>:step:<n>`), its ledger key (`learning/observation/<taskId>:<n>`)
+   * or `<taskId>:<n>`. GoalManager's readGoalData returns a result stored by
+   * hash in full; the episode must belong to this review's evidence.
+   */
+  private async readObservation(extra: ReviewTaskExtra, ref: string): Promise<string> {
+    if (!extra.goalId || !this.goalManagerId) throw new Error('This review has no goal evidence to read observations from');
+    const operation = ref.startsWith('learning/observation/') ? ref.slice('learning/observation/'.length) : ref.replace(/:step:(\d+)$/, ':$1');
+    const match = /^(.+):(\d+)$/.exec(operation);
+    if (!match) throw new Error(`"${ref}" names no observation; use an episode's ref from the dossier, such as <taskId>:step:<n>`);
+    const [, taskId, step] = match;
+    const held = new Set([...(extra.records ?? []).map(r => r.taskId), ...(extra.evidenceTaskIds ?? [])]);
+    if (!held.has(taskId)) throw new Error(`Task ${taskId} is outside this review's evidence`);
+    const key = `learning/observation/${taskId}:${step}`;
+    const observed = await this.request<Record<string, unknown> | null>(request(this.id, this.goalManagerId, 'readGoalData', { goalId: extra.goalId, key }), 10000);
+    const prediction = extra.records?.find(r => r.taskId === taskId)?.predictions?.find(p => p.step === Number(step));
+    if (!observed && !prediction) throw new Error(`No observation is recorded at ${key}`);
+    const actual = observed?.actual ?? prediction?.actual ?? '(no result recorded)';
+    const expect = (typeof observed?.expect === 'string' ? observed.expect : undefined) ?? prediction?.expect ?? '(missing)';
+    return `Observation ${key}\nexpected: ${expect}\noutcome: ${String(observed?.outcome ?? prediction?.outcome ?? 'unknown')}\n`
+      + `full result (${typeof actual === 'string' ? actual.length : JSON.stringify(actual)?.length ?? 0} chars):\n${typeof actual === 'string' ? actual : JSON.stringify(actual, null, 1)}`;
   }
 
   /**
@@ -3469,8 +4137,8 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | Action | Fields | Purpose |
 |--------|--------|---------|
 | mark_useful | ids | Credit the injected entries that genuinely influenced the work |
-| assess_prediction | taskId, step, verdict, explanation, attribution? | Record supported/contradicted/unresolved semantic assessment with an evidence-grounded explanation, separately from observations; for a miss, attribution {source: prior\|entry\|pattern\|link\|world\|runtime, id?, note?} names the belief that failed (runtime: the system itself ended the task) |
-| read_evidence | taskId?, step?, key?, context?, messageId?, sourceGoalId?, offset?, length? | Retrieve complete task evidence or a prediction/observation pair; context:true reads the reviewed goal's linked conversation/proposal through GoalManager, separately from taskId/step |
+| assess_prediction | taskId, step, verdict, explanation, attribution? | Record supported/contradicted/unresolved semantic assessment with an evidence-grounded explanation, separately from observations; for a miss, attribution {source: prior\|entry\|pattern\|link\|world\|runtime\|assumption\|unassigned, id?, note?} names the belief that failed (assumption: the goal's assumption, id such as A2; runtime: the system itself ended the task; unassigned: no reading can tell). A miss recorded without one takes the automated blame reading when it is confident, otherwise unassigned |
+| read_evidence | ref?, taskId?, step?, key?, context?, messageId?, sourceGoalId?, offset?, length? | ref (an episode's ref from the dossier, such as <taskId>:step:<n>) returns that observation's whole recorded result, however long; taskId/step retrieve task evidence or a prediction/observation pair; key reads learning/plans, learning/reviewOutcome, learning/reaction/*, goal/assumptions and the other listed records; context:true reads the reviewed goal's linked conversation/proposal, separately from taskId/step |
 | recall_knowledge | query | Check what the knowledge base already holds before saving |
 | save_entry | title, content, type?, tags? | Save one durable lesson (type: 'learned'\|'fact'\|'insight'\|'reference') |
 | update_entry | id, content?, title?, tags? | Refresh an existing entry instead of near-duplicating it |
@@ -3496,11 +4164,18 @@ After inspecting the evidence, submit assessments directly in the final result:
 {"action":"done","result":{"assessments":[{"taskId":"<observed task>","step":1,"verdict":"contradicted","explanation":"Expected no test suite, but the owner verification ran 198 tests successfully.","attribution":{"source":"entry","id":"<the entry the prediction cited>","note":"The entry said the repository has no tests"}}],"applications":[{"id":"<pattern the plan followed>","application":{"context":"The plan staged research before acting","verdict":"no_effect","evidence":"The staged research returned what the request already stated; the plan after it was the one the first message implied."}},{"id":"<pattern an agent applied>","application":{"taskId":"<observed task>","context":"Inspecting changes","verdict":"inconclusive","evidence":"Whether the agent used this pattern is recorded; its benefit remains uncertain."}}],"summary":"One prediction contradicted by a stale entry; the plan's pattern had no effect here."}}
 Use real task/step identities from the dossier. Cover the recorded predictions, including supported expectations, contradictions, and unresolved claims with specific evidence gaps. Use read_evidence for missing context; hidden payload bodies and an agent's assertion that it reviewed them are not evidence of inspection. Never infer that every prediction held just because every command exited zero. Pattern applications require recorded provenance; seeing an injected pattern does not prove it was used. An application without taskId is the plan's use of the pattern, judged against the goal; with taskId it is that task's own use, whatever steps cited it. You may omit applications when none were declared. Held predictions that cited an entry are recorded as confirmations of it automatically. Existing knowledge corrections can share the completion: knowledgeUpdates:[{action:"update_entry",id:"<existing entry>",title:"<accurate title>",content:"<corrected scoped claim and evidence>",evidence:"<observed task/step or owner verification result>"}]. archive_entry is also supported for obsolete duplicates, and pattern-language updates share the completion the same way. New lessons and all existing learning actions remain available individually. Rejected corrections remain visible as partial learning; do not loop to force acceptance.
 
+## The person comes first
+The aim of all this work is a person who got what they wanted, so their reactions are the most valuable surprise a goal can bring. When the dossier opens with the person's reactions (a correction, a redirect, an unhappy reaction) or with an assumption they corrected, start there, before the predictions:
+- Name the assumption that failed: one the goal stated (attribute the contradicted predictions that followed from it with {source: "assumption", id: "A2"}), or the assumption the plan made silently and was easy to state. Say which in your summary.
+- Save what the person actually wanted as a preference: save_entry with type "fact" and tags ["preference"], in the person's own terms, scoped to the kind of request it governs. When a preference entry misled the plan, update_entry that entry with what they want now; a preference the person wrote stays as they wrote it, so save the refinement as its own preference entry naming the one it refines.
+- Save the unstated-assumption lesson: save_entry with type "learned" and tags ["assumption"], naming the kind of request, the assumption that is easy to make there without saying so, and the question that settles it, so future planning states that assumption and asks about it.
+A satisfied reaction confirms the assumptions the goal acted on; a neutral one teaches little. A goal reviewed again because of a reaction keeps its earlier assessments: add only what the reaction teaches.
+
 ## How to review
-1. **Evaluate predictions first.** Compare the expected claim with the actual result, and include the assessment in the completion batch. Then consider knowledge usefulness. Compare the injected knowledge list against the transcript: entries that demonstrably helped the outcome get one mark_useful call with their ids; mere retrieval or use is not benefit. When none were used, omit usefulness credit; still assess the recorded predictions.
+1. **Evaluate predictions.** Compare the expected claim with the actual result, and include the assessment in the completion batch. Then consider knowledge usefulness. Compare the injected knowledge list against the transcript: entries that demonstrably helped the outcome get one mark_useful call with their ids; mere retrieval or use is not benefit. When none were used, omit usefulness credit; still assess the recorded predictions.
 2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Runtime verdicts compare declared operation status; they do not assess the free-text expectation. A failed action can be the expected result. Legacy missed flags are not proof. Distinguish an invalid pattern from incorrect application, changed conditions, and an execution defect. Preserve competing explanations and scope any revision to the evidence. Distinguish uncertainty from contradiction; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. Record semantic assessments with assess_prediction. Successful actions alone do not establish that predictions held.
 
-   The dossier's Surprises section gathers the misses with what each prediction rested on (the entries and patterns it cited) and the agent's own reading, given while the full result was in view; audit that reading against the evidence rather than adopting it. For each miss, name the belief that failed in the assessment's attribution and update that belief: the model's own prior (save what actually holds as a lesson), an entry it rested on (correct, narrow or dispute that entry), a pattern it followed (a counterexample on the application), the link that led from one pattern to the next (see Weave the pattern language), or a world that changed under it (record the change; the belief may still hold). A task the runtime ended (its outcome names a runtime fault: an inactivity timeout, a plan that superseded it, a worker that died) says nothing about the world: attribute its misses to runtime and leave the world model unchanged on its account; the person is told about the fault separately.
+   The dossier's Surprises section gathers the misses, the most surprising first: each with the confidence it was stated with (a miss stated as sure says a belief was badly wrong; a missed guess says little), what the prediction rested on (the entries and patterns it cited, and the closest ones it was shown without citing), the agent's own reading, given while the full result was in view, and an automated blame reading as advice. Audit the agent's reading against the evidence rather than adopting it. When an excerpt is cut where the comparison matters, read_evidence with the row's ref returns the whole recorded result: read it and judge, so a long result is never the reason a verdict stays unresolved. For each miss, name the belief that failed in the assessment's attribution and update that belief: the model's own prior (save what actually holds as a lesson), an entry it rested on (correct, narrow or dispute that entry), a pattern it followed (a counterexample on the application), the link that led from one pattern to the next (see Weave the pattern language), an assumption the goal made about the person (attribution source assumption with its id; see The person comes first), or a world that changed under it (record the change; the belief may still hold). Guesses that held, listed after the misses, are where confidence should rise: a lesson stating what holds, or a confirmed entry, lets the next prediction there be surer. Entries the dossier lists as flagged keep missing when predictions rest on them: narrow each to where it holds, or dispute it. A task the runtime ended (its outcome names a runtime fault: an inactivity timeout, a plan that superseded it, a worker that died) says nothing about the world: attribute its misses to runtime and leave the world model unchanged on its account; the person is told about the fault separately.
 3. **Distill sparingly.** New reusable lessons are optional. A routine task can finish with no new lesson after recording its prediction assessments; an empty learning update list does not replace those assessments. Save a lesson only when it will help a later task in the applicable project or environment: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
 
    **Save what is true, not the route that was taken.** An entry that tells a future task which steps to run for a kind of question — look here, then check that — freezes one attempt's path as though it described the world, and the next task follows it rather than working out its own. The risk runs opposite to confidence: a task that answered the wrong question without friction yields the tidiest-looking procedure for answering it wrongly again, and writing that down is how a single wrong turn becomes the route everyone takes. Before saving steps, check the transcript against what was actually asked — a fulfilled prediction only shows the agent did what it predicted, not that the user's question was answered, so an entry resting on assessments alone rests on nothing. Record what a thing is, what it exposes, and what its output means; leave the steps to the task.

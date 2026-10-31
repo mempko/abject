@@ -7,7 +7,7 @@
  */
 
 import type { AbjectId } from './types.js';
-import type { KnowledgeLearning } from './learning.js';
+import type { EntryEvidence, KnowledgeLearning } from './learning.js';
 
 /** Well-known id and interface id of the per-workspace KnowledgeBase. */
 export const KNOWLEDGE_BASE_ID = 'abjects:knowledge-base' as AbjectId;
@@ -33,6 +33,8 @@ export type KnowledgeOrigin = 'user' | 'agent' | 'reviewer' | 'scrum';
 export interface KnowledgeEntry {
   knowledgeRef?: string;
   learning?: KnowledgeLearning;
+  /** How often predictions and assumptions resting on this entry held, and what that says. */
+  evidence?: EntryEvidence;
   id: string;
   title: string;
   content: string;

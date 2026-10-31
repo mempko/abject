@@ -23,6 +23,11 @@ import { runtimeFault } from '../core/runtime-fault.js';
 import { failureQuestions, producesQuestions, FAILURE_KINDS, type FailureKind } from '../core/decision-questions.js';
 import { choiceOf, noulOf } from '../llm/decision.js';
 import { CONVERSATION_CONTEXT_KEY, conversationBriefing, type ConversationContext } from '../core/conversation-context.js';
+import {
+  ATTRIBUTION_SOURCES, BELIEF_SOURCES, CONFIDENCE_LEVELS, MAX_ASSUMPTIONS_PER_GOAL, OCCURRENCE_BUCKETS, REACTION_KINDS,
+  brier, confidenceOf, isNegativeReaction, occurrenceBucket, parseAssumption, reactionKindOf, surpriseBits, weekOf,
+  type Assumption, type AssumptionStatus, type AttributionSource, type Confidence, type OccurrenceBucket, type Reaction, type ReactionKind,
+} from '../core/surprise.js';
 const log = new Log('GoalManager');
 
 const GOAL_MANAGER_INTERFACE: InterfaceId = 'abjects:goal-manager';
@@ -197,21 +202,100 @@ function fingerprint(value: unknown): string {
 }
 
 /**
- * Which belief a missed prediction traced back to, as the reviewer read it:
- * the model's own prior, a knowledge entry or a pattern it rested on, the
- * link between two patterns, a world that changed under it, or the runtime
- * itself (a watchdog, a superseded plan, a dead worker), which teaches the
- * world model nothing. Kept with the assessment so the learning it drives can
- * be followed back to its cause.
+ * Which belief a missed prediction traced back to, as the reviewer read it
+ * (the sources are listed in core/surprise.ts): the model's own prior, a
+ * knowledge entry or a pattern, the link between two patterns, a changed
+ * world, the runtime itself, an assumption the goal made about what the
+ * person wanted (id `A2`), or `unassigned` when no one could tell. Kept with
+ * the assessment so the learning it drives can be followed back to its cause.
  */
-export type PredictionAttribution = { source: 'prior' | 'entry' | 'pattern' | 'link' | 'world' | 'runtime'; id?: string; note?: string };
+export type PredictionAttribution = { source: AttributionSource; id?: string; note?: string };
 
 function attributionOf(raw: unknown): PredictionAttribution | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const { source, id, note } = raw as { source?: unknown; id?: unknown; note?: unknown };
-  if (source !== 'prior' && source !== 'entry' && source !== 'pattern' && source !== 'link' && source !== 'world' && source !== 'runtime') return undefined;
-  return { source, ...(typeof id === 'string' && id ? { id: id.slice(0, 300) } : {}), ...(typeof note === 'string' && note.trim() ? { note: note.trim().slice(0, 500) } : {}) };
+  if (!(ATTRIBUTION_SOURCES as readonly unknown[]).includes(source)) return undefined;
+  return { source: source as AttributionSource, ...(typeof id === 'string' && id ? { id: id.slice(0, 300) } : {}), ...(typeof note === 'string' && note.trim() ? { note: note.trim().slice(0, 500) } : {}) };
 }
+
+// ─── Learning curve ──────────────────────────────────────────────────
+//
+// Counted as events happen and kept in Storage under one key, so the curve
+// covers every goal ever recorded, not only the goals still in memory.
+
+const LEARNING_STATS_KEY = 'goals:learning-stats';
+const LEARNING_STATS_WEEKS = 104;
+const LEARNING_STATS_CONTEXTS = 500;
+const LEARNING_CURVE_CONTEXTS = 50;
+
+const ASSUMPTION_STATUSES: readonly AssumptionStatus[] = ['open', 'asked', 'acted', 'confirmed', 'corrected', 'held', 'missed'];
+const SETTLED_ASSUMPTION: readonly AssumptionStatus[] = ['confirmed', 'corrected', 'held', 'missed'];
+
+type BucketCounts = Record<OccurrenceBucket, { judged: number; contradicted: number }>;
+
+/** One week of the predict, judge, blame, update loop. */
+export interface LearningWeek {
+  week: string;
+  goals: number;
+  actions: number; expect: number; withConfidence: number; basis: number; patterns: number;
+  judged: number; supported: number; contradicted: number; unresolved: number;
+  /** Blame on contradicted judgments: any named source, a belief the system holds, or none. */
+  attributed: number; toBelief: number; unassigned: number;
+  /** Sums over judgments with a stated confidence and a decided verdict (`scored` of them). */
+  surpriseBits: number; brier: number; scored: number;
+  calibration: Record<Confidence, { n: number; held: number }>;
+  assumptions: number; asked: number; confirmed: number; corrected: number; checked: number; checkMissed: number; acted: number;
+  reactions: Record<ReactionKind, number>;
+}
+
+interface LearningContext { seen: number; last: number; judged: number; contradicted: number; byBucket: BucketCounts }
+
+interface LearningStats {
+  version: 1;
+  weeks: Record<string, LearningWeek>;
+  curve: BucketCounts;
+  contexts: Record<string, LearningContext>;
+}
+
+function emptyBuckets(): BucketCounts {
+  return Object.fromEntries(OCCURRENCE_BUCKETS.map(b => [b, { judged: 0, contradicted: 0 }])) as BucketCounts;
+}
+
+function emptyWeek(week: string): LearningWeek {
+  return {
+    week, goals: 0, actions: 0, expect: 0, withConfidence: 0, basis: 0, patterns: 0,
+    judged: 0, supported: 0, contradicted: 0, unresolved: 0, attributed: 0, toBelief: 0, unassigned: 0,
+    surpriseBits: 0, brier: 0, scored: 0,
+    calibration: Object.fromEntries(CONFIDENCE_LEVELS.map(c => [c, { n: 0, held: 0 }])) as LearningWeek['calibration'],
+    assumptions: 0, asked: 0, confirmed: 0, corrected: 0, checked: 0, checkMissed: 0, acted: 0,
+    reactions: Object.fromEntries(REACTION_KINDS.map(k => [k, 0])) as LearningWeek['reactions'],
+  };
+}
+
+function emptyLearningStats(): LearningStats {
+  return { version: 1, weeks: {}, curve: emptyBuckets(), contexts: {} };
+}
+
+/**
+ * Add every number in `from` into `into`, key by key, creating what is
+ * missing. Stats counted before the stored copy finished loading merge in
+ * this way, since every figure is a count or a sum.
+ */
+function addCounts(into: Record<string, unknown>, from: unknown): void {
+  if (!from || typeof from !== 'object') return;
+  for (const [key, value] of Object.entries(from as Record<string, unknown>)) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      if (key === 'last') into[key] = Math.max(Number(into[key]) || 0, value);
+      else into[key] = Math.round(((Number(into[key]) || 0) + value) * 10000) / 10000;
+    } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+      if (!into[key] || typeof into[key] !== 'object') into[key] = {};
+      addCounts(into[key] as Record<string, unknown>, value);
+    } else if (typeof value === 'string' && into[key] === undefined) into[key] = value;
+  }
+}
+
+/** What the learning curve needs from a prediction: its confidence, context and occurrence. */
+interface PredictionMeta { confidence?: Confidence; contextKey?: string; occurrence?: number }
 
 export class GoalManager extends Abject {
   private goals: Map<GoalId, Goal> = new Map();
@@ -366,6 +450,7 @@ export class GoalManager extends Abject {
     goal.updatedAt = Date.now();
 
     goal.scratchpad['learning/review'] = 'pending';
+    this.countFinishedGoal();
     await this.persistLearning(goal);
     log.info(`Goal failed: "${goal.title}" (${goalId}) — ${error ?? 'unknown'}`);
     this.changed('goalFailed', { goalId, error });
@@ -1154,8 +1239,91 @@ export class GoalManager extends Abject {
               ],
               returns: { kind: 'object', properties: { reconciled: { kind: 'primitive', primitive: 'number' } } },
             },
+            {
+              name: 'recordPredictionAssessment',
+              description: 'TaskReviewer records its judgment of one prediction, separately from the observed execution evidence. A repeated identical assessment is acknowledged without overwriting or counting twice; a different one must revise the current revision with evidence references, and the learning curve moves its count from the old verdict to the new.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task whose prediction is judged' },
+                { name: 'step', type: { kind: 'primitive', primitive: 'number' }, description: 'The step of that task, from 1' },
+                { name: 'verdict', type: { kind: 'primitive', primitive: 'string' }, description: 'supported, contradicted or unresolved' },
+                { name: 'explanation', type: { kind: 'primitive', primitive: 'string' }, description: 'Why, grounded in the evidence' },
+                { name: 'attribution', type: { kind: 'object', properties: {} }, description: 'The belief a miss traces back to: { source, id?, note? } with source prior, entry, pattern, link, world, runtime, assumption (id such as A2) or unassigned', optional: true },
+                { name: 'origin', type: { kind: 'primitive', primitive: 'string' }, description: '"agreement" when the automated judge was unsure but leaned the same way as the agent\'s own reading; otherwise the origin is "reviewer"', optional: true },
+                { name: 'expectedRevision', type: { kind: 'primitive', primitive: 'number' }, description: 'The revision being revised, when changing an earlier assessment', optional: true },
+                { name: 'evidenceRefs', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Scratchpad keys (learning/task, observation or assessment) the judgment rests on', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' }, duplicate: { kind: 'primitive', primitive: 'boolean' }, conflict: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'ackReview',
+              description: 'Acknowledge a finished retrospective of a goal; with reaction: true, acknowledge the review of the person\'s negative reaction to it instead (learning/reactionReview becomes done).',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'report', type: { kind: 'object', properties: {} }, description: 'The review report; status "partial" marks a retrospective that could not finish', optional: true },
+                { name: 'reaction', type: { kind: 'primitive', primitive: 'boolean' }, description: 'True when acknowledging a reaction review', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'recordAssumptions',
+              description: 'ScrumMaster states what the goal assumes about what the person wants (and about the world), each with a confidence and a cost of being wrong. Ids continue after the goal\'s existing ones (A1, A2, ...), a claim already stated is kept once, and a goal holds at most ' + MAX_ASSUMPTIONS_PER_GOAL + '. Stored at the scratchpad key goal/assumptions. Returns { success, assumptions }.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'assumptions', type: { kind: 'array', elementType: { kind: 'object', properties: {} } }, description: 'Each { claim, about: intent|scope|preference|world, confidence: sure|likely|guess, costIfWrong: undoable|costly|irreversible, basis?: knowledge entry ids }' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' }, assumptions: { kind: 'array', elementType: { kind: 'object', properties: {} } } } },
+            },
+            {
+              name: 'updateAssumption',
+              description: 'ScrumMaster records where an assumption stands: asked, acted on without asking, confirmed or corrected by the person, or held or missed by a read-only check. Settled statuses record resolvedAt. Emits assumptionResolved. Returns { success, assumption }.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Assumption id within the goal, such as A2' },
+                { name: 'status', type: { kind: 'primitive', primitive: 'string' }, description: 'open, asked, acted, confirmed, corrected, held or missed' },
+                { name: 'answer', type: { kind: 'primitive', primitive: 'string' }, description: 'The person\'s answer, or the check\'s finding, in their words', optional: true },
+                { name: 'wanted', type: { kind: 'primitive', primitive: 'string' }, description: 'What the person actually wants, when the answer corrected the claim', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' }, assumption: { kind: 'object', properties: {} } } },
+            },
+            {
+              name: 'getAssumptions',
+              description: 'The assumptions a goal stated, with their status, answers and confidence. Reads archived goals too.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+            },
+            {
+              name: 'recordReaction',
+              description: 'Chat or ScrumMaster records how the person reacted to a goal\'s result or to its work in flight. Works on finished goals too, including ones in the cold archive, which are brought back for review. A correction, redirect or unhappy reaction marks the goal for a reaction review (learning/reactionReview pending) and emits goalReaction. Returns { success }.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'kind', type: { kind: 'primitive', primitive: 'string' }, description: 'satisfied, correction, redirect, unhappy or neutral' },
+                { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'The person\'s words' },
+                { name: 'wanted', type: { kind: 'primitive', primitive: 'string' }, description: 'What they wanted instead, as the classifier read it', optional: true },
+                { name: 'source', type: { kind: 'primitive', primitive: 'string' }, description: '"chat" (after the result) or "interjection" (while the goal ran)' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'pendingReactionReviews',
+              description: 'Goals whose negative reactions still wait for review, with those reactions: [{ goalId, reactions }].',
+              parameters: [],
+              returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+            },
+            {
+              name: 'getLearningCurve',
+              description: 'The learning curve over everything recorded (it survives archiving): per week, finished goals, predictions stated and with confidence, basis or patterns; judgments by verdict; blame on misses (attributed, toBelief, unassigned); summed surprise bits and Brier scores over the scored judgments, and calibration per confidence word; assumptions and their outcomes; the person\'s reactions by kind. Plus judged and contradicted predictions by how often their context had been seen (curve, decided verdicts only) and the 50 most seen contexts. Returns { scope, weeks, curve, contexts }.',
+              parameters: [
+                { name: 'weeks', type: { kind: 'primitive', primitive: 'number' }, description: 'How many recent weeks to return (default and most: 104)', optional: true },
+              ],
+              returns: { kind: 'object', properties: { scope: { kind: 'primitive', primitive: 'string' }, weeks: { kind: 'array', elementType: { kind: 'object', properties: {} } }, curve: { kind: 'object', properties: {} }, contexts: { kind: 'array', elementType: { kind: 'object', properties: {} } } } },
+            },
           ],
           events: [
+            { name: 'assumptionResolved', description: 'An assumption a goal stated changed status (asked, acted on, confirmed, corrected, held or missed).', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' }, assumption: { kind: 'object', properties: {} } } } },
+            { name: 'goalReaction', description: 'The person reacted negatively (a correction, redirect or unhappy) to a goal\'s result or its work in flight; the goal waits for a reaction review.', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' }, kind: { kind: 'primitive', primitive: 'string' }, negative: { kind: 'primitive', primitive: 'boolean' } } } },
             { name: 'goalCreated', description: 'A new goal was created', payload: { kind: 'reference', reference: 'Goal' } },
             { name: 'taskProgress', description: 'A peer reported task status on a shared goal', payload: { kind: 'reference', reference: 'RemoteTaskProgress' } },
             { name: 'collaboratorsChanged', description: 'The set of peers present on a shared goal changed', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } } },
@@ -1185,6 +1353,7 @@ export class GoalManager extends Abject {
     this.sharedStateId = await this.discoverDep('SharedState') ?? undefined;
     this.storageId = await this.discoverDep('Storage') ?? undefined;
     this.agentAbjectId = await this.discoverDep('AgentAbject') ?? undefined;
+    await this.loadLearningStats();
 
     // Subscribe to TupleSpace events so we detect remote permanently_failed/done transitions
     if (this.tupleSpaceId) {
@@ -1210,6 +1379,16 @@ export class GoalManager extends Abject {
     await this.loadColdIndex();
     // Housekeeping runs after boot, off the startup path.
     void this.maintainGoalStore();
+  }
+
+  protected override async onStop(): Promise<void> {
+    // request() is refused while stopping; a fire-and-forget set still reaches Storage.
+    if (this.learningStatsTimer && this.storageId && this.learningStatsLoaded) {
+      clearTimeout(this.learningStatsTimer);
+      this.learningStatsTimer = undefined;
+      try { this.send(request(this.id, this.storageId, 'set', { key: LEARNING_STATS_KEY, value: this.learningStats })); } catch { /* storage gone */ }
+    }
+    await super.onStop();
   }
 
   /** Load the local goal index from Storage and subscribe to each goal's per-goal SharedState. */
@@ -1320,7 +1499,7 @@ export class GoalManager extends Abject {
         goal.scratchpad = useLocal
           ? { ...goal.scratchpad, ...checkpoint }
           : { ...checkpoint, ...goal.scratchpad };
-        for (const [k, v] of Object.entries(checkpoint)) if (/^learning\/(decision|assessment)\//.test(k)) goal.scratchpad[k] = v;
+        for (const [k, v] of Object.entries(checkpoint)) if (/^learning\/(decision|assessment)\/|^goal\/assumptions$/.test(k)) goal.scratchpad[k] = v;
         goal.lastMeaningfulProgressAt = Math.max(goal.lastMeaningfulProgressAt ?? 0, state?.lastMeaningfulProgressAt ?? 0) || undefined;
       }
       else if (local) goal.scratchpad = { ...goal.scratchpad, ...local };
@@ -1441,6 +1620,186 @@ export class GoalManager extends Abject {
     }, 5000);
   }
 
+  // ── Learning stats (the learning curve) ────────────────────────────
+  //
+  // Counts kept as events happen, under LEARNING_STATS_KEY, so the curve
+  // outlives archiving: predictions stated, judgments and their blame,
+  // surprise and calibration where a confidence was stated, assumptions and
+  // the person's reactions, by week; and contradictions by how often the
+  // prediction's context had been seen, overall and per context.
+
+  private learningStats: LearningStats = emptyLearningStats();
+  private learningStatsLoaded = false;
+  private learningStatsTimer?: ReturnType<typeof setTimeout>;
+
+  /** Load the stored stats once, adding in whatever was counted before they arrived. */
+  private async loadLearningStats(): Promise<void> {
+    if (this.learningStatsLoaded || !this.storageId) return;
+    let stored: Partial<LearningStats> | null;
+    try {
+      stored = await this.request<Partial<LearningStats> | null>(request(this.id, this.storageId, 'get', { key: LEARNING_STATS_KEY }));
+    } catch { return; /* Storage not answering: try again on the next save */ }
+    if (this.learningStatsLoaded) return;
+    const counted = this.learningStats;
+    const merged = emptyLearningStats();
+    for (const source of [stored?.version === 1 ? stored : undefined, counted]) {
+      if (!source) continue;
+      for (const [key, week] of Object.entries(source.weeks ?? {})) addCounts((merged.weeks[key] ??= emptyWeek(key)) as unknown as Record<string, unknown>, week);
+      addCounts(merged.curve as unknown as Record<string, unknown>, source.curve);
+      for (const [key, ctx] of Object.entries(source.contexts ?? {})) {
+        addCounts((merged.contexts[key] ??= { seen: 0, last: 0, judged: 0, contradicted: 0, byBucket: emptyBuckets() }) as unknown as Record<string, unknown>, ctx);
+      }
+    }
+    this.learningStats = merged;
+    this.learningStatsLoaded = true;
+    this.boundLearningStats();
+  }
+
+  /** Persist the stats a few seconds after the first change; changes in between ride along. */
+  private learningStatsChanged(): void {
+    if (this.learningStatsTimer || !this.storageId) return;
+    this.learningStatsTimer = this.setTimer(async () => {
+      this.learningStatsTimer = undefined;
+      await this.loadLearningStats();
+      if (!this.learningStatsLoaded) return;
+      await this.request(request(this.id, this.storageId!, 'set', { key: LEARNING_STATS_KEY, value: this.learningStats })).catch(() => undefined);
+    }, 5000);
+  }
+
+  /** Keep the newest weeks and the most seen contexts; `keep` is a context just counted. */
+  private boundLearningStats(keep?: string): void {
+    const weeks = Object.keys(this.learningStats.weeks).sort();
+    for (const key of weeks.slice(0, Math.max(0, weeks.length - LEARNING_STATS_WEEKS))) delete this.learningStats.weeks[key];
+    const contexts = this.learningStats.contexts;
+    let excess = Object.keys(contexts).length - LEARNING_STATS_CONTEXTS;
+    if (excess <= 0) return;
+    const leastSeen = Object.entries(contexts).filter(([key]) => key !== keep)
+      .sort((a, b) => a[1].seen - b[1].seen || a[1].last - b[1].last);
+    for (const [key] of leastSeen) { if (excess-- <= 0) break; delete contexts[key]; }
+  }
+
+  private statsWeek(at: number): LearningWeek;
+  private statsWeek(at: number, create: false): LearningWeek | undefined;
+  private statsWeek(at: number, create = true): LearningWeek | undefined {
+    const key = weekOf(at);
+    let week = this.learningStats.weeks[key];
+    if (!week && create) {
+      week = this.learningStats.weeks[key] = emptyWeek(key);
+      this.boundLearningStats();
+    }
+    return week;
+  }
+
+  /**
+   * Count one stated prediction, and give it its occurrence: how many times
+   * its context (agent, action, target, method) has now been seen. The
+   * occurrence is written onto the recorded observation, where the
+   * assessment that judges it later reads it back.
+   */
+  private countPrediction(recorded: Record<string, unknown>): void {
+    const now = Date.now();
+    const week = this.statsWeek(now);
+    week.actions++;
+    if (typeof recorded.expect === 'string' && recorded.expect.trim()) week.expect++;
+    const confidence = confidenceOf(recorded.confidence);
+    if (confidence) { week.withConfidence++; recorded.confidence = confidence; }
+    if (Array.isArray(recorded.basis) && recorded.basis.length) week.basis++;
+    if (Array.isArray(recorded.patterns) && recorded.patterns.length) week.patterns++;
+    const key = typeof recorded.contextKey === 'string' ? recorded.contextKey.slice(0, 300) : '';
+    if (key) {
+      const ctx = this.learningStats.contexts[key] ??= { seen: 0, last: 0, judged: 0, contradicted: 0, byBucket: emptyBuckets() };
+      ctx.seen++;
+      ctx.last = now;
+      recorded.occurrence = ctx.seen;
+      this.boundLearningStats(key);
+    }
+    this.learningStatsChanged();
+  }
+
+  /** The confidence, context and occurrence of the prediction one assessment judges. */
+  private predictionMeta(goal: Goal, taskId: string, step: number): PredictionMeta {
+    const records = [
+      goal.scratchpad[`learning/observation/${taskId}:${step}`],
+      goal.scratchpad[`learning/observation/${taskId}:${step}:prediction`],
+      (goal.scratchpad[`learning/task/${taskId}`] as { predictions?: Array<Record<string, unknown>> } | undefined)?.predictions?.find(p => p.step === step),
+    ].filter((r): r is Record<string, unknown> => !!r && typeof r === 'object');
+    const meta: PredictionMeta = {};
+    for (const r of records) {
+      meta.confidence ??= confidenceOf(r.confidence);
+      if (meta.contextKey === undefined && typeof r.contextKey === 'string' && r.contextKey) meta.contextKey = r.contextKey.slice(0, 300);
+      if (meta.occurrence === undefined && typeof r.occurrence === 'number' && Number.isFinite(r.occurrence) && r.occurrence >= 1) meta.occurrence = Math.floor(r.occurrence);
+    }
+    return meta;
+  }
+
+  /**
+   * Add (`sign` 1) or take back (`sign` -1) one assessment's share of the
+   * stats: a revised assessment takes back its previous verdict, in the week
+   * it was counted, before the new one is added. Blame is counted on
+   * contradicted judgments; surprise, Brier and calibration on decided
+   * verdicts with a stated confidence; the curve on decided verdicts whose
+   * prediction carried an occurrence.
+   */
+  private countAssessment(assessment: { verdict: string; at: number; attribution?: PredictionAttribution }, meta: PredictionMeta, sign: 1 | -1): void {
+    const week = sign === 1 ? this.statsWeek(assessment.at) : this.statsWeek(assessment.at, false);
+    const add = (n: number, by: number) => Math.max(0, Math.round((n + sign * by) * 10000) / 10000);
+    const verdict = assessment.verdict as 'supported' | 'contradicted' | 'unresolved';
+    const decided = verdict === 'supported' || verdict === 'contradicted';
+    const held = verdict === 'supported';
+    if (week) {
+      week.judged = add(week.judged, 1);
+      if (verdict in week) week[verdict] = add(week[verdict], 1);
+      const source = assessment.attribution?.source;
+      if (verdict === 'contradicted' && source) {
+        if (source === 'unassigned') week.unassigned = add(week.unassigned, 1);
+        else {
+          week.attributed = add(week.attributed, 1);
+          if (BELIEF_SOURCES.includes(source)) week.toBelief = add(week.toBelief, 1);
+        }
+      }
+      if (decided && meta.confidence) {
+        week.surpriseBits = add(week.surpriseBits, surpriseBits(meta.confidence, held));
+        week.brier = add(week.brier, brier(meta.confidence, held));
+        week.scored = add(week.scored, 1);
+        const cal = week.calibration[meta.confidence];
+        cal.n = add(cal.n, 1);
+        if (held) cal.held = add(cal.held, 1);
+      }
+    }
+    if (decided && meta.occurrence) {
+      const bucket = occurrenceBucket(meta.occurrence);
+      const tally = (counts: { judged: number; contradicted: number }) => {
+        counts.judged = add(counts.judged, 1);
+        if (!held) counts.contradicted = add(counts.contradicted, 1);
+      };
+      tally(this.learningStats.curve[bucket]);
+      const ctx = meta.contextKey ? this.learningStats.contexts[meta.contextKey] : undefined;
+      if (ctx) { tally(ctx); tally(ctx.byBucket[bucket]); }
+    }
+    this.learningStatsChanged();
+  }
+
+  /** Count an assumption moving into a status. */
+  private countAssumptionStatus(status: AssumptionStatus): void {
+    const week = this.statsWeek(Date.now());
+    switch (status) {
+      case 'asked': week.asked++; break;
+      case 'acted': week.acted++; break;
+      case 'confirmed': week.confirmed++; break;
+      case 'corrected': week.corrected++; break;
+      case 'held': week.checked++; break;
+      case 'missed': week.checked++; week.checkMissed++; break;
+      default: return;
+    }
+    this.learningStatsChanged();
+  }
+
+  /** Count a goal reaching completed or failed. */
+  private countFinishedGoal(): void {
+    this.statsWeek(Date.now()).goals++;
+    this.learningStatsChanged();
+  }
+
   // ── Cold archive ───────────────────────────────────────────────────
 
   /** Archived goals by id, from Storage: listed and readable, never loaded at boot. */
@@ -1483,7 +1842,7 @@ export class GoalManager extends Abject {
    * nothing to apply (it keeps the lifecycle sweep from deleting history).
    */
   private hasUnfinishedLearning(goal: Goal): boolean {
-    if (goal.scratchpad['learning/review'] === 'pending') return true;
+    if (goal.scratchpad['learning/review'] === 'pending' || goal.scratchpad['learning/reactionReview'] === 'pending') return true;
     return Object.entries(goal.scratchpad).some(([key, value]) => key.startsWith('learning/decision/')
       && (value as LearningDecision | undefined)?.effects?.some(e => !['applied', 'abandoned'].includes(e.state)));
   }
@@ -1740,6 +2099,20 @@ reviews results and either plans another round or completes/fails the goal.
   // Read entire scratchpad
   const all = await call(await dep('GoalManager'), 'readGoalData', { goalId });
 
+### Assumptions, reactions and the learning curve
+
+  // What a goal assumed about what the person wants, with status and answers
+  const assumptions = await call(await dep('GoalManager'), 'getAssumptions', { goalId });
+  // [{ id: 'A1', claim, about, confidence, costIfWrong, status, answer?, wanted? }]
+
+  // How often predictions held, by week and by how familiar their context was
+  const curve = await call(await dep('GoalManager'), 'getLearningCurve', { weeks: 12 });
+  // { scope, weeks: [{ week, actions, judged, contradicted, surpriseBits, ... }], curve, contexts }
+
+The planner states and settles assumptions (recordAssumptions, updateAssumption);
+the chat and the planner record the person's reactions (recordReaction). Subscribers
+hear assumptionResolved and goalReaction.
+
 ### IMPORTANT
 - The interface ID is 'abjects:goal-manager'.
 - Goals are created by their originator (e.g. Chat creates one per user request); the planner owns the goal's lifecycle while a scrum is running it.
@@ -1938,7 +2311,9 @@ reviews results and either plans another round or completes/fails the goal.
    * Each goal gets namespace `goal-{uuid}` for selective cross-peer sync.
    */
   private async syncGoalToSharedState(goal: Goal): Promise<void> {
-    if (!this.sharedStateId) return;
+    // A cold-archived goal brought back for a reaction review stays local:
+    // its namespace and catalog entry were retired when it was archived.
+    if (!this.sharedStateId || this.coldIndex.has(goal.id)) return;
     // Every goal mutation funnels through here, so advertising the goal in the
     // shared catalog at this one point keeps the index complete without
     // touching each of the mutation call sites.
@@ -1986,6 +2361,8 @@ reviews results and either plans another round or completes/fails the goal.
   }
 
   private hasPendingLearning(goal: Goal): boolean {
+    // A negative reaction waits for its own review, even on a finished goal.
+    if (goal.scratchpad['learning/reactionReview'] === 'pending') return true;
     if (goal.scratchpad['learning/review'] === 'partial' && !Object.keys(goal.scratchpad).some(k => k.startsWith('learning/decision/'))) return true;
     return Object.entries(goal.scratchpad).some(([key, value]) => key.startsWith('learning/decision/')
       && (value as LearningDecision).effects.some(e => !['applied', 'abandoned'].includes(e.state)));
@@ -2021,10 +2398,21 @@ reviews results and either plans another round or completes/fails the goal.
     this.on('getLearningFunnel', async () => {
       const observations: Array<Record<string, unknown>> = [], assessments: Array<Record<string, unknown>> = [];
       const effects: LearningEffect[] = [];
-      for (const goal of this.goals.values()) for (const [key, value] of Object.entries(goal.scratchpad)) {
-        if (key.startsWith('learning/observation/') && !key.endsWith(':self')) observations.push(value as Record<string, unknown>);
-        else if (key.startsWith('learning/assessment/')) assessments.push(value as Record<string, unknown>);
-        else if (key.startsWith('learning/decision/')) effects.push(...(value as LearningDecision).effects);
+      const reactionKinds: Record<string, number> = {}, assumptionStatuses: Record<string, number> = {};
+      let reactions = 0, awaitingReactionReview = 0, assumptions = 0;
+      for (const goal of this.goals.values()) {
+        if (goal.scratchpad['learning/reactionReview'] === 'pending') awaitingReactionReview++;
+        for (const a of this.assumptionsOf(goal)) { assumptions++; assumptionStatuses[a.status] = (assumptionStatuses[a.status] ?? 0) + 1; }
+        for (const [key, value] of Object.entries(goal.scratchpad)) {
+          if (key.startsWith('learning/observation/') && !key.endsWith(':self')) observations.push(value as Record<string, unknown>);
+          else if (key.startsWith('learning/assessment/')) assessments.push(value as Record<string, unknown>);
+          else if (key.startsWith('learning/decision/')) effects.push(...(value as LearningDecision).effects);
+          else if (key.startsWith('learning/reaction/')) {
+            reactions++;
+            const kind = String((value as Reaction | undefined)?.kind ?? 'unknown');
+            reactionKinds[kind] = (reactionKinds[kind] ?? 0) + 1;
+          }
+        }
       }
       const verdicts: Record<string, number> = {}, blame: Record<string, number> = {}, missBlame: Record<string, number> = {}, states: Record<string, number> = {}, reasons: Record<string, number> = {};
       for (const a of assessments) {
@@ -2047,12 +2435,147 @@ reviews results and either plans another round or completes/fails the goal.
           withExpectation: observations.filter(o => typeof o.expect === 'string' && o.expect.trim()).length,
           namingBelief: observations.filter(o => Array.isArray(o.basis) && o.basis.length > 0).length,
           declaringPattern: observations.filter(o => Array.isArray(o.patterns) && o.patterns.length > 0).length,
+          withConfidence: observations.filter(o => confidenceOf(o.confidence)).length,
+          withCandidates: observations.filter(o => Array.isArray(o.basisCandidates) && o.basisCandidates.length > 0).length,
         },
+        assumptions: { total: assumptions, byStatus: assumptionStatuses },
+        reactions: { total: reactions, byKind: reactionKinds, awaitingReview: awaitingReactionReview },
         judgments: { total: assessments.length, byVerdict: verdicts, byBlame: blame, missesByBlame: missBlame },
         updates: { byState: states, openReasons: Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([reason, n]) => ({ reason, n })) },
         lifetime: { ...this.learningTotals },
       };
     });
+    this.on('getLearningCurve', async msg => {
+      await this.loadLearningStats();
+      const requested = Number((msg.payload as { weeks?: unknown } | undefined)?.weeks);
+      const count = Number.isFinite(requested) && requested >= 1 ? Math.min(LEARNING_STATS_WEEKS, Math.floor(requested)) : LEARNING_STATS_WEEKS;
+      const stats = this.learningStats;
+      return {
+        scope: 'all recorded',
+        weeks: Object.keys(stats.weeks).sort().slice(-count).map(key => structuredClone(stats.weeks[key])),
+        curve: structuredClone(stats.curve),
+        contexts: Object.entries(stats.contexts)
+          .sort((a, b) => b[1].seen - a[1].seen || b[1].last - a[1].last)
+          .slice(0, LEARNING_CURVE_CONTEXTS)
+          .map(([key, c]) => ({ key, seen: c.seen, judged: c.judged, contradicted: c.contradicted, byBucket: structuredClone(c.byBucket) })),
+      };
+    });
+
+    this.on('recordAssumptions', async msg => {
+      if (!await this.isBuiltInCaller(msg.routing.from, ['ScrumMaster'])) throw new Error('Assumptions are stated by ScrumMaster');
+      const { goalId, assumptions } = msg.payload as { goalId: GoalId; assumptions: unknown[] };
+      requireNonEmpty(goalId, 'goalId');
+      precondition(Array.isArray(assumptions), 'assumptions must be an array');
+      return withKeyedLock(`${this.id}:assumptions:${goalId}`, async () => {
+        const goal = this.goals.get(goalId);
+        if (!goal) return { success: false, error: 'Unknown goal', assumptions: [] };
+        const previous = goal.scratchpad['goal/assumptions'];
+        const list = this.assumptionsOf(goal).map(a => ({ ...a }));
+        const claims = new Set(list.map(a => a.claim.trim().toLowerCase()));
+        const now = Date.now();
+        let added = 0;
+        for (const raw of assumptions) {
+          if (list.length >= MAX_ASSUMPTIONS_PER_GOAL) break;
+          const parsed = parseAssumption(raw, this.nextAssumptionIndex(list), now);
+          if (!parsed || claims.has(parsed.claim.trim().toLowerCase())) continue;
+          claims.add(parsed.claim.trim().toLowerCase());
+          list.push(parsed);
+          added++;
+        }
+        if (added > 0) {
+          goal.scratchpad['goal/assumptions'] = list;
+          try { await this.persistLearning(goal); } catch (err) {
+            if (previous === undefined) delete goal.scratchpad['goal/assumptions']; else goal.scratchpad['goal/assumptions'] = previous;
+            throw err;
+          }
+          this.statsWeek(now).assumptions += added;
+          this.learningStatsChanged();
+        }
+        return { success: true, assumptions: structuredClone(list) };
+      });
+    });
+
+    this.on('updateAssumption', async msg => {
+      if (!await this.isBuiltInCaller(msg.routing.from, ['ScrumMaster'])) throw new Error('Assumptions are settled by ScrumMaster');
+      const { goalId, id, status, answer, wanted } = msg.payload as { goalId: GoalId; id: string; status: string; answer?: unknown; wanted?: unknown };
+      requireNonEmpty(goalId, 'goalId');
+      requireNonEmpty(id, 'id');
+      if (!(ASSUMPTION_STATUSES as readonly string[]).includes(status)) return { success: false, error: `status must be one of ${ASSUMPTION_STATUSES.join(', ')}` };
+      return withKeyedLock(`${this.id}:assumptions:${goalId}`, async () => {
+        const goal = this.goals.get(goalId);
+        if (!goal) return { success: false, error: 'Unknown goal' };
+        const previous = goal.scratchpad['goal/assumptions'];
+        const list = this.assumptionsOf(goal).map(a => ({ ...a }));
+        const index = list.findIndex(a => a.id === id);
+        if (index === -1) return { success: false, error: `No assumption ${id} on this goal` };
+        const before = list[index];
+        const next: Assumption = { ...before, status: status as AssumptionStatus };
+        if (typeof answer === 'string' && answer.trim()) next.answer = answer.trim().slice(0, 1000);
+        if (typeof wanted === 'string' && wanted.trim()) next.wanted = wanted.trim().slice(0, 500);
+        if (SETTLED_ASSUMPTION.includes(next.status)) next.resolvedAt ??= Date.now();
+        else delete next.resolvedAt;
+        list[index] = next;
+        goal.scratchpad['goal/assumptions'] = list;
+        try { await this.persistLearning(goal); } catch (err) { goal.scratchpad['goal/assumptions'] = previous; throw err; }
+        if (before.status !== next.status) this.countAssumptionStatus(next.status);
+        this.changed('assumptionResolved', { goalId, assumption: structuredClone(next) });
+        return { success: true, assumption: structuredClone(next) };
+      });
+    });
+
+    this.on('getAssumptions', async msg => {
+      const { goalId } = msg.payload as { goalId: GoalId };
+      requireNonEmpty(goalId, 'goalId');
+      const goal = this.goals.get(goalId) ?? await this.readRetainedGoal(goalId).catch(() => null);
+      return goal ? structuredClone(this.assumptionsOf(goal)) : [];
+    });
+
+    this.on('recordReaction', async msg => {
+      if (!await this.isBuiltInCaller(msg.routing.from, ['Chat', 'ScrumMaster'])) throw new Error('Reactions are recorded by Chat or ScrumMaster');
+      const p = msg.payload as { goalId: GoalId; kind: unknown; text: unknown; wanted?: unknown; source: unknown };
+      requireNonEmpty(p.goalId, 'goalId');
+      const kind = reactionKindOf(p.kind);
+      if (!kind) return { success: false, error: 'kind must be satisfied, correction, redirect, unhappy or neutral' };
+      if (typeof p.text !== 'string' || !p.text.trim()) return { success: false, error: 'A reaction needs the person\'s words' };
+      if (p.source !== 'chat' && p.source !== 'interjection') return { success: false, error: 'source must be chat or interjection' };
+      const reaction: Reaction = {
+        kind, text: p.text.trim().slice(0, 2000), source: p.source, at: Date.now(),
+        ...(typeof p.wanted === 'string' && p.wanted.trim() ? { wanted: p.wanted.trim().slice(0, 1000) } : {}),
+      };
+      const goal = this.goals.get(p.goalId) ?? await this.restoreForReview(p.goalId);
+      if (!goal) return { success: false, error: 'Unknown goal' };
+      return withKeyedLock(`${this.id}:reactions:${goal.id}`, async () => {
+        const existing = Object.entries(goal.scratchpad).filter(([key]) => key.startsWith('learning/reaction/'));
+        // A retried delivery of the same reaction is acknowledged once.
+        if (existing.some(([, r]) => (r as Reaction).kind === reaction.kind && (r as Reaction).text === reaction.text && (r as Reaction).source === reaction.source)) {
+          return { success: true, duplicate: true };
+        }
+        const n = existing.reduce((max, [key]) => Math.max(max, Number(key.slice('learning/reaction/'.length)) || 0), 0) + 1;
+        const key = `learning/reaction/${n}`;
+        const negative = isNegativeReaction(kind);
+        const previousReview = goal.scratchpad['learning/reactionReview'];
+        goal.scratchpad[key] = reaction;
+        if (negative) goal.scratchpad['learning/reactionReview'] = 'pending';
+        try { await this.persistLearning(goal); } catch (err) {
+          delete goal.scratchpad[key];
+          if (previousReview === undefined) delete goal.scratchpad['learning/reactionReview']; else goal.scratchpad['learning/reactionReview'] = previousReview;
+          throw err;
+        }
+        await this.refreshColdCopy(goal);
+        this.statsWeek(reaction.at).reactions[kind]++;
+        this.learningStatsChanged();
+        if (negative) this.changed('goalReaction', { goalId: goal.id, kind, negative: true });
+        return { success: true };
+      });
+    });
+
+    this.on('pendingReactionReviews', async () => [...this.goals.values()]
+      .filter(g => g.scratchpad['learning/reactionReview'] === 'pending')
+      .map(g => ({
+        goalId: g.id,
+        reactions: Object.entries(g.scratchpad).filter(([key, r]) => key.startsWith('learning/reaction/') && isNegativeReaction((r as Reaction).kind)).map(([, r]) => structuredClone(r)),
+      })));
+
     this.on('getLearningEffect', async msg => {
       const p = msg.payload as { goalId: string; decisionId: string; effectId: string; requester: string };
       if (msg.routing.from !== await this.discoverDep('KnowledgeBase') || p.requester !== await this.discoverDep('TaskReviewer')) throw new Error('Learning effects must be delivered by TaskReviewer to KnowledgeBase');
@@ -2205,6 +2728,53 @@ reviews results and either plans another round or completes/fails the goal.
     }
   }
 
+  /** The assumptions a goal stated, as stored at `goal/assumptions`. */
+  private assumptionsOf(goal: Goal): Assumption[] {
+    const stored = goal.scratchpad['goal/assumptions'];
+    return Array.isArray(stored) ? stored.filter((a): a is Assumption => !!a && typeof a === 'object' && typeof (a as Assumption).id === 'string') : [];
+  }
+
+  /** The index parseAssumption takes so the next id follows the highest one held (A1 is index 0). */
+  private nextAssumptionIndex(list: Assumption[]): number {
+    return list.reduce((max, a) => Math.max(max, Number(a.id.slice(1)) || 0), 0);
+  }
+
+  /**
+   * Bring a finished goal that is no longer in memory back for a reaction
+   * review: from the cold archive, or from its learning checkpoint. It comes
+   * back with its status and history as they were; it stays out of the live
+   * goal list and the shared catalog (a cold goal still lists from the cold
+   * index), and a pending reaction review keeps it from being swept or
+   * archived until the reviewer acknowledges it.
+   */
+  private async restoreForReview(goalId: GoalId): Promise<Goal | undefined> {
+    return withKeyedLock(`${this.id}:restore:${goalId}`, async () => {
+      const live = this.goals.get(goalId);
+      if (live) return live;
+      const retained = await this.readRetainedGoal(goalId).catch(() => null);
+      if (!retained) return undefined;
+      const { coldTasks: _tasks, cold: _cold, ...rest } = retained as Goal & { coldTasks?: unknown; cold?: unknown };
+      const goal: Goal = {
+        ...rest,
+        description: rest.description ?? rest.title,
+        progress: rest.progress ?? [], childIds: rest.childIds ?? [], interjections: rest.interjections ?? [],
+        currentScrumNumber: rest.currentScrumNumber ?? 0, scratchpad: { ...(rest.scratchpad ?? {}) },
+      };
+      this.goals.set(goalId, goal);
+      log.info(`brought goal ${goalId.slice(0, 8)} back for a reaction review`);
+      return goal;
+    });
+  }
+
+  /** Keep a cold-archived goal's stored copy in step with learning recorded after it was archived. */
+  private async refreshColdCopy(goal: Goal): Promise<void> {
+    if (!this.storageId || !this.coldIndex.has(goal.id)) return;
+    const cold = await this.readColdGoal(goal.id);
+    if (!cold) return;
+    await this.request(request(this.id, this.storageId, 'set', { key: coldGoalKey(goal.id), value: { ...cold, scratchpad: structuredClone(goal.scratchpad) } }))
+      .catch(err => log.warn(`cold copy of goal ${goal.id.slice(0, 8)} not refreshed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
   /** Read retained evidence without re-registering or scheduling the old goal. */
   private async readRetainedGoal(goalId: string): Promise<Goal | null> {
     const live = this.goals.get(goalId);
@@ -2278,7 +2848,10 @@ reviews results and either plans another round or completes/fails the goal.
         if (previous && (p.expectedRevision !== (previous.revision ?? 1) || !p.evidenceRefs?.length)) return { success: false, conflict: true, error: 'Assessment differs; explicitly revise the current assessment with evidence references', assessment: previous };
         if (p.evidenceRefs?.some(ref => !/^learning\/(task|observation|assessment)\//.test(ref) || !(ref in goal.scratchpad))) return { success: false, error: 'Assessment evidence reference unavailable' };
         const attribution = attributionOf((msg.payload as { attribution?: unknown }).attribution);
-        const assessment = { taskId, step, verdict, explanation, origin: 'reviewer', at: Date.now(), revision: (previous?.revision ?? (previous ? 1 : 0)) + 1,
+        // The agreement rule: the automated judge was unsure but leaned the
+        // agent's way, so the verdict stands on both readings together.
+        const origin = (msg.payload as { origin?: unknown }).origin === 'agreement' ? 'agreement' : 'reviewer';
+        const assessment = { taskId, step, verdict, explanation, origin, at: Date.now(), revision: (previous?.revision ?? (previous ? 1 : 0)) + 1,
           ...(attribution ? { attribution } : {}),
           evidenceRefs: p.evidenceRefs ?? [], history: previous ? [...(previous.history ?? []), { ...previous, history: undefined }] : [] };
         goal.scratchpad[key] = assessment;
@@ -2304,6 +2877,9 @@ reviews results and either plans another round or completes/fails the goal.
           for (const d of reconsiderations) delete goal.scratchpad[`learning/decision/${d.id}`];
           throw err;
         }
+        const meta = this.predictionMeta(goal, taskId, step);
+        if (previous) this.countAssessment({ verdict: String(previous.verdict), at: Number(previous.at) || assessment.at, attribution: previous.attribution }, meta, -1);
+        this.countAssessment(assessment, meta, 1);
         return { success: true, assessment };
       });
     });
@@ -2326,6 +2902,20 @@ reviews results and either plans another round or completes/fails the goal.
         recorded.actual = `${full.slice(0, OBSERVATION_INLINE_CAP / 2)}\n[... ${full.length} chars in all; readGoalData on this key returns the whole result ...]\n${full.slice(-OBSERVATION_INLINE_CAP / 4)}`;
         recorded.actualHash = reference.hash;
         recorded.actualChars = full.length;
+      }
+      // A stated prediction counts once toward the learning curve: the
+      // pre-action record (kind 'prediction') when the agent sent one, else
+      // the record of the step's result. The result record carries the
+      // pre-action record's confidence, context and occurrence along.
+      const step = recorded.step, taskId = recorded.taskId;
+      const stepped = typeof step === 'number' && typeof taskId === 'string';
+      const preAction = stepped && recorded.kind !== 'prediction'
+        ? goal.scratchpad[`learning/observation/${taskId}:${step}:prediction`] as Record<string, unknown> | undefined
+        : undefined;
+      if (preAction) {
+        for (const field of ['confidence', 'contextKey', 'occurrence']) if (recorded[field] === undefined && preAction[field] !== undefined) recorded[field] = preAction[field];
+      } else if (recorded.kind === 'prediction' || (stepped && recorded.kind === undefined && 'expect' in recorded)) {
+        this.countPrediction(recorded);
       }
       goal.scratchpad[key] = recorded;
       goal.lastMeaningfulProgressAt=Date.now();
@@ -2368,9 +2958,17 @@ reviews results and either plans another round or completes/fails the goal.
       .filter(g => g.scratchpad['learning/review'] === 'pending')
       .map(g => ({ goalId: g.id, outcome: g.error ? 'failed' : 'completed', detail: g.error })));
     this.on('ackReview', async (msg: AbjectMessage) => {
-      const { goalId, report } = msg.payload as { goalId: string; report?: { status?: string } };
+      const { goalId, report, reaction } = msg.payload as { goalId: string; report?: { status?: string }; reaction?: boolean };
       const goal = this.goals.get(goalId);
       if (!goal) return { success: false };
+      if (reaction === true) {
+        // The review of the person's reaction, separate from the retrospective.
+        goal.scratchpad['learning/reactionReview'] = 'done';
+        if (report) goal.scratchpad['learning/reactionOutcome'] = structuredClone(report);
+        await this.persistLearning(goal);
+        await this.refreshColdCopy(goal);
+        return { success: true };
+      }
       goal.scratchpad['learning/review'] = report?.status === 'partial' ? 'partial' : 'reviewed';
       if (report) goal.scratchpad['learning/reviewOutcome'] = structuredClone(report);
       await this.persistLearning(goal);
@@ -2583,6 +3181,7 @@ reviews results and either plans another round or completes/fails the goal.
       goal.updatedAt = Date.now();
 
       goal.scratchpad['learning/review'] = 'pending';
+      this.countFinishedGoal();
       await this.persistLearning(goal);
       log.info(`Goal completed: "${goal.title}" (${goalId})`);
       this.changed('goalCompleted', { goalId, result });
@@ -2702,6 +3301,7 @@ reviews results and either plans another round or completes/fails the goal.
 
       log.info(`Goal stopped by user: "${goal.title}" (${goalId}) — ${cancelled} tasks cancelled`);
       goal.scratchpad['learning/review'] = 'deferred:user-stop';
+      this.countFinishedGoal();
       for (const [key,value] of Object.entries(goal.scratchpad)) if (key.startsWith('learning/decision/')) {
         const decision = value as LearningDecision; decision.paused = true;
         for (const e of decision.effects) if (!['applied','abandoned'].includes(e.state)) { e.state = 'waiting'; e.error = 'Goal stopped; explicit learning resumption required'; }
@@ -3057,6 +3657,7 @@ reviews results and either plans another round or completes/fails the goal.
       await this.sweepGoals();
       let active = 0, paused = 0, completed = 0, failed = 0, archived = 0;
       for (const [, goal] of this.goals) {
+        if (this.coldIndex.has(goal.id)) continue; // brought back for a review; counted as archived below
         switch (goal.status) {
           case 'active': active++; break;
           case 'paused': paused++; break;
@@ -3066,7 +3667,7 @@ reviews results and either plans another round or completes/fails the goal.
         }
       }
       archived += this.coldIndex.size;
-      return { active, paused, completed, failed, archived, total: this.goals.size + this.coldIndex.size };
+      return { active, paused, completed, failed, archived, total: [...this.goals.keys()].filter(id => !this.coldIndex.has(id)).length + this.coldIndex.size };
     });
 
     // ── Task convenience methods (delegate to TupleSpace) ──
@@ -3313,8 +3914,9 @@ reviews results and either plans another round or completes/fails the goal.
     this.on('getTasksForGoal', async (msg: AbjectMessage) => {
       const { goalId, status } = msg.payload as { goalId: string; status?: string };
       requireNonEmpty(goalId, 'goalId');
-      // An archived goal's tasks were kept in its cold record.
-      if (!this.goals.has(goalId) && this.coldIndex.has(goalId)) {
+      // An archived goal's tasks were kept in its cold record (also while it
+      // is back in memory for a reaction review: its task queue is gone).
+      if (this.coldIndex.has(goalId)) {
         const cold = await this.readColdGoal(goalId) as (Goal & { coldTasks?: Array<{ fields: Record<string, unknown> }> }) | null;
         return (cold?.coldTasks ?? []).filter(t => !status || t.fields?.status === status);
       }
@@ -3405,6 +4007,7 @@ reviews results and either plans another round or completes/fails the goal.
       requireNonEmpty(key, 'key');
       if (key === CONVERSATION_CONTEXT_KEY || key.startsWith('context/imports/')) throw new Error('Conversation context is managed by GoalManager');
       if (/^learning\/(decision|assessment)\//.test(key)) throw new Error('Use the reviewer-owned learning protocol for decisions and assessments');
+      if (key === 'goal/assumptions' || /^learning\/(reaction\/|reactionReview$)/.test(key)) throw new Error('Assumptions and reactions are recorded with recordAssumptions, updateAssumption and recordReaction');
       const goal = this.goals.get(goalId);
       if (!goal) return { success: false };
       goal.scratchpad[key] = value;

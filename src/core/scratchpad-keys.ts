@@ -10,7 +10,7 @@
  */
 
 /** Prefixes of keys the runtime writes about the work, not as its results. */
-export const INTERNAL_SCRATCHPAD_PREFIXES = ['learning/', 'routing/', 'context/', 'scrum/'] as const;
+export const INTERNAL_SCRATCHPAD_PREFIXES = ['learning/', 'routing/', 'context/', 'scrum/', 'goal/assumptions'] as const;
 
 /** True for a key that records how the work went rather than what it found. */
 export function isInternalScratchpadKey(key: string): boolean {

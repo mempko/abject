@@ -56,6 +56,11 @@ import { choiceOf, noulOf, scoreOf, topLevel, type DecisionQuestion } from '../l
 import { declaredPatterns, planPatternIds } from '../core/plan-patterns.js';
 import { runtimeFault } from '../core/runtime-fault.js';
 import { isInternalScratchpadKey } from '../core/scratchpad-keys.js';
+import {
+  needsAsking, needsCheck, QUESTION_BUDGET, CHECK_TASKS_PER_GOAL, MAX_ASSUMPTIONS_PER_GOAL,
+  type Assumption, type AssumptionStatus,
+} from '../core/surprise.js';
+import type { EntryEvidence } from '../core/learning.js';
 
 const log = new Log('ScrumMaster');
 
@@ -63,6 +68,70 @@ const SCRUM_MASTER_INTERFACE: InterfaceId = 'abjects:scrum-master';
 
 /** Scratchpad key where a completed sprint's working plan is recorded on the goal. */
 const SCRUM_PLAN_KEY = 'scrum/plan';
+
+/** Scratchpad key counting the questions a goal has put to the person, by phase. */
+const SCRUM_QUESTIONS_KEY = 'scrum/questions';
+
+/** GoalManager's scratchpad key for a goal's stated assumptions (read only as a fallback). */
+const GOAL_ASSUMPTIONS_KEY = 'goal/assumptions';
+
+/** Statuses `resolve_assumption` may set. */
+const RESOLVABLE_STATUSES: readonly AssumptionStatus[] = ['held', 'missed', 'confirmed', 'corrected'];
+
+/**
+ * A knowledge entry's evidence as the planner reads it: how often the claim
+ * held when tested, and whether misses have overtaken it.
+ */
+function evidenceNote(e: EntryEvidence | undefined): string | undefined {
+  if (!e || typeof e !== 'object') return undefined;
+  const held = Number(e.held) || 0;
+  const tested = held + (Number(e.missed) || 0);
+  const base = tested === 0 ? 'untested' : `held ${held} of ${tested}`;
+  return e.flagged ? `${base}, flagged: misses outnumber holds` : base;
+}
+
+/** Recalled entries with their evidence compacted for the planner. */
+function withEvidenceNotes<T extends { evidence?: EntryEvidence | string }>(entries: T[]): T[] {
+  return entries.map(e => {
+    if (!e.evidence || typeof e.evidence === 'string') return e;
+    const note = evidenceNote(e.evidence);
+    return note ? { ...e, evidence: note } : e;
+  });
+}
+
+/** A claim read as a clause after "I'll assume": no trailing stop, lower-case lead unless it is an acronym or a name. */
+function asClause(claim: string): string {
+  const text = claim.trim().replace(/[.!?\s]+$/, '');
+  return /^[A-Z][a-z]/.test(text) && !/^I\b/.test(text) ? text[0].toLowerCase() + text.slice(1) : text;
+}
+
+/**
+ * One question that puts every assumption needing the person's word to them,
+ * with the system's guess as the default, and tappable answers that offer the
+ * guess first.
+ */
+function assumptionQuestion(toAsk: Assumption[], atStart: boolean): { question: string; choices: string[] } {
+  precondition(toAsk.length > 0, 'an assumption question needs assumptions to ask about');
+  const lead = atStart ? 'Before I start' : 'Before I go on';
+  if (toAsk.length === 1) {
+    const claim = toAsk[0].claim.trim().replace(/[.!?\s]+$/, '');
+    const first = claim.length <= 60 ? claim[0].toUpperCase() + claim.slice(1) : 'Yes, go with that';
+    return {
+      question: `${lead}: I'll assume ${asClause(claim)} unless you say otherwise. Is that right?`,
+      choices: [first, 'No, something else'],
+    };
+  }
+  return {
+    question: `${lead}, here is what I'll assume unless you say otherwise:\n${toAsk.map(a => `- ${a.claim.trim()}`).join('\n')}\nTell me anything that's off.`,
+    choices: ['Yes, go with all of that', 'Some of it is off'],
+  };
+}
+
+/** Whitespace- and case-insensitive containment, for folding a planner's question into the assumption question. */
+function containsText(haystack: string, needle: string): boolean {
+  const norm = (t: string) => t.replace(/\s+/g, ' ').trim().toLowerCase();
+  return norm(haystack).includes(norm(needle));
+}
 
 /** A single team-member contribution returned by a poll_team ask. */
 interface TeamContribution {
@@ -87,10 +156,14 @@ interface WovenForPlanning {
  * The dispatch data a task carries to its agent, or nothing when it has none.
  * `maxSteps` is the planner's sizing; the agent clamps it to its own range.
  */
-function taskData(target?: string, patterns?: Array<{ id: string; why: string }>, maxSteps?: number): Record<string, unknown> | undefined {
+function taskData(target?: string, patterns?: Array<{ id: string; why: string }>, maxSteps?: number, check?: boolean): Record<string, unknown> | undefined {
   const sized = typeof maxSteps === 'number' && Number.isFinite(maxSteps);
-  if (!target && !patterns?.length && !sized) return undefined;
-  return { ...(target ? { target } : {}), ...(patterns?.length ? { patterns } : {}), ...(sized ? { maxSteps } : {}) };
+  if (!target && !patterns?.length && !sized && !check) return undefined;
+  return {
+    ...(target ? { target } : {}), ...(patterns?.length ? { patterns } : {}), ...(sized ? { maxSteps } : {}),
+    // A read-only check task: the agent refuses anything but reads.
+    ...(check ? { check: true } : {}),
+  };
 }
 
 interface StagedTask {
@@ -141,6 +214,13 @@ interface StagedTask {
    * signed in with the item still in it.
    */
   profile?: string;
+  /**
+   * A read-only check task: a cheap step that tests a belief about the world
+   * before the work that relies on it. The agent runs it read only.
+   */
+  check?: boolean;
+  /** The assumption id (`A2`) the check tests, when it tests a stated one. */
+  checks?: string;
 }
 
 function compactLine(value: unknown, max = 220): string {
@@ -155,6 +235,7 @@ export class ScrumMaster extends Abject {
   /** Every action the scrum loop dispatches; feeds the per-step reminder. */
   private static readonly ACTIONS = [
     'review_scrum', 'poll_team', 'add_task', 'save_knowledge', 'lookup_knowledge', 'forget_knowledge',
+    'state_assumptions', 'resolve_assumption',
     'complete_goal', 'fail_goal', 'dispatch_scrum', 'quick_dispatch', 'continue_scrum', 'ask_user',
   ];
 
@@ -251,7 +332,18 @@ export class ScrumMaster extends Abject {
     patterns?: Array<{ id: string; why: string }>;
     /** Planner-sized step budget, delivered with it. */
     maxSteps?: number;
+    /** A read-only check task, delivered as such. */
+    check?: boolean;
   }>();
+
+  /**
+   * Answers already judged against a goal's asked assumptions, keyed by goal
+   * and the question's timestamp, so a retried scrum does not judge the same
+   * reply twice.
+   */
+  private judgedAnswers = new Set<string>();
+  /** Interjections already recorded as redirect reactions, keyed by goal and note time. */
+  private reactedNotes = new Set<string>();
   /**
    * Selection receipts (patternRef) of the patterns each goal's planning was
    * shown, so a plan's declaration records the version the planner read.
@@ -279,6 +371,13 @@ export class ScrumMaster extends Abject {
      */
     interjectionsUpTo?: number;
     planRevision?: number;
+    /**
+     * Assumptions this scrum stated that want the person's word before work
+     * starts. A dispatch in the same scrum is turned back once with a nudge
+     * to ask first; a second dispatch goes ahead, and the assumptions are
+     * then acted on and named in the result.
+     */
+    askFirst?: string[];
   }>();
 
   /**
@@ -420,7 +519,7 @@ export class ScrumMaster extends Abject {
             fail_goal: { type: 'error', resultFields: ['reason'] },
             dispatch_scrum: { type: 'success', execute: true },
             continue_scrum: { type: 'success' },
-            ask_user: { type: 'success', resultFields: ['question'], ownContentRequired: true },
+            ask_user: { type: 'success', execute: true, resultFields: ['question'], ownContentRequired: true },
           },
           intermediateActions: [],
           actions: ScrumMaster.ACTIONS,
@@ -452,7 +551,7 @@ export class ScrumMaster extends Abject {
     });
     this.on('restoreTask', msg => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore Scrum state');
-      const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: { inflight?: { goalId: string; staged: StagedTask[]; planRevision?: number; interjectionsUpTo?: number } } };
+      const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: { inflight?: { goalId: string; staged: StagedTask[]; planRevision?: number; interjectionsUpTo?: number; askFirst?: string[] } } };
       if (snapshot?.inflight) this.scrumInFlight.set(taskId, structuredClone(snapshot.inflight));
       return { success: true };
     });
@@ -587,7 +686,7 @@ export class ScrumMaster extends Abject {
                 dispatch_scrum: { type: 'success', execute: true },
                 quick_dispatch: { type: 'success' },
                 continue_scrum: { type: 'success' },
-                ask_user: { type: 'success', resultFields: ['question'], ownContentRequired: true },
+                ask_user: { type: 'success', execute: true, resultFields: ['question'], ownContentRequired: true },
               },
               actions: ScrumMaster.ACTIONS,
             },
@@ -655,8 +754,10 @@ export class ScrumMaster extends Abject {
           const goal = await this.request<{ status?: string; scratchpad?: Record<string, unknown> } | null>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
           // A durable result can outlive its goal. Acknowledge it without replaying effects.
           if (!goal || ['completed', 'failed', 'archived'].includes(goal.status ?? '')) { obsolete = true; return; }
-          if (goal.status === 'paused') throw new Error('Goal is paused; defer the scrum result until resumed');
+          // A committed receipt is acknowledged even on a paused goal: an
+          // executed ask_user is what paused it, and its scrum has finished.
           const receipt = goal?.scratchpad?.[`learning/commit/${payload.ticketId}`] as { outcome?: string; error?: string } | undefined;
+          if (!receipt && goal.status === 'paused') throw new Error('Goal is paused; defer the scrum result until resumed');
           if (receipt) {
             if (receipt.outcome === 'replanned') {
               payload.success = false;
@@ -1051,6 +1152,12 @@ export class ScrumMaster extends Abject {
       // fast path to a single think (quick_dispatch) and saves a think on
       // every scrum's first round.
       const goalId = await this.lookupGoalIdForOTATask(taskId);
+      // The person may have just answered the goal's assumption question:
+      // judge the answer first, so the snapshot shows where each one stands.
+      if (goalId) {
+        await this.judgeAssumptionAnswers(goalId).catch(err =>
+          log.warn(`assumption answers for ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`));
+      }
       const snap = goalId ? await this.buildReviewSnapshot(goalId) : { error: 'goal not resolved yet' };
       if ('data' in snap) {
         // Record which interjections this scrum saw, so the commit marks
@@ -1134,7 +1241,21 @@ export class ScrumMaster extends Abject {
           return await this.actLookupKnowledge(action, await this.knowledgeScopeForGoal(goalId));
         case 'forget_knowledge':
           return await this.actForgetKnowledge(action);
-        case 'dispatch_scrum':
+        case 'state_assumptions':
+          return await this.actStateAssumptions(taskId, goalId, action);
+        case 'resolve_assumption':
+          return await this.actResolveAssumption(goalId, action);
+        case 'ask_user':
+        case 'dispatch_scrum': {
+          // A question past the goal's budget goes back to the planner as
+          // its answer: proceed on the best reading and name the assumption.
+          if (action.action === 'ask_user') {
+            const refusal = await this.questionBudgetRefusal(goalId);
+            if (refusal) return { success: false, error: refusal };
+          } else {
+            const nudge = await this.askFirstNudge(taskId, goalId);
+            if (nudge) return { success: false, error: nudge };
+          }
           await withKeyedLock(`${this.id}:scrum-commit`, async () => {
             const goal = await this.request<{ scratchpad?: Record<string, unknown> }>(request(this.id, this.goalManagerId!, 'getGoal', { goalId }));
             if (goal?.scratchpad?.[`learning/commit/${taskId}`]) {
@@ -1144,9 +1265,12 @@ export class ScrumMaster extends Abject {
             await this.executeTerminalAction(taskId, action);
             await this.request(request(this.id, this.goalManagerId!, 'recordScrumCommit', { goalId, operationId: taskId }));
           });
-          return { success: true, data: 'Scrum dispatch accepted by the goal coordinator.' };
+          return { success: true, data: action.action === 'ask_user'
+            ? 'Question put to the person; the goal waits for their answer.'
+            : 'Scrum dispatch accepted by the goal coordinator.' };
+        }
         default:
-          return { success: false, error: `Unknown action "${action.action}". Valid intermediate: review_scrum, poll_team, add_task, save_knowledge, lookup_knowledge, forget_knowledge. Terminal: complete_goal, fail_goal, dispatch_scrum, quick_dispatch, continue_scrum, ask_user.` };
+          return { success: false, error: `Unknown action "${action.action}". Valid intermediate: review_scrum, poll_team, add_task, save_knowledge, lookup_knowledge, forget_knowledge, state_assumptions, resolve_assumption. Terminal: complete_goal, fail_goal, dispatch_scrum, quick_dispatch, continue_scrum, ask_user.` };
       }
     } catch (err) {
       if (err instanceof ScrumPlanConflict) {
@@ -1264,20 +1388,310 @@ export class ScrumMaster extends Abject {
    * goal and broadcasts the question to every goal subscriber (Chat and
    * terminal clients render it); the user's next message queues as an
    * interjection and resumes the goal into a review scrum that reads it.
+   *
+   * Every stated assumption that wants the person's word rides in the same
+   * question, with the system's guess as the default, so the person is asked
+   * once. Those assumptions are marked `asked`, and the question counts
+   * against the goal's budget.
    */
   private async commitAskUser(goalId: string, action: Record<string, unknown>): Promise<void> {
     if (!this.goalManagerId) return;
-    const question = (action.question as string | undefined)?.trim()
-      || 'The scrum needs a bit more direction — how would you like to proceed?';
-    log.info(`ask_user: goal ${goalId.slice(0, 8)} — "${question.slice(0, 80)}"`);
+    const refusal = await this.questionBudgetRefusal(goalId);
+    if (refusal) {
+      // A replayed decision past the budget: plan on without asking.
+      await this.rerunScrumAfterFailedCommit(goalId, refusal);
+      return;
+    }
+    const goal = await this.request<{ currentScrumNumber?: number; scratchpad?: Record<string, unknown> } | null>(
+      request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000,
+    ).catch(() => null);
+    const atStart = (goal?.currentScrumNumber ?? 0) === 0;
+    const toAsk = (await this.fetchAssumptions(goalId, goal?.scratchpad)).filter(needsAsking);
+
+    const own = (action.question as string | undefined)?.trim() ?? '';
+    let question = own || 'The scrum needs a bit more direction: how would you like to proceed?';
+    let choices = Array.isArray(action.choices) ? action.choices : undefined;
+    if (toAsk.length > 0) {
+      const batched = assumptionQuestion(toAsk, atStart);
+      const coversAll = own && (containsText(own, batched.question) || toAsk.every(a => containsText(own, a.claim.replace(/[.!?\s]+$/, ''))));
+      if (coversAll) {
+        // The planner already put the assumptions in its own words.
+      } else if (!own || containsText(batched.question, own)) {
+        question = batched.question;
+        choices = batched.choices;
+      } else {
+        // The planner's own question leads; the assumptions follow, and a
+        // mixed question is answered in words rather than with a tap.
+        question = `${own}\n\n${batched.question}`;
+        choices = undefined;
+      }
+    }
+
+    log.info(`ask_user: goal ${goalId.slice(0, 8)}: "${question.slice(0, 80)}"${toAsk.length ? ` (with ${toAsk.length} assumption(s))` : ''}`);
     const ok = await this.request<boolean>(
       request(this.id, this.goalManagerId, 'requestClarification', {
-        goalId, question, ...(Array.isArray(action.choices) ? { choices: action.choices } : {}),
+        goalId, question, ...(choices ? { choices } : {}),
       }), 10000,
     ).catch(() => false);
     if (!ok) {
       log.warn(`ask_user for ${goalId.slice(0, 8)} could not pause the goal (already terminal?)`);
+      return;
     }
+    await this.countQuestion(goalId, atStart, goal?.scratchpad);
+    for (const a of toAsk) await this.setAssumptionStatus(goalId, a.id, 'asked');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Assumptions: stated, asked, checked, acted on
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // A plan rests on assumptions about what the person wants and about the
+  // world. Stating them makes a wrong one a measurable surprise: claims
+  // about the person that are guesses (or likely and irreversible) go to
+  // the person in one question, claims about the world worth testing get a
+  // read-only check, and the rest are acted on and named in the result so
+  // the person can correct them. GoalManager keeps them; this object only
+  // decides when to ask, check, or name.
+
+  /** A goal's stated assumptions, from GoalManager (falling back to the goal's scratchpad copy). */
+  private async fetchAssumptions(goalId: string, scratchpad?: Record<string, unknown>): Promise<Assumption[]> {
+    if (!this.goalManagerId) return [];
+    const listed = await this.request<Assumption[] | null>(
+      request(this.id, this.goalManagerId, 'getAssumptions', { goalId }), 10000,
+    ).catch(() => null);
+    const raw = Array.isArray(listed) ? listed : scratchpad?.[GOAL_ASSUMPTIONS_KEY];
+    return Array.isArray(raw) ? raw.filter((a): a is Assumption => !!a && typeof (a as Assumption).id === 'string' && typeof (a as Assumption).claim === 'string') : [];
+  }
+
+  /** Set one assumption's status through GoalManager; the updated assumption, or undefined. */
+  private async setAssumptionStatus(goalId: string, id: string, status: AssumptionStatus, answer?: string, wanted?: string): Promise<Assumption | undefined> {
+    if (!this.goalManagerId) return undefined;
+    const r = await this.request<{ success: boolean; assumption?: Assumption; error?: string }>(
+      request(this.id, this.goalManagerId, 'updateAssumption', {
+        goalId, id, status, ...(answer ? { answer: answer.slice(0, 2000) } : {}), ...(wanted ? { wanted: wanted.slice(0, 2000) } : {}),
+      }), 10000,
+    ).catch(err => ({ success: false, error: err instanceof Error ? err.message : String(err) }) as { success: boolean; assumption?: Assumption; error?: string });
+    if (!r?.success) log.warn(`updateAssumption ${id} → ${status} on ${goalId.slice(0, 8)} failed: ${r?.error ?? 'no reply'}`);
+    return r?.success ? r.assumption : undefined;
+  }
+
+  /** Questions still allowed in the goal's current phase: before its first dispatch, or while it runs. */
+  private questionsLeft(currentScrumNumber: number, scratchpad?: Record<string, unknown>): number {
+    const phase = currentScrumNumber === 0 ? 'atStart' : 'duringGoal';
+    const used = Number((scratchpad?.[SCRUM_QUESTIONS_KEY] as Record<string, unknown> | undefined)?.[phase]) || 0;
+    return Math.max(0, QUESTION_BUDGET[phase] - used);
+  }
+
+  /** Count one question against the goal's budget, in the phase it was asked. */
+  private async countQuestion(goalId: string, atStart: boolean, scratchpad?: Record<string, unknown>): Promise<void> {
+    if (!this.goalManagerId) return;
+    const prior = (scratchpad?.[SCRUM_QUESTIONS_KEY] as { atStart?: number; duringGoal?: number } | undefined) ?? {};
+    const phase = atStart ? 'atStart' : 'duringGoal';
+    const value = { atStart: prior.atStart ?? 0, duringGoal: prior.duringGoal ?? 0 };
+    value[phase] += 1;
+    await this.request(request(this.id, this.goalManagerId, 'writeGoalData', { goalId, key: SCRUM_QUESTIONS_KEY, value }), 10000)
+      .catch(err => log.warn(`question count for ${goalId.slice(0, 8)} not recorded: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  /**
+   * Why an ask_user must not go to the person, or undefined when it may: the
+   * goal has used its question for this phase (one at the start, one more
+   * while it runs). The refusal names the assumptions the planner would have
+   * asked about, so it proceeds on them and the result names them.
+   */
+  private async questionBudgetRefusal(goalId: string): Promise<string | undefined> {
+    if (!this.goalManagerId) return undefined;
+    const goal = await this.request<{ currentScrumNumber?: number; scratchpad?: Record<string, unknown> } | null>(
+      request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000,
+    ).catch(() => null);
+    if (!goal) return undefined;
+    const round = goal.currentScrumNumber ?? 0;
+    if (this.questionsLeft(round, goal.scratchpad) > 0) return undefined;
+    const open = (await this.fetchAssumptions(goalId, goal.scratchpad)).filter(a => a.status === 'open' || a.status === 'asked');
+    const named = open.length
+      ? ` Name the assumption you act on in the result: ${open.slice(0, 4).map(a => `${a.id} ("${a.claim.slice(0, 120)}")`).join(', ')}; open assumptions are named to the person when the goal completes.`
+      : ' State the assumption you act on with state_assumptions, so the result names it to the person.';
+    return `The question budget for this goal is spent (${round === 0 ? 'one question before work starts' : 'one more question while it runs'}). ` +
+      `Proceed on your best reading of what the person wants.${named}`;
+  }
+
+  /**
+   * A dispatch in the scrum that just stated assumptions wanting the
+   * person's word: turned back once with a nudge to ask first. Clears itself,
+   * so a planner that dispatches again goes ahead.
+   */
+  private async askFirstNudge(taskId: string, goalId: string): Promise<string | undefined> {
+    const inflight = this.scrumInFlight.get(taskId);
+    const ids = inflight?.askFirst;
+    if (!inflight || !ids?.length) return undefined;
+    inflight.askFirst = undefined;
+    const stillOpen = (await this.fetchAssumptions(goalId)).filter(a => ids.includes(a.id) && needsAsking(a));
+    if (stillOpen.length === 0 || await this.questionBudgetRefusal(goalId)) return undefined;
+    return `Not dispatched yet: ${stillOpen.map(a => a.id).join(', ')} want the person's word before work starts. ` +
+      'End this scrum with ask_user; the runtime puts them to the person as one question with your guess as the default. ' +
+      'Dispatch again only if the plan holds whatever they answer.';
+  }
+
+  // ─── Action: state_assumptions ─────────────────────────────────────
+
+  private async actStateAssumptions(
+    otaTaskId: string,
+    goalId: string,
+    action: Record<string, unknown>,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    if (!this.goalManagerId) return { success: false, error: 'GoalManager unavailable' };
+    const raw = action.assumptions;
+    if (!Array.isArray(raw) || raw.length === 0) {
+      return { success: false, error: 'state_assumptions requires assumptions: [{ claim, about, confidence, costIfWrong, basis? }]' };
+    }
+    const recorded = await this.request<{ success: boolean; assumptions?: Assumption[]; error?: string }>(
+      request(this.id, this.goalManagerId, 'recordAssumptions', { goalId, assumptions: raw.slice(0, MAX_ASSUMPTIONS_PER_GOAL) }), 10000,
+    );
+    if (!recorded?.success) return { success: false, error: `Assumptions not recorded: ${recorded?.error ?? 'no reply'}` };
+    const all = recorded.assumptions ?? [];
+    const toAsk = all.filter(needsAsking);
+    const toCheck = all.filter(needsCheck);
+    log.info(`state_assumptions: goal ${goalId.slice(0, 8)} → ${all.length} assumption(s), ${toAsk.length} to ask, ${toCheck.length} to check`);
+
+    const next: string[] = [];
+    if (toAsk.length > 0) {
+      const refusal = await this.questionBudgetRefusal(goalId);
+      if (refusal) {
+        next.push(`${toAsk.map(a => a.id).join(', ')} would be worth asking about, but ${refusal.charAt(0).toLowerCase()}${refusal.slice(1)}`);
+      } else {
+        const inflight = this.scrumInFlight.get(otaTaskId);
+        if (inflight) inflight.askFirst = toAsk.map(a => a.id);
+        const goal = await this.request<{ currentScrumNumber?: number } | null>(
+          request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000,
+        ).catch(() => null);
+        const preview = assumptionQuestion(toAsk, (goal?.currentScrumNumber ?? 0) === 0);
+        next.push(
+          `Ask first: ${toAsk.map(a => a.id).join(', ')} want the person's word before work starts. End this scrum with ask_user; ` +
+          `the runtime sends this question (add any other question of your own in \`question\`, or repeat this one): ${JSON.stringify(preview.question)}`,
+        );
+      }
+    }
+    if (toCheck.length > 0) {
+      next.push(
+        `Check first: ${toCheck.map(a => a.id).join(', ')} rest on the world and are worth a cheap read-only check. ` +
+        'Stage add_task with check: true and checks: "<id>", describing what to read and what would confirm or refute the belief; plan the work that relies on it once the finding is in, and settle it with resolve_assumption.',
+      );
+    }
+    const acted = all.filter(a => a.status === 'open' && !needsAsking(a) && !needsCheck(a));
+    if (acted.length > 0) next.push(`Act on ${acted.map(a => a.id).join(', ')}: the result names them to the person, who can correct them.`);
+    return { success: true, data: { assumptions: all, next: next.join(' ') } };
+  }
+
+  // ─── Action: resolve_assumption ────────────────────────────────────
+
+  private async actResolveAssumption(
+    goalId: string,
+    action: Record<string, unknown>,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    const id = typeof action.id === 'string' ? action.id.trim() : '';
+    const status = action.status as AssumptionStatus;
+    const answer = typeof action.answer === 'string' ? action.answer.trim() : '';
+    if (!/^A\d+$/.test(id)) return { success: false, error: 'resolve_assumption requires id, an assumption id such as "A2"' };
+    if (!RESOLVABLE_STATUSES.includes(status)) return { success: false, error: `resolve_assumption status is one of ${RESOLVABLE_STATUSES.join(', ')}` };
+    if ((status === 'missed' || status === 'corrected') && !answer) {
+      return { success: false, error: `resolve_assumption with status ${status} needs answer: what the check found, or what the person wants` };
+    }
+    const updated = await this.setAssumptionStatus(goalId, id, status, answer || undefined, status === 'corrected' ? answer : undefined);
+    if (!updated) return { success: false, error: `Assumption ${id} could not be updated (unknown id?)` };
+    log.info(`resolve_assumption: goal ${goalId.slice(0, 8)} ${id} → ${status}`);
+    const note = status === 'missed'
+      ? `The check found ${id} no longer holds ("${updated.claim.slice(0, 160)}"). Plan on what it found; the result tells the person the belief did not hold.`
+      : status === 'corrected'
+        ? `${id} was corrected: plan on what the person wants (${answer.slice(0, 200)}).`
+        : `${id} ${status}.`;
+    return { success: true, data: { assumption: updated, note } };
+  }
+
+  /**
+   * Judge the person's reply against the assumptions the goal asked about
+   * (site goal.assumption): confirmed, corrected, or left unanswered. A
+   * confident reading settles each one; anything else leaves it `asked` for
+   * the planner to settle with resolve_assumption, the reply in view.
+   */
+  private async judgeAssumptionAnswers(goalId: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    const goal = await this.request<{
+      scratchpad?: Record<string, unknown>;
+      interjections?: Array<{ note: string; at: number; status: string }>;
+      pendingQuestion?: { question: string; at: number };
+    } | null>(request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000).catch(() => null);
+    const asked = goal?.pendingQuestion;
+    if (!goal || !asked) return;
+    const key = `${goalId}:${asked.at}`;
+    if (this.judgedAnswers.has(key)) return;
+    const pending = (goal.interjections ?? []).filter(i => i.status === 'pending');
+    const replies = pending.filter(i => i.at >= asked.at);
+    const answer = (replies.length ? replies : pending).map(i => i.note).join('\n').trim();
+    if (!answer) return;
+    const open = (await this.fetchAssumptions(goalId, goal.scratchpad)).filter(a => a.status === 'asked');
+    if (open.length === 0) return;
+    this.judgedAnswers.add(key);
+    while (this.judgedAnswers.size > 500) this.judgedAnswers.delete(this.judgedAnswers.keys().next().value!);
+
+    const questions: Record<string, DecisionQuestion> = {};
+    for (const a of open) {
+      questions[a.id] = {
+        type: 'choice',
+        instructions: instruction(`What does \`answer\` say about assumption ${a.id} in \`assumptions\`?`, {
+          focus: 'The person\'s words read against that one claim, beside `question`, which offered the claim as the default. A plain yes to the question ("yes", "sure", "go ahead", the first offered choice) accepts every claim it listed.',
+          notFor: 'Whether the claim is a good idea; only what the person said about it.',
+        }),
+        criteria: {
+          confirmed: criterion('The answer accepts this claim, outright or by approving the listed defaults as a whole.', {
+            examples: ['yes', 'sounds good, go ahead', 'that\'s right'],
+          }),
+          corrected: criterion('The answer changes or rejects this claim, or says what the person wants instead.', {
+            notFor: 'A change to a different claim in the list while this one is left alone.',
+            examples: ['no, make it weekly', 'not the shared doc, my own one'],
+          }),
+          unanswered: criterion('The answer is about something else, or settles other claims and leaves this one open.', {
+            notFor: 'A blanket yes to the listed defaults.',
+          }),
+        },
+      };
+    }
+    const outcome = await this.askDecision('goal.assumption', {
+      question: asked.question.slice(0, 2000),
+      answer: answer.slice(0, 2000),
+      assumptions: open.map(a => ({ id: a.id, claim: a.claim, about: a.about })),
+    }, questions, { goalId, onBehalfOf: 'ScrumMaster' });
+    if (!outcome) return;
+    for (const a of open) {
+      const verdict = choiceOf(outcome, a.id);
+      if (!verdict) continue;
+      const p = verdict.probabilities[verdict.choice] ?? 0;
+      log.info(`[decision:${outcome.mode}] goal.assumption ${goalId.slice(0, 8)} ${a.id}: ${verdict.choice}@${p.toFixed(2)}`);
+      if (outcome.mode !== 'act' || p < 0.7) continue;
+      if (verdict.choice === 'confirmed') await this.setAssumptionStatus(goalId, a.id, 'confirmed', answer);
+      else if (verdict.choice === 'corrected') await this.setAssumptionStatus(goalId, a.id, 'corrected', answer, answer);
+    }
+  }
+
+  /**
+   * At completion: assumptions still open were acted on without asking, so
+   * mark them `acted` and name them in one short line under the result, with
+   * any belief a check found no longer held. Empty when there are none.
+   */
+  private async closeAssumptions(goalId: string): Promise<string> {
+    const all = await this.fetchAssumptions(goalId);
+    if (all.length === 0) return '';
+    const open = all.filter(a => a.status === 'open');
+    for (const a of open) await this.setAssumptionStatus(goalId, a.id, 'acted');
+    const clip = (t: string, n: number) => { const s = t.trim().replace(/[.!?\s]+$/, ''); return s.length > n ? `${s.slice(0, n - 3)}...` : s; };
+    const lines: string[] = [];
+    const missed = all.filter(a => a.status === 'missed');
+    if (missed.length > 0) {
+      lines.push(`Checked first: ${missed.slice(0, 2).map(a => `${clip(a.claim, 120)} did not hold${a.answer ? ` (${clip(a.answer, 120)})` : ''}`).join('; ')}.`);
+    }
+    if (open.length > 0) {
+      lines.push(`Assumed: ${open.slice(0, 3).map(a => clip(a.claim, 140)).join('; ')}${open.length > 3 ? `; and ${open.length - 3} more` : ''}. Tell me if any of that is off.`);
+    }
+    return lines.join('\n');
   }
 
   /**
@@ -1376,6 +1790,7 @@ export class ScrumMaster extends Abject {
     const scratchpadSummary: Record<string, string> = {};
     for (const [k, v] of Object.entries(scratchpad)) {
       if (k === 'context/conversation') continue; // supplied as a bounded, referenceable briefing below
+      if (k === GOAL_ASSUMPTIONS_KEY) continue; // shown as `assumptions` below
       scratchpadSummary[k] = safeStringify(v, 6000);
     }
     const conversationContext = scratchpad['context/conversation']
@@ -1398,7 +1813,9 @@ export class ScrumMaster extends Abject {
       this.recallKnowledge(goal.description, 5, knowledgeScope),
       this.weavePatterns(evolvingContext, 3, knowledgeScope, planPatternIds(planHistory.at(-1)?.plan), goalId),
     ]);
-    const relevantKnowledge = recalled.filter(e => e.type !== 'pattern');
+    const relevantKnowledge = withEvidenceNotes(recalled.filter(e => e.type !== 'pattern'));
+    const assumptions = await this.fetchAssumptions(goalId, scratchpad);
+    const questionsLeft = this.questionsLeft(goal.currentScrumNumber ?? 0, scratchpad);
 
     // Loop backstop: many rounds with accumulating failures is the signature of
     // retrying the same fix. Surface it deterministically so the planner weighs
@@ -1466,6 +1883,15 @@ export class ScrumMaster extends Abject {
         recentPlans: planHistory.slice(-3),
         team: teamRoster,
         ...(quickDispatchAvailable ? { quickDispatchAvailable: true } : {}),
+        // What the goal stated it takes for granted, and where each stands.
+        ...(assumptions.length > 0 ? { assumptions: assumptions.map(a => ({
+          id: a.id, claim: a.claim, about: a.about, confidence: a.confidence, costIfWrong: a.costIfWrong, status: a.status,
+          ...(a.basis?.length ? { basis: a.basis } : {}),
+          ...(a.answer ? { answer: a.answer.slice(0, 500) } : {}),
+          ...(a.wanted ? { wanted: a.wanted.slice(0, 500) } : {}),
+          ...(needsAsking(a) ? { needs: 'asking' } : needsCheck(a) ? { needs: 'check' } : {}),
+        })) } : {}),
+        questionsLeft,
         relevantKnowledge,
         ...(applicablePatterns.length > 0 ? { applicablePatterns } : {}),
       },
@@ -1512,11 +1938,11 @@ export class ScrumMaster extends Abject {
     query: string,
     limit = 5,
     scope?: string,
-  ): Promise<Array<{ id: string; title: string; type: string; tags?: string[]; content: string }>> {
+  ): Promise<Array<{ id: string; title: string; type: string; tags?: string[]; content: string; evidence?: EntryEvidence | string }>> {
     const kbId = await this.getKnowledgeBaseId();
     if (!kbId) return [];
     try {
-      const entries = await this.request<Array<{ id: string; title: string; type: string; tags?: string[]; content: string }>>(
+      const entries = await this.request<Array<{ id: string; title: string; type: string; tags?: string[]; content: string; evidence?: EntryEvidence | string }>>(
         request(this.id, kbId, 'recall', { query, limit, scope }),
         5000,
       );
@@ -1698,9 +2124,15 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     const maxSteps = typeof action.maxSteps === 'number' && Number.isFinite(action.maxSteps) ? Math.round(action.maxSteps) : undefined;
     const profile = typeof action.profile === 'string' && action.profile.trim() ? action.profile.trim() : undefined;
     const patterns = declaredPatterns(action.patterns);
+    // A read-only check of a belief; naming the assumption it tests implies it.
+    const checks = typeof action.checks === 'string' && action.checks.trim() ? action.checks.trim() : undefined;
+    const check = action.check === true || action.check === 'true' || checks !== undefined;
 
     if (!description || !assignedAgentName) {
       return { success: false, error: 'add_task requires description and assignedAgentName' };
+    }
+    if (checks !== undefined && !/^A\d+$/.test(checks)) {
+      return { success: false, error: `checks names the assumption the check tests, an id such as "A2" (got "${checks.slice(0, 40)}")` };
     }
 
     // Resolve agent at stage time so the LLM gets immediate feedback on bad names.
@@ -1717,6 +2149,20 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     if (!inflight) {
       inflight = { goalId, staged: [] };
       this.scrumInFlight.set(otaTaskId, inflight);
+    }
+
+    // Checks are cheap by design, and a goal that keeps checking instead of
+    // acting has stopped making progress: a few per goal, then act.
+    if (check) {
+      const used = await this.checkTasksUsed(goalId) + inflight.staged.filter(t => t.check).length;
+      if (used >= CHECK_TASKS_PER_GOAL) {
+        return {
+          success: false,
+          error: `Check NOT staged: this goal has used its ${CHECK_TASKS_PER_GOAL} read-only checks. ` +
+            'Plan on your best reading of what the checks found, and name the belief you rely on in the result' +
+            `${checks ? ` (state it with state_assumptions, or settle ${checks} with resolve_assumption)` : ''}.`,
+        };
+      }
     }
 
     // A name has to be unique within the round, or an edge naming it is
@@ -1778,6 +2224,8 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       maxSteps,
       profile,
       ...(patterns.length ? { patterns } : {}),
+      ...(check ? { check: true } : {}),
+      ...(checks ? { checks } : {}),
     };
     if ((consumes?.length ?? 0) > 0 || (produces?.length ?? 0) > 0) {
       let existingKeys = new Set<string>();
@@ -1804,16 +2252,28 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     inflight.staged.push(candidate);
 
     const targetNote = target ? ` →${target}` : '';
-    log.info(`add_task (staged): "${description.slice(0, 60)}" → ${assignedAgentName}${targetNote} (deps: ${resolvedDeps.length === 0 ? 'none' : resolvedDeps.join(',')}); ${inflight.staged.length} staged total`);
+    log.info(`add_task (staged${check ? ', read-only check' : ''}): "${description.slice(0, 60)}" → ${assignedAgentName}${targetNote} (deps: ${resolvedDeps.length === 0 ? 'none' : resolvedDeps.join(',')}); ${inflight.staged.length} staged total`);
     return {
       success: true,
       data: {
         position: inflight.staged.length - 1,
         stagedCount: inflight.staged.length,
         deps: resolvedDeps,
-        note: 'Task is staged but NOT yet committed. Call dispatch_scrum to commit and enqueue, or add more tasks first.',
+        ...(check ? { readOnly: true } : {}),
+        note: 'Task is staged but NOT yet committed. Call dispatch_scrum to commit and enqueue, or add more tasks first.' +
+          (check ? ' It runs read only: the agent reads and reports, and changes nothing.' : ''),
       },
     };
+  }
+
+  /** Read-only check tasks this goal has already committed (any round, cancelled ones aside). */
+  private async checkTasksUsed(goalId: string): Promise<number> {
+    if (!this.goalManagerId) return 0;
+    const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+      request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId }), 10000,
+    ).catch(() => [] as Array<{ id: string; fields: Record<string, unknown> }>);
+    return tasks.filter(t => (t.fields.data as { check?: unknown } | undefined)?.check === true
+      && !['cancelled', 'superseded'].includes(String(t.fields.status))).length;
   }
 
   // ─── Terminal commit: complete_goal ───────────────────────────────
@@ -1848,6 +2308,11 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
         return ScrumMaster.SYNTHESIS_FALLBACK;
       });
     }
+
+    // Assumptions the work went ahead on without asking are named to the
+    // person, so a wrong one is a correction away.
+    const assumed = await this.closeAssumptions(goalId).catch(() => '');
+    if (assumed) synthesis = `${synthesis}\n\n${assumed}`;
 
     log.info(`complete_goal: ${goalId.slice(0, 8)} → DONE (${synthesis.slice(0, 80)})`);
     await this.recordCompletionPlan(goalId, synthesis);
@@ -2168,12 +2633,12 @@ ${record.length > 0
     const tags = action.tags as string[] | undefined;
     const limit = (action.limit as number | undefined) ?? 5;
     if (!query) return { success: false, error: 'lookup_knowledge requires a query string' };
-    const entries = await this.request<Array<{ id: string; title: string; type: string; tags?: string[]; content: string }>>(
+    const entries = await this.request<Array<{ id: string; title: string; type: string; tags?: string[]; content: string; evidence?: EntryEvidence | string }>>(
       request(this.id, kbId, 'recall', { query, type, tags, limit, scope }),
       5000,
     ).catch(() => []);
     log.info(`lookup_knowledge: "${query.slice(0, 60)}" → ${entries.length} entries`);
-    return { success: true, data: { entries } };
+    return { success: true, data: { entries: withEvidenceNotes(entries) } };
   }
 
   // ─── Action: forget_knowledge ─────────────────────────────────────
@@ -2531,6 +2996,9 @@ ${record.length > 0
     if (!outcome || !intent) return undefined;
     const p = intent.probabilities[intent.choice] ?? 0;
     log.info(`[decision:${outcome.mode}] scrum.interjection ${goalId.slice(0, 8)}: ${intent.choice}@${p.toFixed(2)}`);
+    // A note that changes the work in flight is the person's reaction to the
+    // plan: the most telling surprise there is, recorded for review.
+    if (intent.choice === 'redirect' && p >= 0.7) await this.recordRedirect(goalId, notes);
     // One reading decides: the deferrable kinds already mean "nothing in
     // flight is wasted", so no separate conflict answer is combined in.
     const benign = (DEFERRABLE_NOTES as readonly string[]).includes(intent.choice) && p >= 0.85;
@@ -2543,6 +3011,22 @@ ${record.length > 0
     }
     if (p < 0.7) return undefined;
     return { defer: false, hint: `Runtime check: the pending note reads as "${intent.choice.replace(/_/g, ' ')}" (p=${p.toFixed(2)}).` };
+  }
+
+  /**
+   * Record pending notes the interjection reading called a redirect as one
+   * `redirect` reaction on the goal. Each note is recorded at most once.
+   */
+  private async recordRedirect(goalId: string, notes: Array<{ note: string; at: number }>): Promise<void> {
+    if (!this.goalManagerId) return;
+    const fresh = notes.filter(n => !this.reactedNotes.has(`${goalId}:${n.at}`));
+    if (fresh.length === 0) return;
+    for (const n of fresh) this.reactedNotes.add(`${goalId}:${n.at}`);
+    while (this.reactedNotes.size > 500) this.reactedNotes.delete(this.reactedNotes.keys().next().value!);
+    const text = fresh.map(n => n.note).join('\n').slice(0, 2000);
+    await this.request(request(this.id, this.goalManagerId, 'recordReaction', {
+      goalId, kind: 'redirect', text, source: 'interjection',
+    }), 10000).catch(err => log.warn(`redirect reaction for ${goalId.slice(0, 8)} not recorded: ${err instanceof Error ? err.message : String(err)}`));
   }
 
   /**
@@ -2653,6 +3137,12 @@ ${record.length > 0
         return false;
       }
       // A report still answers the question: without a synthesis it ships as written.
+    }
+
+    const assumed = await this.closeAssumptions(goalId).catch(() => '');
+    if (assumed && typeof result === 'string') {
+      result = `${result}\n\n${assumed}`;
+      resultText = result as string;
     }
 
     await this.recordCompletionPlan(goalId, resultText);
@@ -2797,7 +3287,7 @@ ${record.length > 0
       const addResult = await this.request<{ taskId?: string; error?: string }>(
         request(this.id, this.goalManagerId, 'addTask', {
           goalId, operationId: `${otaTaskId}:task:${taskIds.length}`,
-          data: { planOperationId: otaTaskId, target: s.target, maxSteps: s.maxSteps, ...(s.profile ? { profile: s.profile } : {}), ...(s.patterns ? { patterns: s.patterns } : {}), priority: weights.get(String(taskIds.length)) ?? 0, assignedAgentName: s.assignedAgentName },
+          data: { planOperationId: otaTaskId, target: s.target, maxSteps: s.maxSteps, ...(s.profile ? { profile: s.profile } : {}), ...(s.patterns ? { patterns: s.patterns } : {}), ...(s.check ? { check: true } : {}), ...(s.checks ? { checks: s.checks } : {}), priority: weights.get(String(taskIds.length)) ?? 0, assignedAgentName: s.assignedAgentName },
           description: s.description,
           dependsOn: depIds.length > 0 ? depIds : undefined,
           produces: s.produces,
@@ -2838,6 +3328,7 @@ ${record.length > 0
           target: inflight.staged[i].target,
           patterns: inflight.staged[i].patterns,
           maxSteps: inflight.staged[i].maxSteps,
+          ...(inflight.staged[i].check ? { check: true } : {}),
         });
         log.info(`dispatch: task ${taskIds[i].slice(0, 8)} deferred on ${blockerSets[i].length} dep(s): ${blockerSets[i].map(d => d.slice(0, 8)).join(', ')}`);
       }
@@ -2855,7 +3346,7 @@ ${record.length > 0
             goalId,
             dispatchTupleId: taskIds[i],
             priority: weights.get(String(i)) ?? 0,
-            data: taskData(staged.target, staged.patterns, staged.maxSteps),
+            data: taskData(staged.target, staged.patterns, staged.maxSteps, staged.check),
           }),
         );
       }
@@ -2913,10 +3404,10 @@ ${record.length > 0
           }
           const waiting = blockers.filter(id => byId.get(id)?.fields.status !== 'done');
           if (waiting.length) {
-            this.pendingDeps.set(tuple.id, { goalId: goal.id, agentId: agent.agentId, description: tuple.fields.description, blockers: new Set(waiting), priority: data.priority ?? 0, target: data.target, patterns: declaredPatterns(data.patterns), maxSteps: data.maxSteps });
+            this.pendingDeps.set(tuple.id, { goalId: goal.id, agentId: agent.agentId, description: tuple.fields.description, blockers: new Set(waiting), priority: data.priority ?? 0, target: data.target, patterns: declaredPatterns(data.patterns), maxSteps: data.maxSteps, ...(data.check === true ? { check: true } : {}) });
             continue;
           }
-          await this.request(request(this.id, this.agentAbjectId, 'enqueueTask', { agentId: agent.agentId, taskId: tuple.id, dispatchTupleId: tuple.id, goalId: goal.id, task: tuple.fields.description, priority: data.priority ?? 0, data: taskData(data.target, declaredPatterns(data.patterns), data.maxSteps) }));
+          await this.request(request(this.id, this.agentAbjectId, 'enqueueTask', { agentId: agent.agentId, taskId: tuple.id, dispatchTupleId: tuple.id, goalId: goal.id, task: tuple.fields.description, priority: data.priority ?? 0, data: taskData(data.target, declaredPatterns(data.patterns), data.maxSteps, data.check === true) }));
           this.recoveredEnqueues.add(tuple.id);
           this.pendingDeps.delete(tuple.id);
         }
@@ -2926,13 +3417,13 @@ ${record.length > 0
 
   private async unblockDependents(completedTaskId: string): Promise<void> {
     if (!this.agentAbjectId) return;
-    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string; target?: string; patterns?: Array<{ id: string; why: string }>; maxSteps?: number; priority: number }> = [];
+    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string; target?: string; patterns?: Array<{ id: string; why: string }>; maxSteps?: number; check?: boolean; priority: number }> = [];
     for (const [pendingId, info] of this.pendingDeps) {
       if (!info.blockers.has(completedTaskId)) continue;
       info.blockers.delete(completedTaskId);
       if (info.blockers.size === 0) {
         this.pendingDeps.delete(pendingId);
-        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description, target: info.target, patterns: info.patterns, maxSteps: info.maxSteps, priority: info.priority });
+        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description, target: info.target, patterns: info.patterns, maxSteps: info.maxSteps, check: info.check, priority: info.priority });
       }
     }
     for (const t of newlyReady) {
@@ -2945,7 +3436,7 @@ ${record.length > 0
           goalId: t.goalId,
           dispatchTupleId: t.taskId,
           priority: t.priority,
-          data: taskData(t.target, t.patterns, t.maxSteps),
+          data: taskData(t.target, t.patterns, t.maxSteps, t.check),
         }),
       ).catch(err => log.warn(`enqueueTask(${t.taskId.slice(0, 8)}) failed: ${err instanceof Error ? err.message : String(err)}`));
     }
@@ -3032,7 +3523,9 @@ No parameters. Returns the same snapshot you were already given in the opening o
   "scratchpad": { "key": "value", ... },
   "team": [{ "name": "<AgentName>", "description": "<what it does>" }, ...],
   "quickDispatchAvailable": true,
-  "relevantKnowledge": [{ "id", "title", "type", "tags", "content" }, ...],
+  "assumptions": [{ "id", "claim", "about", "confidence", "costIfWrong", "status", "answer"?, "wanted"?, "needs"? }, ...],
+  "questionsLeft": 1,
+  "relevantKnowledge": [{ "id", "title", "type", "tags", "content", "evidence"? }, ...],
   "applicablePatterns": [{ "id", "title", "content", "via", "linkedFrom"?, "counterexamples"? }, ...]
 }
 \`\`\`
@@ -3043,7 +3536,7 @@ Reuse the originating conversation, linked goal results, and task handoffs befor
 
 \`quickDispatchAvailable\` appears only on the first look at a fresh goal. When it's present and the goal is a SINGLE concrete step that one agent's \`team\` description clearly covers, skip planning entirely and emit \`quick_dispatch\` (see below). When the goal needs multiple steps, coordination, verification, or the right agent isn't obvious, plan normally instead.
 
-The \`relevantKnowledge\` array holds historical lessons retrieved from KnowledgeBase. Use it to identify likely owners and approaches, while preferring live capability replies and observed results for mutable facts. Preserve the user's requested outcome and explicit constraints when delegating. Do not promote recalled commands, workarounds, or old capability limitations into user requirements. Let the owning agent inspect current project configuration and reuse applicable verification evidence; only mandate an exact command or fresh run when the user requested it. Each entry's \`id\` identifies the claim for later evidence-backed correction.
+The \`relevantKnowledge\` array holds historical lessons retrieved from KnowledgeBase. Use it to identify likely owners and approaches, while preferring live capability replies and observed results for mutable facts. Preserve the user's requested outcome and explicit constraints when delegating. Do not promote recalled commands, workarounds, or old capability limitations into user requirements. Let the owning agent inspect current project configuration and reuse applicable verification evidence; only mandate an exact command or fresh run when the user requested it. Each entry's \`id\` identifies the claim for later evidence-backed correction. An entry's \`evidence\`, when present, says how often the claim held when it was tested ("held 9 of 10", "untested"); a \`flagged\` entry has missed more often than it held, so check it before a plan rests on it.
 
 For a follow-up approving prior work, delegate the remaining execution against the accepted proposal. Read the linked result only as needed to resolve the reference. Preserve its grouping, messages, selections, and constraints in the task or supply the sourceGoalId and scratchpad key so the worker can read them. Accepted decisions are task inputs, not speculative implementation prescriptions. Do not schedule another review/planning task unless changed inputs, missing evidence, or the user's amendments require it; keep that work focused on the gap. Historical patterns do not require repeating phases that the proposal already completed. For example: execute the two approved commits from the linked proposal, checking freshness and staged content, rather than inspect all changes and devise commit groups again.
 
@@ -3066,7 +3559,7 @@ Restrict via \`members\` when you can narrow the candidate set to a couple of pl
 
 Returns \`{ contributions: [{ agentName, text }, ...] }\`. Each \`text\` is the agent's full reply naming its capabilities and proposed contribution. PASS / empty replies are filtered out.
 
-### \`add_task({ id?, description, assignedAgentName, target?, dependsOn?, produces?, consumes?, patterns? })\` — STAGE only
+### \`add_task({ id?, description, assignedAgentName, target?, dependsOn?, produces?, consumes?, patterns?, check?, checks? })\` — STAGE only
 Append one task to the current scrum's plan. **This does NOT commit** — it stages the task locally. Call \`dispatch_scrum\` to commit and enqueue all staged tasks at once, or call \`complete_goal\` to abandon them.
 
 - \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop. **State the OUTCOME, not the implementation.** Describe what must be true when the task is done and let the agent discover how (it asks the live objects for current usage at build time). Do not embed step-by-step code prescriptions or a diagnosis of why a prior round failed — a wrong theory copied into the task description propagates the error into the next round. On a retry, describe the same outcome and, at most, which approach already failed so the agent picks a genuinely different one; never re-stage a task that prescribes the approach a prior round already proved wrong. **Carry the goal's key requirement phrases through VERBATIM** (quote them): a paraphrase softens the requirement into something weaker that an agent can satisfy with an imitation — "use 3D graphics" rewritten as "a 3D presentation" invites a flat perspective drawing; "delete the old entries" rewritten as "clean up" invites archiving. Outcome wording is yours; the requirement words stay the user's.
@@ -3078,6 +3571,7 @@ Append one task to the current scrum's plan. **This does NOT commit** — it sta
 - \`maxSteps\`: OPTIONAL. A step budget sized to the task when the agent's default would be wrong: a quick lookup needs far fewer steps than a multi-file implementation that must also run the project's checks. The agent clamps it to its own range and still earns progress-based extensions. Omit it when unsure.
 - **Parallel tasks on one external project (files on disk) run in the same checkout at once.** Partition them by area — different files or directories per task — so two tasks never edit the same file; name the area in each description.
 - \`consumes\`: \`["key", ...]\` — scratchpad keys this task expects to read (auto-injected into the agent's context). **A consumed key is an edge.** If another task in this round produces it, this task automatically waits for that task, whether or not you also list it in \`dependsOn\`. So describing the data a task needs is enough; you do not have to keep the topology right by hand as well. A key nothing in the round produces has to already be on the goal scratchpad from an earlier round, otherwise the whole round is refused and you plan it again.
+- \`check\`: OPTIONAL \`true\` for a read-only check: a cheap step that tests a belief about the world before the work that relies on it. Describe what to read (list, get, search, inspect) and what finding would confirm or refute the belief; the agent runs it read only, reading and reporting. \`checks\` names the assumption it tests (\`"A2"\`). A goal stages at most ${CHECK_TASKS_PER_GOAL} checks. Stage the check this round and the work that relies on it next round, once you have read the finding and settled the assumption with \`resolve_assumption\`.
 - \`id\`: an optional short name for this task (\`"audit-web"\`). Other tasks can then depend on it by name instead of by position, which is worth doing the moment a round has more than two or three tasks: a mistaken index produces a valid graph of the wrong shape and nothing downstream can tell.
 
 Returns \`{ position, stagedCount, deps }\`. Multiple add_task calls accumulate.
@@ -3133,6 +3627,27 @@ The user's mid-round message needs no plan change: the work in flight already se
 ### \`ask_user({ question })\` — TERMINAL success
 Pause the sprint and put ONE specific question to the user. Use when a user interjection (or the goal itself) is ambiguous in a way that changes what you would plan — a wrong guess costs a whole round, a good question costs seconds. The user sees the question in their chat; their reply arrives as the next interjection and the sprint resumes into a review scrum that reads it. Ask sparingly and concretely: name the alternatives you are choosing between. When the answers are few and short, list them as \`choices\` (two to four, a few words each) so the user can tap one: \`ask_user({ question: "Which style should I finish?", choices: ["The plain one", "The illustrated one"] })\`. They can still type anything else.
 
+A goal puts one question to the person before work starts and at most one more while it runs (\`questionsLeft\` shows what remains). Past that, \`ask_user\` returns telling you to proceed on your best reading: do so, and name the assumption you act on, so the result shows it to the person. Stated assumptions that want the person's word always ride in the same question, so one question settles them all.
+
+### \`state_assumptions({ assumptions: [{ claim, about, confidence, costIfWrong, basis? }] })\`
+Before the first dispatch of a new goal, say what the plan takes for granted, so a wrong guess surfaces as a question now rather than as a redo later. State what you assume about what the person wants (their intent, the scope, their preferences) and about the world the plan rests on (what exists, what state it is in, what an agent can reach). Name the few assumptions the plan actually turns on, at most ${MAX_ASSUMPTIONS_PER_GOAL}.
+
+- \`claim\`: one plain sentence the person could read and correct, addressed to them ("you want the summary as a bulleted list", "the project builds with pnpm").
+- \`about\`: \`intent\`, \`scope\` or \`preference\` for claims about the person; \`world\` for claims about the environment.
+- \`confidence\`: \`sure\`, \`likely\` or \`guess\`.
+- \`costIfWrong\`: \`undoable\` (the person can take it back with Ctrl+Z, or it stays inside this system and is easily redone), \`costly\` (a wrong guess wastes real work or time), or \`irreversible\` (it reaches outside the system and stays done: messages sent, purchases, deletes on external accounts, anything published).
+- \`basis\`: the \`relevantKnowledge\` ids the claim rests on (a stated preference, a profile fact). Weigh their \`evidence\`: a claim resting on an entry that has held up well is likely; one resting on an untested or flagged entry is a guess.
+
+Returns the recorded assumptions with their ids (\`A1\`, \`A2\`, ...) and \`next\`, which says what each needs:
+- Claims about the person that are guesses, or likely but irreversible, want the person's word before work starts: end the scrum with \`ask_user\`. The runtime turns them into ONE question with your guess as the default ("I'll assume X unless you say otherwise") and joins any question of your own to it. Their answer arrives as the next interjection, and the runtime records which claims it confirmed or corrected; any it left \`asked\`, settle with \`resolve_assumption\` from the answer.
+- A claim about the world that is a guess and not cheap to get wrong (or likely and irreversible) deserves a read-only check first: \`add_task\` with \`check: true\` and \`checks\`.
+- Everything else, act on. Assumptions still open when the goal completes are named to the person in one short line under the result, so they can correct them.
+
+A single-step \`quick_dispatch\` goal goes ahead without this, unless an irreversible step rests on a guess. When any claim about the person is a guess, or likely and irreversible, send \`state_assumptions\` as its own reply and read \`next\` before staging work; otherwise send it as the first block of the round's batch.
+
+### \`resolve_assumption({ id, status, answer })\`
+Settle a stated assumption: \`held\` or \`missed\` once a check task has reported (\`answer\`: what it found), \`confirmed\` or \`corrected\` when the person's reply settles one still marked \`asked\` (\`answer\`: their words). A missed check or a correction changes the plan: plan on what was found or what the person wants, and the result tells the person.
+
 ### \`save_knowledge({ title, content, type?, tags? })\`
 Persist a genuinely reusable FACT to KnowledgeBase. The user browses these entries directly and future scrums auto-recall them in \`review_scrum\`, so each one should read like a standalone fact that holds on its own, not a log of this sprint.
 
@@ -3177,8 +3692,9 @@ Returns \`{ id, forgotten: true }\` on success.
 
 **First scrum (currentScrumNumber=0):** the goal state (description, \`team\` roster with capability summaries, cached knowledge) is already in your opening observation. Act directly:
 1. **Is this a single step one agent obviously owns?** If \`quickDispatchAvailable\` is set and one \`team\` description clearly covers the whole request in one action (call a method on an existing object, one lookup, one navigation) → \`quick_dispatch({ agentName, task })\` and you're done. This is the common case for small requests; don't spin up a full sprint for them.
-2. **Does the plan depend on something nobody has found out yet?** If you cannot write the implementation tasks without guessing — the goal turns on facts that do not exist yet (what an unfamiliar API or codebase actually exposes, which of several approaches is viable, the current state of an external source, how an existing object is really structured) — this is a research+do goal. Stage ONLY the research this round, and plan the implementation next scrum once the findings are on the scratchpad. See **Research-first goals** below.
-3. Otherwise decide: do I already know which agent has the right capability?
+2. **State your assumptions before the first dispatch.** \`state_assumptions\` with what you take for granted about what the person wants and about the world, then follow its \`next\`: ask, check, or plan.
+3. **Does the plan depend on something nobody has found out yet?** If you cannot write the implementation tasks without guessing — the goal turns on facts that do not exist yet (what an unfamiliar API or codebase actually exposes, which of several approaches is viable, the current state of an external source, how an existing object is really structured) — this is a research+do goal. Stage ONLY the research this round, and plan the implementation next scrum once the findings are on the scratchpad. See **Research-first goals** below.
+4. Otherwise decide: do I already know which agent has the right capability?
    - **YES** (cached lesson in \`relevantKnowledge\` names the agent + tool, or the goal is so generic any agent fits) → \`add_task\` directly, then \`dispatch_scrum\`.
    - **NO** → \`poll_team\` (often restricted via \`members\` to plausible candidates) to learn current capabilities. Read each contribution: which agent reported owning the relevant tool/skill/MCP? \`add_task\` to that agent, then \`dispatch_scrum\`. Save what you learned via \`save_knowledge\` before \`complete_goal\` later so the next sprint skips the poll.
 

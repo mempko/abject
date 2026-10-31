@@ -25,9 +25,14 @@
  * The Learning tab is a read-only report over GoalManager's learning funnel
  * (`getLearningFunnel`): how many actions stated a prediction and named the
  * belief behind it, how the reviewer judged them and what it blamed for the
- * misses, and how many of the resulting updates reached the world model. It
- * replaces the list and detail panes while active, loads when first shown,
- * and re-reads on Refresh.
+ * misses, and how many of the resulting updates reached the world model.
+ * Above it sits the learning curve (`getLearningCurve`): a week-by-week
+ * table of predictions, surprises, questions and the person's reactions,
+ * how often predictions proved wrong by how many times the same kind of
+ * action had come up before (learning is being surprised less in repeated
+ * contexts), and the kinds of action judged most often. It replaces the list
+ * and detail panes while active, loads when first shown, and re-reads on
+ * Refresh. An entry's detail shows its test record (held n of m, flagged).
  *
  * Forgetting a live entry (it is archived) and restoring an archived one are
  * undoable from the window: the browser keeps one history of what was done
@@ -45,6 +50,7 @@ import { UndoHistory, UndoRefused, UNDO_EVENTS, undoMethods, type UndoAction } f
 import { emptyStateMarkdown, emptyStateStyle, hintStyle, sectionHeaderStyle, sectionHeaderText } from './ui-kit.js';
 import { readPattern, readStructured, renderPatternText } from '../core/pattern.js';
 import type { KnowledgeEntry, KnowledgeType } from '../core/knowledge.js';
+import { OCCURRENCE_BUCKETS, NEGATIVE_REACTIONS, type OccurrenceBucket } from '../core/surprise.js';
 import type { ListItem } from './widgets/list-widget.js';
 
 const log = new Log('KnowledgeBrowser');
@@ -85,11 +91,15 @@ interface LearningFunnel {
   lifetime: { applied: number; abandoned: number };
 }
 
+/** One column of a report table, as the table widget takes it. */
+interface ReportColumn { key: string; label: string; width?: number; align?: 'left' | 'right' }
+
 /** One row of the Learning report, top to bottom. */
 type ReportRow =
   | { kind: 'heading'; text: string }
-  | { kind: 'note'; text: string }
-  | { kind: 'stat'; label: string; value: string; ratio?: number };
+  | { kind: 'note'; text: string; lines?: number }
+  | { kind: 'stat'; label: string; value: string; ratio?: number }
+  | { kind: 'table'; columns: ReportColumn[]; rows: Array<Record<string, string>> };
 
 /** Plain names for the reviewer's verdicts, blame sources and update states (in display order). */
 const VERDICT_LABELS: Record<string, string> = {
@@ -211,6 +221,176 @@ function funnelRows(f: LearningFunnel): ReportRow[] {
   rows.push(stat('Updates abandoned', { value: String(f.lifetime.abandoned) }));
   ensure(rows.length > 0, 'the funnel report has rows');
   return rows;
+}
+
+// ── The learning curve (GoalManager `getLearningCurve`) ─────────────────
+
+/** Weeks of history the Learning tab asks for. */
+const CURVE_WEEKS = 12;
+/** Kinds of action listed under the curve, most judged first. */
+const TOP_CONTEXTS = 8;
+const TABLE_HEADER_H = 28;
+const TABLE_ROW_H = 24;
+
+/** One week of `getLearningCurve`, normalized to the counts the table shows. */
+interface WeekRow {
+  week: string;
+  actions: number;
+  expect: number;
+  basis: number;
+  judged: number;
+  supported: number;
+  contradicted: number;
+  unresolved: number;
+  toBelief: number;
+  brier: number;
+  scored: number;
+  asked: number;
+  corrected: number;
+  reactions: Record<string, number>;
+}
+
+/** GoalManager's `getLearningCurve` reply, normalized. */
+interface LearningCurve {
+  scope: string;
+  weeks: WeekRow[];
+  curve: Record<OccurrenceBucket, { judged: number; contradicted: number }>;
+  contexts: Array<{ key: string; judged: number; contradicted: number }>;
+}
+
+/** Plain names for the occurrence buckets: how many times the same kind of action had come up. */
+const BUCKET_LABELS: Record<OccurrenceBucket, string> = {
+  '1': 'The first time',
+  '2-3': 'The 2nd or 3rd time',
+  '4-7': '4 to 7 times in',
+  '8-15': '8 to 15 times in',
+  '16+': '16 times or more',
+};
+
+const WEEK_COLUMNS: ReportColumn[] = [
+  { key: 'week', label: 'Week', width: 64 },
+  { key: 'actions', label: 'Actions', align: 'right' },
+  { key: 'predicted', label: 'Predicted', align: 'right' },
+  { key: 'cited', label: 'Named why', align: 'right' },
+  { key: 'judged', label: 'Judged', align: 'right' },
+  { key: 'surprise', label: 'Surprised', align: 'right' },
+  { key: 'unclear', label: 'Unclear', align: 'right' },
+  { key: 'blamed', label: 'Belief blamed', align: 'right' },
+  { key: 'error', label: 'Off by', align: 'right' },
+  { key: 'asked', label: 'Asked you', align: 'right' },
+  { key: 'corrected', label: 'You corrected', align: 'right' },
+  { key: 'reactions', label: 'Unhappy / happy', align: 'right' },
+];
+
+const WEEK_COLUMNS_NOTE =
+  'Predicted: actions where the agent said what it expected. Named why: predictions that named the knowledge behind them. '
+  + 'Surprised: judged predictions that proved wrong. Unclear: judgments that could not tell. '
+  + 'Belief blamed: wrong predictions traced to something the system believed, of all wrong ones. '
+  + 'Off by: how far stated confidence was from what happened (0 is perfect, lower is better). '
+  + 'Asked you: questions put to you about what you wanted; You corrected: answers that changed the guess. '
+  + 'Unhappy / happy: how you reacted to results.';
+
+function pct(n: number, of: number): string {
+  return of > 0 ? `${Math.round((n / of) * 100)}%` : '-';
+}
+
+/** Validate and normalize a `getLearningCurve` reply; throws on a shape it does not recognize. */
+function readCurve(raw: unknown): LearningCurve {
+  const r = (raw ?? {}) as { scope?: unknown; weeks?: unknown; curve?: unknown; contexts?: unknown };
+  if (!Array.isArray(r.weeks)) throw new Error('Unexpected learning curve reply');
+  const weeks: WeekRow[] = (r.weeks as Array<Record<string, unknown>>)
+    .filter(w => w && typeof w.week === 'string')
+    .map(w => ({
+      week: w.week as string,
+      actions: count(w.actions), expect: count(w.expect), basis: count(w.basis),
+      judged: count(w.judged), supported: count(w.supported), contradicted: count(w.contradicted),
+      unresolved: count(w.unresolved), toBelief: count(w.toBelief),
+      brier: typeof w.brier === 'number' && Number.isFinite(w.brier) && w.brier > 0 ? w.brier : 0,
+      scored: count(w.scored), asked: count(w.asked), corrected: count(w.corrected),
+      reactions: counts(w.reactions),
+    }))
+    .sort((a, b) => b.week.localeCompare(a.week));
+  const rawCurve = (r.curve ?? {}) as Record<string, { judged?: unknown; contradicted?: unknown } | undefined>;
+  const curve = Object.fromEntries(OCCURRENCE_BUCKETS.map(b => [b, {
+    judged: count(rawCurve[b]?.judged), contradicted: count(rawCurve[b]?.contradicted),
+  }])) as LearningCurve['curve'];
+  const contexts = (Array.isArray(r.contexts) ? r.contexts as Array<Record<string, unknown>> : [])
+    .filter(c => c && typeof c.key === 'string')
+    .map(c => ({ key: c.key as string, judged: count(c.judged), contradicted: count(c.contradicted) }))
+    .filter(c => c.judged > 0)
+    .sort((a, b) => b.judged - a.judged)
+    .slice(0, TOP_CONTEXTS);
+  return { scope: typeof r.scope === 'string' && r.scope ? r.scope : 'all recorded', weeks, curve, contexts };
+}
+
+/** A week's Monday as "Oct 26". */
+function weekLabel(week: string): string {
+  const d = new Date(`${week}T00:00:00Z`);
+  return Number.isNaN(d.getTime()) ? week : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+
+/** A context key (`agent|action|target|method`) as words: "Agent: call Target.method". */
+function contextLabel(key: string): string {
+  const [agent, action, target, method] = key.split('|');
+  const on = [target, method].filter(Boolean).join('.');
+  const text = `${agent && agent !== '?' ? `${agent}: ` : ''}${action ?? key}${on ? ` ${on}` : ''}`;
+  return text.length > 70 ? `${text.slice(0, 67)}...` : text;
+}
+
+/** The learning curve as report rows: the weekly table, surprise by repetition, the busiest contexts. */
+function curveRows(c: LearningCurve): ReportRow[] {
+  const rows: ReportRow[] = [];
+  rows.push({ kind: 'heading', text: 'Week by week' });
+  if (c.weeks.length === 0) {
+    rows.push({ kind: 'note', text: 'No weeks recorded yet. The table fills in as agents work on goals.' });
+  } else {
+    const negative = NEGATIVE_REACTIONS as readonly string[];
+    rows.push({
+      kind: 'table', columns: WEEK_COLUMNS,
+      rows: c.weeks.map(w => {
+        const unhappy = Object.entries(w.reactions).filter(([k]) => negative.includes(k)).reduce((a, [, n]) => a + n, 0);
+        return {
+          week: weekLabel(w.week),
+          actions: String(w.actions),
+          predicted: pct(w.expect, w.actions),
+          cited: pct(w.basis, w.expect),
+          judged: String(w.judged),
+          surprise: pct(w.contradicted, w.supported + w.contradicted),
+          unclear: pct(w.unresolved, w.judged),
+          blamed: w.contradicted > 0 ? `${w.toBelief} of ${w.contradicted}` : '-',
+          error: w.scored > 0 ? (w.brier / w.scored).toFixed(2) : '-',
+          asked: String(w.asked),
+          corrected: String(w.corrected),
+          reactions: `${unhappy} / ${w.reactions.satisfied ?? 0}`,
+        };
+      }),
+    });
+    rows.push({ kind: 'note', text: WEEK_COLUMNS_NOTE, lines: 5 });
+  }
+
+  rows.push({ kind: 'heading', text: 'Surprised less with practice?' });
+  rows.push({ kind: 'note', text: 'Predictions that proved wrong, by how many times the agent had done the same kind of action before. Learning shows as shorter bars further down.', lines: 2 });
+  for (const b of OCCURRENCE_BUCKETS) {
+    const { judged, contradicted } = c.curve[b];
+    rows.push({ kind: 'stat', label: BUCKET_LABELS[b], ...share(contradicted, judged) });
+  }
+
+  if (c.contexts.length > 0) {
+    rows.push({ kind: 'heading', text: 'Most frequent kinds of action' });
+    rows.push({ kind: 'note', text: 'Wrong predictions out of those judged, for the kinds of action judged most often.' });
+    for (const ctx of c.contexts) rows.push({ kind: 'stat', label: contextLabel(ctx.key), ...share(ctx.contradicted, ctx.judged) });
+  }
+  ensure(rows.length > 0, 'the curve report has rows');
+  return rows;
+}
+
+/** An entry's test record in a few words, for the detail pane's metadata line. */
+function evidenceText(entry: KnowledgeEntry): string {
+  const ev = entry.evidence;
+  const tests = ev ? count(ev.held) + count(ev.missed) : 0;
+  if (!ev || tests === 0) return 'Untested';
+  const last = ev.lastTestedAt ? `, last ${new Date(ev.lastTestedAt).toLocaleDateString()}` : '';
+  return `Held ${count(ev.held)} of ${tests}${last}${ev.flagged ? '  |  Flagged: wrong more often than right' : ''}`;
 }
 
 export class KnowledgeBrowser extends Abject {
@@ -952,7 +1132,7 @@ export class KnowledgeBrowser extends Abject {
         style: { visible: true },
       })),
       this.request(request(this.id, this.metaLabelId!, 'update', {
-        text: `Origin: ${entry.origin}${peerStr}  |  Created ${created}  |  Updated ${updated}  |  Accessed ${entry.accessCount} times${usefulStr}`,
+        text: `Origin: ${entry.origin}${peerStr}  |  Created ${created}  |  Updated ${updated}  |  Accessed ${entry.accessCount} times${usefulStr}  |  ${evidenceText(entry)}`,
         style: { visible: true },
       })),
       this.request(request(this.id, this.restoreBtnId!, 'update', {
@@ -1292,12 +1472,23 @@ export class KnowledgeBrowser extends Abject {
     if (refreshId) this.send(event(this.id, refreshId, 'update', { busy: true }));
     try {
       let funnel: LearningFunnel | null = null;
+      let curve: LearningCurve | null = null;
       try {
         this.goalManagerId = await this.resolveDep('GoalManager', this.goalManagerId);
-        if (this.goalManagerId) {
-          funnel = readFunnel(await this.request<unknown>(
-            request(this.id, this.goalManagerId, 'getLearningFunnel', {}),
-          ));
+        const goalManagerId = this.goalManagerId;
+        if (goalManagerId) {
+          // The curve is read beside the funnel; either may be missing alone.
+          const [f, c] = await Promise.allSettled([
+            this.request<unknown>(request(this.id, goalManagerId, 'getLearningFunnel', {})),
+            this.request<unknown>(request(this.id, goalManagerId, 'getLearningCurve', { weeks: CURVE_WEEKS })),
+          ]);
+          if (f.status === 'fulfilled') funnel = readFunnel(f.value);
+          else throw f.reason;
+          if (c.status === 'fulfilled') {
+            try { curve = readCurve(c.value); } catch (err) { log.warn('Learning curve unreadable:', err instanceof Error ? err.message : String(err)); }
+          } else {
+            log.warn('Learning curve unavailable:', c.reason instanceof Error ? c.reason.message : String(c.reason));
+          }
         }
       } catch (err) {
         this.goalManagerId = undefined; // rediscover next time: it may have been respawned
@@ -1310,7 +1501,11 @@ export class KnowledgeBrowser extends Abject {
         ? `Counts cover the ${funnel.scope}. All time counts every update since tracking began.`
         : LEARNING_UNAVAILABLE;
       await this.request(request(this.id, this.learningStatusId!, 'update', { text: status })).catch(() => {});
-      if (funnel) await this.addLearningRows(funnelRows(funnel));
+      if (funnel) {
+        const curveReport: ReportRow[] = curve ? curveRows(curve)
+          : [{ kind: 'heading', text: 'Week by week' }, { kind: 'note', text: 'The week-by-week report is unavailable right now.' }];
+        await this.addLearningRows([...curveReport, ...funnelRows(funnel)]);
+      }
       this.learningLoaded = true;
       log.info(`Learning report: ${funnel ? `${this.learningRowIds.length} rows` : 'unavailable'}`);
     } finally {
@@ -1348,7 +1543,10 @@ export class KnowledgeBrowser extends Abject {
         specs.push({ type: 'label', windowId, text: sectionHeaderText(this.theme, row.text),
           style: { ...sectionHeaderStyle(this.theme, 12), wordWrap: false } });
       } else if (row.kind === 'note') {
-        specs.push({ type: 'label', windowId, text: row.text, style: { fontSize: 11, color: this.theme.textSecondary } });
+        specs.push({ type: 'label', windowId, text: row.text,
+          style: { fontSize: 11, color: this.theme.textSecondary, ...(row.lines && row.lines > 1 ? { wordWrap: true } : {}) } });
+      } else if (row.kind === 'table') {
+        specs.push({ type: 'table', windowId, sortable: false, columns: row.columns, rowsData: row.rows, rowHeight: TABLE_ROW_H });
       } else {
         specs.push({ type: 'label', windowId, text: row.label, style: { fontSize: 12, color: this.theme.textPrimary } });
         if (row.ratio !== undefined) specs.push({ type: 'progress', windowId, value: row.ratio });
@@ -1372,7 +1570,9 @@ export class KnowledgeBrowser extends Abject {
       widgetId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height },
     });
     const children = await Promise.all(placed.map(async ({ row, ids }) => {
-      if (row.kind !== 'stat') return fixedRow(ids[0], row.kind === 'heading' ? 28 : REPORT_ROW_H);
+      if (row.kind === 'table') return fixedRow(ids[0], TABLE_HEADER_H + row.rows.length * TABLE_ROW_H + 4);
+      if (row.kind === 'note') return fixedRow(ids[0], REPORT_ROW_H + Math.max(0, (row.lines ?? 1) - 1) * 15);
+      if (row.kind !== 'stat') return fixedRow(ids[0], 28);
       const rowId = await this.request<AbjectId>(request(this.id, wm, 'createDetachedHBox', {
         windowId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 12,
       }));

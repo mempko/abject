@@ -15,6 +15,13 @@
 
   const entry = await call(await dep('KnowledgeBase'), 'get', { id: hits[0].id });
 
+### How far to trust an entry
+Full entries carry `evidence`: how often predictions and assumptions that rested on the entry held (`held`/`missed` when it was cited, `shownHeld`/`shownMissed` when it was only shown), with `confidence` (the chance its claim holds), `uncertainty` (1 when untested, falling with tests and rising again as they age) and `flagged` (its misses outnumber its holds: check it before relying on it). Previews carry it once the entry has been tested. Reviewers record these tests; agents only read them. To find what is relied on most but known least, the entries most worth checking:
+
+  const toCheck = await call(await dep('KnowledgeBase'), 'recall', {
+    order: 'uncertain', limit: 5, previews: true,
+  });
+
 ### The iterate pattern
 Search, read the previews, and refine: when results are thin, reformulate with different terms (synonyms, the object's registered name, a distinctive phrase) and search again. Fetch full entries only for the results you will actually use.
 

@@ -44,6 +44,38 @@ TypeScript callers read its message shapes from `src/core/knowledge.ts`
   answered as a duplicate. `observe_pattern` records a reviewer's verdict on a
   pattern the goal did not formally apply (shown, or followed undeclared) in
   the pattern's `observations`, never as a recorded use.
+- **Evidence.** Each entry can carry `evidence` { held, missed, shownHeld,
+  shownMissed, lastTestedAt }: how often the predictions and assumptions that
+  rested on it held. `held`/`missed` count the ones that cited the entry;
+  `shownHeld`/`shownMissed` the ones where it was only shown (a suspect,
+  weighted a quarter). Absent means untested, so stores written before it
+  load unchanged. TaskReviewer's `observe_entry` effect
+  { id, outcome: 'held'|'missed', cited } arrives through the same
+  `applyLearningDecision` round trip as the other effects and bumps one
+  counter and `lastTestedAt`. It changes no claim: no revision, no
+  `updatedAt` change (a `knowledgeRef` read for another effect stays valid),
+  allowed on user-authored entries, and no receipt in the learning history;
+  the newest 100 observation effect ids are kept with the counters so a
+  redelivery is answered as a duplicate. An archived or missing entry answers
+  `Knowledge target unavailable` (TaskReviewer abandons the effect). Readers
+  get derived fields, rounded to 3 decimals:
+  `confidence = (1 + held + 0.25 shownHeld) / (2 + held + missed + 0.25 (shownHeld + shownMissed))`;
+  effective tests `n = (held + missed + 0.25 (shownHeld + shownMissed)) * 0.5^(daysSinceLastTested / 60)`;
+  `uncertainty = 1 / (1 + n)` (1 when untested); `flagged = missed >= 2 && missed > held`.
+  Full entries (`get`, `list`, `recall`, `match`, `weave`, change events)
+  always carry it; `recall` previews only once the entry was tested. When
+  the claim changes (a new title or content through `update`, a `remember`
+  that rewrites an existing entry, or a reviewer's `update_entry`, which is
+  also how a supersession's replacement is revised) the counters and
+  `lastTestedAt` reset to zero and `claimAt` is stamped: the old holds and
+  misses tested the old claim. The observation effect ids stay, so a
+  redelivered old observation is still a duplicate. Tag-only changes, and a
+  pattern write that only moves its own learning record, keep the counters.
+  Sync folds a peer's counters in (last-writer-wins on `updatedAt` cannot
+  carry them): for the same `claimAt` each counter takes the larger value,
+  counters for a newer claim replace ours and those for an older claim are
+  ignored. Two observations made on different peers from the same count are
+  counted once.
 - **Receipts stay small.** A receipt keeps the prediction-level evidence
   (`{hash, digest}` per cited record: expectation, outcome, verdict,
   explanation, attribution; GoalManager stores the whole record once under
@@ -68,7 +100,9 @@ TypeScript callers read its message shapes from `src/core/knowledge.ts`
 - **Distillation** runs on load and at most every 30 minutes, piggybacked on
   writes rather than a timer. It archives `learned` entries never accessed
   within 7 days, `learned`/`reference` entries idle for 30 days, and the least
-  useful entries over the 1000-entry active cap. User-authored entries,
+  useful entries over the 1000-entry active cap (fewest marked useful first;
+  among equals a `flagged` entry goes before the rest however often it was
+  read, then the least read). User-authored entries,
   patterns, `profile`-tagged entries, `user`/`person` facts, entries marked
   useful and entries with learning history are never touched. Archived entries are purged after 180
   days or past 2000 archived (user-authored ones never).
@@ -81,9 +115,9 @@ TypeScript callers read its message shapes from `src/core/knowledge.ts`
 | Group | Methods |
 |---|---|
 | Store | `remember` (dedup by normalized title + type; optional `origin`: user, agent, reviewer, scrum), `update` (optional `expectedRevision`), `forget` (first call archives, second deletes), `archive` |
-| Retrieve | `recall` (BM25, `previews: true` for `{id, title, snippet}`; without a query, `order: 'worth'` ranks user-written, then reviewer-confirmed useful, then recent), `match` (literal or `A\|B`), `get`, `list`, `listTags`, `weave` (patterns by context, plus linked patterns; `from`, `hops` up to 2); `recall`, `get` and `list` take `includeLearning` |
+| Retrieve | `recall` (BM25, `previews: true` for `{id, title, snippet}`; without a query, `order: 'worth'` ranks user-written, then reviewer-confirmed useful, then recent; `order: 'uncertain'`, with or without a query, ranks what is relied on most and tested least first: `(1 + accessCount + 2 * usefulCount) * evidence.uncertainty`), `match` (literal or `A\|B`), `get`, `list`, `listTags`, `weave` (patterns by context, plus linked patterns; `from`, `hops` up to 2); `recall`, `get` and `list` take `includeLearning` |
 | Curation | `markUseful` (bumps `usefulCount`, which protects an entry from distillation) |
-| Pattern learning | `beginPatternApplication`, `assessPatternApplication`, `recordPatternApplication`, `patternHistory`, `applyLearningDecision`, `evidenceHashes` |
+| Pattern learning | `beginPatternApplication`, `assessPatternApplication`, `recordPatternApplication`, `patternHistory`, `applyLearningDecision` (including `observe_entry`), `evidenceHashes` |
 | Events | `entryAdded`, `entryUpdated`, `entryRemoved` |
 
 It also handles `timerFired` (its own Timer wakeup) and `changed` (SharedState

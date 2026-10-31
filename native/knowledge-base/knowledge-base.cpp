@@ -39,6 +39,7 @@
 #include <abject/abject.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <random>
@@ -86,6 +87,16 @@ static constexpr size_t FEEDBACK_IDS_KEPT = 200;
 /// Text kept per field of an evidence digest, and of a receipt's prior text.
 static constexpr size_t EVIDENCE_TEXT_CAP = 400;
 static constexpr size_t BEFORE_CONTENT_CAP = 8000;
+/// Effect ids of the newest observe_entry effects applied to an entry, kept
+/// so a redelivered observation is answered as a duplicate without a receipt
+/// in the learning history.
+static constexpr size_t OBSERVED_EFFECTS_KEPT = 100;
+/// Shown-only evidence (the entry was in front of the agent but not cited)
+/// counts a quarter of a cited test.
+static constexpr double SHOWN_WEIGHT = 0.25;
+/// Days for the weight of past tests to halve: uncertainty grows back as an
+/// entry goes untested.
+static constexpr double EVIDENCE_HALF_LIFE_DAYS = 60.0;
 
 // ── Entry model (JSON shape of KnowledgeEntry in src/core/knowledge.ts) ─
 
@@ -136,6 +147,112 @@ static std::set<std::string> learning_receipt_ids(const json& learning) {
   return ids;
 }
 
+static double round3(double v) { return std::round(v * 1000.0) / 1000.0; }
+
+/// How often the predictions and assumptions that rested on an entry held.
+/// held/missed count the ones that cited it; shownHeld/shownMissed the ones
+/// where it was only shown. Absent from storage means untested (all zero).
+/// It is evidence about the claim, not part of it: recording a test changes
+/// neither the entry's revision nor its updatedAt.
+struct Evidence {
+  int64_t held = 0, missed = 0, shown_held = 0, shown_missed = 0;
+  int64_t last_tested_at = 0;
+  /// When the claim these counters test was last changed (0: since the entry
+  /// was written). A new claim starts untested; the stamp keeps a peer's
+  /// counters for the old claim from coming back through sync.
+  int64_t claim_at = 0;
+  /// Recent observe_entry effect ids (OBSERVED_EFFECTS_KEPT), for idempotency.
+  std::vector<std::string> effect_ids;
+
+  bool tested() const { return held + missed + shown_held + shown_missed > 0; }
+  bool stored() const { return tested() || last_tested_at > 0 || claim_at > 0 || !effect_ids.empty(); }
+  /// The claim changed: the old holds and misses tested something else. The
+  /// effect ids stay, so a redelivered old observation is still a duplicate.
+  void reset_for_new_claim(int64_t now) {
+    held = missed = shown_held = shown_missed = 0;
+    last_tested_at = 0;
+    claim_at = std::max(claim_at, now);
+  }
+  double weighted_tests() const { return held + missed + SHOWN_WEIGHT * (shown_held + shown_missed); }
+  /// The chance the claim holds: a Laplace estimate over the tests.
+  double confidence() const {
+    return (1.0 + held + SHOWN_WEIGHT * shown_held) / (2.0 + weighted_tests());
+  }
+  /// 1 when untested; falls as tests accumulate and grows back as they age.
+  double uncertainty(int64_t now) const {
+    if (!tested()) return 1.0;
+    const double days = last_tested_at > 0 ? std::max(0.0, double(now - last_tested_at) / double(DAY_MS)) : 0.0;
+    const double n = weighted_tests() * std::pow(0.5, days / EVIDENCE_HALF_LIFE_DAYS);
+    return 1.0 / (1.0 + n);
+  }
+  /// Misses outnumber holds after enough tests: it needs narrowing or a dispute.
+  bool flagged() const { return missed >= 2 && missed > held; }
+  bool knows(const std::string& effect_id) const {
+    return std::find(effect_ids.begin(), effect_ids.end(), effect_id) != effect_ids.end();
+  }
+  void remember_effect(const std::string& effect_id) {
+    if (effect_id.empty() || knows(effect_id)) return;
+    effect_ids.push_back(effect_id);
+    if (effect_ids.size() > OBSERVED_EFFECTS_KEPT) {
+      effect_ids.erase(effect_ids.begin(), effect_ids.begin() + static_cast<std::ptrdiff_t>(effect_ids.size() - OBSERVED_EFFECTS_KEPT));
+    }
+  }
+  json counters() const {
+    json j = {{"held", held}, {"missed", missed}, {"shownHeld", shown_held}, {"shownMissed", shown_missed}};
+    if (last_tested_at > 0) j["lastTestedAt"] = last_tested_at;
+    return j;
+  }
+  /// As stored and synced: the counters and the recent effect ids.
+  json to_json() const {
+    json j = counters();
+    if (claim_at > 0) j["claimAt"] = claim_at;
+    j["effectIds"] = effect_ids;
+    return j;
+  }
+  /// As readers get it: the counters with confidence, uncertainty and flagged.
+  json view(int64_t now) const {
+    json j = counters();
+    j["confidence"] = round3(confidence());
+    j["uncertainty"] = round3(uncertainty(now));
+    j["flagged"] = flagged();
+    return j;
+  }
+  static Evidence from_json(const json& j) {
+    Evidence e;
+    if (!j.is_object()) return e;
+    e.held = std::max<int64_t>(0, int_or(j, "held", 0));
+    e.missed = std::max<int64_t>(0, int_or(j, "missed", 0));
+    e.shown_held = std::max<int64_t>(0, int_or(j, "shownHeld", 0));
+    e.shown_missed = std::max<int64_t>(0, int_or(j, "shownMissed", 0));
+    e.last_tested_at = std::max<int64_t>(0, int_or(j, "lastTestedAt", 0));
+    e.claim_at = std::max<int64_t>(0, int_or(j, "claimAt", 0));
+    if (j.contains("effectIds") && j["effectIds"].is_array()) {
+      for (const auto& v : j["effectIds"]) if (v.is_string()) e.remember_effect(v.get<std::string>());
+    }
+    return e;
+  }
+  /// Fold in a peer's copy. Counters for a newer claim replace ours, those
+  /// for an older claim are ignored; for the same claim each counter and the
+  /// test time take the larger value. Effect ids always join. Monotone, so
+  /// replicas converge (two observations made on different peers from the
+  /// same count are counted once). Returns whether anything changed.
+  bool merge(const Evidence& other) {
+    bool changed = false;
+    if (other.claim_at > claim_at) {
+      held = other.held; missed = other.missed; shown_held = other.shown_held; shown_missed = other.shown_missed;
+      last_tested_at = other.last_tested_at; claim_at = other.claim_at;
+      changed = true;
+    } else if (other.claim_at == claim_at) {
+      auto up = [&changed](int64_t& mine, int64_t theirs) { if (theirs > mine) { mine = theirs; changed = true; } };
+      up(held, other.held); up(missed, other.missed);
+      up(shown_held, other.shown_held); up(shown_missed, other.shown_missed);
+      up(last_tested_at, other.last_tested_at);
+    }
+    for (const auto& id : other.effect_ids) if (!knows(id)) { remember_effect(id); changed = true; }
+    return changed;
+  }
+};
+
 struct Entry {
   std::string id;
   std::string title;
@@ -158,7 +275,17 @@ struct Entry {
   /// Archived entries are hidden from recall/match but restorable.
   bool archived = false;
   json learning = nullptr;
+  Evidence evidence;
 
+  /// What the entry claims, for telling a claim change from a bookkeeping
+  /// one: title and content, a pattern's without its own learning record.
+  std::string claim_text() const {
+    std::string body = content;
+    if (type == "pattern") {
+      if (auto p = kbpat::read(content, title)) { p->learning = nullptr; body = p->to_json().dump(); }
+    }
+    return title + "\n" + body;
+  }
   std::string knowledge_ref() const { return json::array({id, updated_at, learning.is_object() ? int_or(learning, "revision", 0) : 0}).dump(); }
   bool applicable(const std::string& scope = "") const {
     if (archived) return false;
@@ -190,6 +317,7 @@ struct Entry {
   json to_presented_json() const {
     json j = to_json();
     j["knowledgeRef"] = knowledge_ref();
+    j["evidence"] = evidence.view(static_cast<int64_t>(host::time_ms()));
     if (type == "pattern") {
       if (auto p = kbpat::read(content, title)) {
         if (!p->learning.is_object()) p->learning = {{"revision", 1}, {"applications", json::array()}, {"feedbackIds", json::array()}, {"history", json::array()}};
@@ -211,7 +339,7 @@ struct Entry {
   }
 
   json to_json() const {
-    return {{"id", id},           {"title", title},
+    json j = {{"id", id},           {"title", title},
             {"content", content}, {"type", type},
             {"tags", tags},       {"origin", origin},
             {"createdBy", created_by},
@@ -223,6 +351,8 @@ struct Entry {
             {"usefulCount", useful_count},
             {"lastUsefulAt", last_useful_at},
             {"archived", archived}, {"learning", learning}};
+    if (evidence.stored()) j["evidence"] = evidence.to_json();
+    return j;
   }
 
   /// Provenance/usefulness fields default when absent so entries from
@@ -251,6 +381,7 @@ struct Entry {
     e.useful_count = int_or(j, "usefulCount", 0);
     e.last_useful_at = int_or(j, "lastUsefulAt", 0);
     e.archived = j.contains("archived") && j["archived"].is_boolean() && j["archived"].get<bool>();
+    if (j.contains("evidence")) e.evidence = Evidence::from_json(j["evidence"]);
     return e;
   }
 };
@@ -491,6 +622,7 @@ static json learning_summary(const json& learning) {
 /// history is summarized (subscribers render entries, not receipts).
 static json event_json(const Entry& e) {
   json j = e.to_json();
+  j["evidence"] = e.evidence.view(static_cast<int64_t>(host::time_ms()));
   if (e.learning.is_object()) j["learning"] = learning_summary(e.learning);
   return j;
 }
@@ -575,9 +707,14 @@ class KnowledgeBase final : public Object {
         "generative pattern-language entries with Context/Forces/Therefore "
         "sections and links to related patterns). Knowledge "
         "persists across restarts and syncs across peers.",
-        "3.9.0", "abjects:knowledge-base");
+        "3.10.0", "abjects:knowledge-base");
 
-    m.method("applyLearningDecision", "Apply an authenticated journaled correction with a durable idempotent receipt")
+    m.method("applyLearningDecision",
+             "Apply an authenticated journaled correction with a durable idempotent receipt. "
+             "observe_entry {id, outcome: 'held'|'missed', cited} records one prediction or "
+             "assumption that rested on an entry: it counts toward the entry's evidence "
+             "(held/missed when cited, shownHeld/shownMissed when only shown) and changes no "
+             "claim, revision or updatedAt")
         .param("goalId", "string", "Evidence owner goal").param("decisionId", "string", "Durable decision")
         .param("effectId", "string", "Immutable effect identity").returns("object");
     m.method("remember",
@@ -594,14 +731,18 @@ class KnowledgeBase final : public Object {
              "Search knowledge entries by query (BM25-ranked full text, "
              "title-boosted), type, or tags. Each result carries a snippet "
              "and score. Pass previews: true for compact {id, title, snippet} "
-             "results, then fetch winners with get.")
+             "results, then fetch winners with get. Full entries carry "
+             "evidence {held, missed, shownHeld, shownMissed, lastTestedAt, "
+             "confidence, uncertainty, flagged}: how often predictions resting "
+             "on the entry held; previews carry it once the entry was tested.")
         .param("query", "string", "Search query (keywords)", true)
         .param("type", "string", "Filter by type", true)
         .param("tags", "array", "Filter by tags", true)
         .param("limit", "number", "Max results (default 10)", true)
         .param("scope", "string", "Explicit applicability scope", true)
         .param("previews", "boolean", "Return compact previews instead of full entries", true)
-        .param("order", "string", "Without a query: 'recent' (default) or 'worth' (user-written first, then reviewer-confirmed useful, then recent)", true)
+        .param("order", "string", "Without a query: 'recent' (default) or 'worth' (user-written first, then reviewer-confirmed useful, then recent). "
+               "'uncertain' (with or without a query): entries relied on most and tested least first, by (1 + accessCount + 2 * usefulCount) * evidence.uncertainty", true)
         .param("includeLearning", "boolean", "Include each entry's whole learning history (receipts); by default only its summary", true)
         .param("minGoals", "number", "Only entries met in at least this many goals (distinct goals behind their learning receipts)", true)
         .returns("array");
@@ -1134,6 +1275,11 @@ class KnowledgeBase final : public Object {
       const json decision = r.payload["decision"], effect = r.payload["effect"], input = effect["input"];
       const std::string id = str_or(input, "id", ""), action = str_or(input, "action", ""), effect_id = str_or(effect, "id", "");
       auto it = entries_.find(id);
+      // An observation already counted: its id is kept with the counters,
+      // not as a receipt in the learning history.
+      if (it != entries_.end() && action == "observe_entry" && it->second.evidence.knows(effect_id)) {
+        reply_to(correlation, {{"success", true}, {"duplicate", true}, {"receipt", {{"effectId", effect_id}, {"decisionId", decision["id"]}, {"action", action}, {"evidence", it->second.evidence.counters()}}}}); return;
+      }
       if (it != entries_.end() && it->second.learning.is_object()) {
         const json& held = it->second.learning;
         if (held.contains("history") && held["history"].is_array()) {
@@ -1153,6 +1299,7 @@ class KnowledgeBase final : public Object {
       const bool creating = action == "save_entry";
       if (creating && it != entries_.end()) { reject("Target already exists"); return; }
       if (!creating && it == entries_.end()) { reject("Knowledge target unavailable"); return; }
+      if (action == "observe_entry") { observe_entry(correlation, decision, effect, it->second); return; }
       // Pattern feedback (a recorded use's verdict, or an observation about a
       // pattern that was shown) lands on a pattern that agents keep using, so
       // its version moves constantly; neither rewrites the pattern's claims,
@@ -1197,6 +1344,7 @@ class KnowledgeBase final : public Object {
           for (const auto& t : input["tags"]) if (t.is_string()) next.tags.push_back(t.get<std::string>());
         }
       }
+      if (!creating && action == "update_entry" && next.claim_text() != it->second.claim_text()) next.evidence.reset_for_new_claim(now);
       if (!next.learning.is_object()) next.learning = {{"revision",0},{"history",json::array()},{"disputes",json::array()},{"supersessions",json::array()}};
       if (action == "record_pattern_application") {
         auto pattern = next.type == "pattern" ? kbpat::read(next.content,next.title) : std::optional<kbpat::Pattern>();
@@ -1259,6 +1407,53 @@ class KnowledgeBase final : public Object {
         mark_dirty(next.id); request_sync(); changed(creating ? "entryAdded" : "entryUpdated", event_json(next));
         reply_to(correlation, {{"success",true},{"receipt",receipt}});
       });
+    });
+  }
+
+  /// One prediction or assumption that rested on an entry held or missed.
+  /// It counts toward the entry's evidence and changes no claim: no revision,
+  /// no updatedAt (a reviewer's selected version for another effect stays
+  /// valid), allowed on user-authored entries, and no receipt in the learning
+  /// history (the effect id joins the entry's recent observations instead,
+  /// which keeps redelivery idempotent). An archived entry is unavailable.
+  void observe_entry(const std::string& correlation, const json& decision, const json& effect, const Entry& current) {
+    const json input = effect.contains("input") && effect["input"].is_object() ? effect["input"] : json::object();
+    const std::string effect_id = str_or(effect, "id", ""), outcome = str_or(input, "outcome", "");
+    auto reject = [this, correlation](const std::string& error) { reply_to(correlation, {{"success", false}, {"retryable", false}, {"error", error}}); };
+    if (current.archived) { reject("Knowledge target unavailable: the entry is archived"); return; }
+    if (outcome != "held" && outcome != "missed") { reject("An entry observation is held or missed"); return; }
+    if (!input.contains("cited") || !input["cited"].is_boolean()) { reject("Say whether the entry was cited or only shown"); return; }
+    const bool cited = input["cited"].get<bool>(), held = outcome == "held";
+    Entry next = current;
+    int64_t& counter = cited ? (held ? next.evidence.held : next.evidence.missed)
+                             : (held ? next.evidence.shown_held : next.evidence.shown_missed);
+    counter++;
+    const int64_t now = static_cast<int64_t>(now_ms());
+    next.evidence.last_tested_at = std::max(next.evidence.last_tested_at, now);
+    next.evidence.remember_effect(effect_id);
+    const json receipt = {{"effectId", effect_id}, {"decisionId", decision["id"]}, {"goalId", decision["goalId"]}, {"action", "observe_entry"},
+                          {"outcome", outcome}, {"cited", cited}, {"at", now}, {"knowledgeRef", next.knowledge_ref()}, {"evidence", next.evidence.counters()}};
+    pending_learning_.insert(next.id);
+    request("@Storage", "set", {{"key", ENTRY_KEY_PREFIX + next.id}, {"value", next.to_json()}}, [this, correlation, next, receipt](const Result& saved) {
+      pending_learning_.erase(next.id);
+      if (!saved.ok || saved.payload == false || (saved.payload.is_object() && saved.payload.contains("success") && !bool_or(saved.payload, "success", false))) {
+        reply_to(correlation, {{"success", false}, {"retryable", true}, {"error", "Knowledge persistence rejected"}}); return;
+      }
+      // Reads and usefulness credit that landed while the write was in flight
+      // belong to the live entry.
+      Entry merged = next;
+      auto live = entries_.find(next.id);
+      if (live != entries_.end()) {
+        merged.access_count = std::max(merged.access_count, live->second.access_count);
+        merged.last_accessed_at = std::max(merged.last_accessed_at, live->second.last_accessed_at);
+        merged.useful_count = std::max(merged.useful_count, live->second.useful_count);
+        merged.last_useful_at = std::max(merged.last_useful_at, live->second.last_useful_at);
+      }
+      const bool counters_moved = merged.access_count != next.access_count || merged.useful_count != next.useful_count;
+      entries_[next.id] = merged;
+      if (counters_moved) persist_entry(entries_[next.id]);
+      mark_dirty(next.id); request_sync(); changed("entryUpdated", event_json(merged));
+      reply_to(correlation, {{"success", true}, {"receipt", receipt}});
     });
   }
 
@@ -1517,7 +1712,9 @@ class KnowledgeBase final : public Object {
     if (existing) {
       if (busy_learning(req, existing->id)) return;
       if (existing->learning.is_object() && (existing->archived || !existing->learning.value("supersessions",json::array()).empty())) { req.reply({{"success",false},{"error","Retired knowledge requires an explicit revision"},{"id",existing->id}}); return; }
+      const std::string old_claim = existing->claim_text();
       existing->content = type == "pattern" ? *revise_pattern(title, content, existing->content) : body;
+      if (existing->claim_text() != old_claim) existing->evidence.reset_for_new_claim(now);
       if (p.contains("tags") && p["tags"].is_array()) existing->tags = tags;
       existing->archived = false;
       existing->updated_at = std::max(now, existing->updated_at + 1);
@@ -1576,6 +1773,10 @@ class KnowledgeBase final : public Object {
 
     struct Row { const Entry* entry; std::string snippet; double score; bool scored; };
     std::vector<Row> rows;
+    // 'uncertain': what agents rely on most but know least about first, the
+    // entries most worth testing. Ranks the whole filtered pool, then cuts.
+    const bool by_uncertainty = str_or(p, "order", "") == "uncertain";
+    const size_t pool = by_uncertainty ? SIZE_MAX : max;
 
     const std::vector<std::string> query_terms = kb::tokenize(query);
     if (!query_terms.empty()) {
@@ -1591,7 +1792,7 @@ class KnowledgeBase final : public Object {
         if (min_goals > 0 && receipt_goals(e.learning) < min_goals) continue;
         const std::string shown = e.type == "pattern" ? e.to_presented_json()["content"].get<std::string>() : e.content;
         rows.push_back({&e, kb::make_snippet(shown, query_terms), hit.score, true});
-        if (rows.size() >= max) break;
+        if (rows.size() >= pool) break;
       }
     } else {
       // Without a query the candidates are ordered by recency, or by worth
@@ -1613,8 +1814,14 @@ class KnowledgeBase final : public Object {
         // Patterns are stored as JSON; the snippet shows the prose a reader sees.
         const std::string shown = e->type == "pattern" ? e->to_presented_json()["content"].get<std::string>() : e->content;
         rows.push_back({e, clip_utf8(shown, 160), 0, false});
-        if (rows.size() >= max) break;
+        if (rows.size() >= pool) break;
       }
+    }
+    if (by_uncertainty) {
+      const int64_t now = static_cast<int64_t>(now_ms());
+      auto worth_testing = [now](const Entry* e) { return reliance(*e) * e->evidence.uncertainty(now); };
+      std::stable_sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) { return worth_testing(a.entry) > worth_testing(b.entry); });
+      if (rows.size() > max) rows.resize(max);
     }
 
     // Count the read. Counters live in one small key (see ACCESS_KEY); the
@@ -1629,6 +1836,9 @@ class KnowledgeBase final : public Object {
                         {"type", row.entry->type}, {"tags", row.entry->tags},
                         {"snippet", row.entry->learning.is_object() ? clip_utf8(row.entry->to_presented_json()["content"].get<std::string>(), 240) : row.snippet}, {"knowledgeRef", row.entry->knowledge_ref()},
                         {"learning", include_learning ? row.entry->learning : learning_summary(row.entry->learning)}};
+        // Compact: a preview carries evidence only once the entry was tested
+        // (absent means untested).
+        if (row.entry->evidence.tested()) preview["evidence"] = row.entry->evidence.view(static_cast<int64_t>(now_ms()));
         if (row.scored) preview["score"] = row.score;
         out.push_back(std::move(preview));
       } else {
@@ -1905,6 +2115,7 @@ class KnowledgeBase final : public Object {
       return;
     }
     Entry& e = it->second;
+    const std::string old_claim = e.claim_text();
     const auto old_pattern = e.type == "pattern" ? kbpat::read(e.content, e.title) : std::optional<kbpat::Pattern>();
     const int64_t revision = e.type == "pattern"
       ? (old_pattern && old_pattern->learning.is_object() ? int_or(old_pattern->learning, "revision", 1) : 1) : e.updated_at;
@@ -1933,6 +2144,7 @@ class KnowledgeBase final : public Object {
       }
     }
     const int64_t now = static_cast<int64_t>(now_ms());
+    if (e.claim_text() != old_claim) e.evidence.reset_for_new_claim(now);
     e.updated_at = std::max(now, e.updated_at + 1);
     index_.add(e.id, e.title, index_text(e), e.tags);
     save_entry(e);
@@ -1943,6 +2155,12 @@ class KnowledgeBase final : public Object {
   }
 
   // ── Query helpers ──────────────────────────────────────────────────────
+
+  /// How much agents lean on an entry: reads, and reviewer-confirmed help
+  /// counted double.
+  static double reliance(const Entry& e) {
+    return 1.0 + static_cast<double>(e.access_count) + 2.0 * static_cast<double>(e.useful_count);
+  }
 
   bool has_any_tag(const Entry& e, const std::vector<std::string>& wanted) const {
     for (const auto& w : wanted) {
@@ -2199,6 +2417,14 @@ class KnowledgeBase final : public Object {
     int64_t local_stamp = 0;
     if (pending_learning_.count(id)) return false;
     auto local = entries_.find(id);
+    // Evidence counters move without touching updatedAt, so last-writer-wins
+    // cannot carry them: a peer's counters are folded in whether or not its
+    // copy of the entry wins.
+    const json* remote_body = raw.contains("entry") && raw["entry"].is_object() ? &raw["entry"] : nullptr;
+    if (local != entries_.end() && remote_body && remote_body->contains("evidence") &&
+        local->second.evidence.merge(Evidence::from_json((*remote_body)["evidence"]))) {
+      persist_entry(local->second);
+    }
     if (local != entries_.end() && !local->second.preserves_learning(raw.value("entry",json::object()).value("learning",json()))) return false;
     if (local != entries_.end()) {
       have_local_stamp = true;
@@ -2230,6 +2456,7 @@ class KnowledgeBase final : public Object {
     // A peer that predates provenance sends no creator; the publishing peer
     // is the best available attribution.
     if (re.creator_peer_id.empty()) re.creator_peer_id = remote_peer;
+    if (local != entries_.end()) re.evidence.merge(local->second.evidence);
 
     tombstones_.erase(id);
     const bool is_new = !entries_.count(id);
@@ -2279,6 +2506,7 @@ class KnowledgeBase final : public Object {
       auto it = entries_.find(re.id);
       if (pending_learning_.count(re.id) || (it != entries_.end() && !it->second.preserves_learning(re.learning))) continue;
       if (it == entries_.end() || re.updated_at > it->second.updated_at) {
+        if (it != entries_.end()) re.evidence.merge(it->second.evidence);
         const std::string rid = re.id;
         const bool is_new = it == entries_.end();
         if (!is_new) index_.remove(rid);
@@ -2361,7 +2589,10 @@ class KnowledgeBase final : public Object {
     }
 
     // Cap the ACTIVE store by archiving the least useful entries first
-    // (usefulCount, then accessCount). Protected entries are exempt.
+    // (usefulCount, then flagged evidence, then accessCount). Protected
+    // entries are exempt. An entry whose tests mostly missed goes before an
+    // equally useful one however often it was read: reads alone do not keep
+    // a belief that keeps failing.
     size_t active_count = 0;
     for (const auto& [_, e] : entries_) {
       if (!e.archived) active_count++;
@@ -2372,8 +2603,9 @@ class KnowledgeBase final : public Object {
         if (!e.archived && !is_protected(e)) candidates.push_back(&e);
       }
       std::sort(candidates.begin(), candidates.end(), [](const Entry* a, const Entry* b) {
-        return a->useful_count != b->useful_count ? a->useful_count < b->useful_count
-                                                  : a->access_count < b->access_count;
+        if (a->useful_count != b->useful_count) return a->useful_count < b->useful_count;
+        if (a->evidence.flagged() != b->evidence.flagged()) return a->evidence.flagged();
+        return a->access_count < b->access_count;
       });
       size_t excess = active_count - MAX_ENTRIES;
       for (Entry* e : candidates) {

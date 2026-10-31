@@ -48,6 +48,28 @@ export interface KnowledgeLearning {
   disputes: Array<{ explanation: string; scope: string; effectId: string }>;
   scope?: string;
 }
+
+/**
+ * Evidence counters on a knowledge entry: predictions and assumptions that
+ * rested on it and held or missed. `held`/`missed` count those that cited
+ * the entry; `shownHeld`/`shownMissed` those where it was only shown (a
+ * suspect, weaker evidence). The KnowledgeBase derives `confidence` (the
+ * chance the entry's claim holds) and `uncertainty` from them, with
+ * uncertainty growing again as time passes since `lastTestedAt`.
+ */
+export interface EntryEvidence {
+  held: number;
+  missed: number;
+  shownHeld: number;
+  shownMissed: number;
+  lastTestedAt?: number;
+  /** Derived: the chance the claim holds, from the counts. */
+  confidence?: number;
+  /** Derived: 0 (well tested, recently) to 1 (untested or long untested). */
+  uncertainty?: number;
+  /** Set when misses outnumber holds after enough tests: the entry needs narrowing or a dispute. */
+  flagged?: boolean;
+}
 /** A replacement changed in this decision must still be at the acknowledged revision. */
 export function replacementEffect(decision: LearningDecision, effect: LearningEffect): LearningEffect | undefined {
   return decision.effects.filter(e => e !== effect && e.input.id === effect.input.replacementId
@@ -57,7 +79,7 @@ export function validateLearningEffect(decision: LearningDecision, effect: Learn
   if (decision.paused) return 'Learning paused; explicit resumption required';
   if (effect.dependsOn?.some(id => decision.effects.find(e => e.id === id)?.state !== 'applied')) return 'Waiting for acknowledged replacement effects';
   const p = effect.input;
-  if (!['save_entry', 'update_entry', 'archive_entry', 'supersede_entry', 'dispute_entry', 'confirm_entry', 'narrow_entry', 'record_pattern_application', 'observe_pattern', 'no_change'].includes(String(p.action))) return 'Unknown knowledge disposition';
+  if (!['save_entry', 'update_entry', 'archive_entry', 'supersede_entry', 'dispute_entry', 'confirm_entry', 'narrow_entry', 'record_pattern_application', 'observe_pattern', 'observe_entry', 'no_change'].includes(String(p.action))) return 'Unknown knowledge disposition';
   if (typeof p.evidence !== 'string' || !p.evidence.trim()) return 'Explain what the evidence establishes (or the remaining uncertainty)';
   if (p.action === 'no_change') return;
   if (!Object.keys(decision.evidence).length) return 'Missing explicit references to recorded episode evidence';
@@ -73,6 +95,12 @@ export function validateLearningEffect(decision: LearningDecision, effect: Learn
     // A verdict on a pattern this goal did not formally apply: kept beside
     // its recorded uses as weaker evidence, never counted as one of them.
     if (!['helpful','no_effect','harmful','inconclusive'].includes(String(p.verdict))) return 'Invalid pattern usefulness verdict';
+  } else if (p.action === 'observe_entry') {
+    // One prediction or assumption that rested on this entry, held or
+    // missed: a counter on the entry, never a change to its claim, so it
+    // needs no selected version.
+    if (p.outcome !== 'held' && p.outcome !== 'missed') return 'An entry observation is held or missed';
+    if (typeof p.cited !== 'boolean') return 'Say whether the entry was cited or only shown';
   } else if (p.action === 'save_entry') {
     if (typeof p.title !== 'string' || !p.title.trim() || typeof p.content !== 'string' || !p.content.trim()) return 'New knowledge needs title and content';
     if (p.type !== undefined && !['fact', 'learned', 'insight', 'reference', 'pattern'].includes(String(p.type))) return 'Invalid knowledge type';

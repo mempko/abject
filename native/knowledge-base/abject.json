@@ -1,6 +1,6 @@
 {
   "name": "KnowledgeBaseCpp",
-  "version": "3.9.0",
+  "version": "3.10.0",
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace",
@@ -44,7 +44,7 @@
       "id": "abjects:knowledge-base",
       "methods": [
         {
-          "description": "Apply an authenticated journaled correction with a durable idempotent receipt",
+          "description": "Apply an authenticated journaled correction with a durable idempotent receipt. observe_entry {id, outcome: 'held'|'missed', cited} records one prediction or assumption that rested on an entry: it counts toward the entry's evidence (held/missed when cited, shownHeld/shownMissed when only shown) and changes no claim, revision or updatedAt",
           "name": "applyLearningDecision",
           "parameters": [
             {
@@ -129,7 +129,7 @@
           }
         },
         {
-          "description": "Search knowledge entries by query (BM25-ranked full text, title-boosted), type, or tags. Each result carries a snippet and score. Pass previews: true for compact {id, title, snippet} results, then fetch winners with get.",
+          "description": "Search knowledge entries by query (BM25-ranked full text, title-boosted), type, or tags. Each result carries a snippet and score. Pass previews: true for compact {id, title, snippet} results, then fetch winners with get. Full entries carry evidence {held, missed, shownHeld, shownMissed, lastTestedAt, confidence, uncertainty, flagged}: how often predictions resting on the entry held; previews carry it once the entry was tested.",
           "name": "recall",
           "parameters": [
             {
@@ -186,7 +186,7 @@
               }
             },
             {
-              "description": "Without a query: 'recent' (default) or 'worth' (user-written first, then reviewer-confirmed useful, then recent)",
+              "description": "Without a query: 'recent' (default) or 'worth' (user-written first, then reviewer-confirmed useful, then recent). 'uncertain' (with or without a query): entries relied on most and tested least first, by (1 + accessCount + 2 * usefulCount) * evidence.uncertainty",
               "name": "order",
               "optional": true,
               "type": {
@@ -689,6 +689,6 @@
       "system",
       "knowledge"
     ],
-    "version": "3.9.0"
+    "version": "3.10.0"
   }
 }

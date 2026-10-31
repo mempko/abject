@@ -21,6 +21,7 @@ import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { looksLikeAbsenceClaim, looksLikeClaim } from '../core/claims.js';
 import { replyKindQuestions, REPLY_KINDS_TO_AUDIT, criterion, instruction } from '../core/decision-questions.js';
 import { choiceOf, type DecisionOutcome, type DecisionQuestion } from '../llm/decision.js';
+import { REACTION_KINDS, reactionKindOf, type ReactionKind } from '../core/surprise.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { UndoHistory, UndoRefused, UNDO_EVENTS, undoMethods } from '../core/undo.js';
@@ -81,6 +82,47 @@ const ROUTE_HINTS: Record<string, string> = {
   remember: 'a personal fact worth remembering',
   clarify: 'ambiguous in a way only the user can settle',
 };
+
+/**
+ * How the person took the last result (site chat.reaction): read from their
+ * first message after a goal's outcome. Their reactions are the surprise that
+ * matters most, so any kind but neutral goes to GoalManager for review.
+ */
+const REACTION_CRITERIA: Record<ReactionKind, Record<string, unknown>> = {
+  satisfied: criterion('Says the result worked or is welcome.', {
+    examples: ['thanks, that worked', 'looks good', 'perfect'],
+  }),
+  correction: criterion('Says the result is wrong or incomplete, naming what is off.', {
+    examples: ["that's not the file I meant", 'you missed two', 'the total should be 40'],
+  }),
+  redirect: criterion('Asks for something different in place of what was done.', {
+    notFor: 'A new request unrelated to the result, which is neutral.',
+    examples: ['actually do it for the work account', 'use the other folder instead'],
+  }),
+  unhappy: criterion('Displeased with the result without saying how to fix it.', {
+    examples: ["that's not what I wanted", 'ugh', 'this is useless'],
+  }),
+  neutral: criterion('An unrelated new request, a follow-up question, or small talk that says nothing about the result.', {
+    examples: ["what's the weather tomorrow?", 'tell me more about the second item'],
+  }),
+};
+
+const CHAT_REACTION_QUESTION: DecisionQuestion = {
+  type: 'choice',
+  instructions: instruction('`last_result` is the result the assistant just delivered for a goal. How does `message`, the person\'s next message, take that result?', {
+    focus: 'What the message says about the delivered result: welcome, wrong, wanted differently, or a letdown.',
+    notFor: 'Whether the message is itself a new request; read only what it says about the last result.',
+  }),
+  criteria: Object.fromEntries(REACTION_KINDS.map(k => [k, REACTION_CRITERIA[k]])),
+};
+
+/** How long after a result the person's next message still reads as a reaction to it. */
+const REACTION_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** A reaction is recorded when its kind reads at least this likely. */
+const REACTION_MIN_P = 0.6;
+
+/** A delivered goal result awaiting the person's next message. */
+interface PendingOutcome { goalId: string; title: string; result: string; at: number }
 
 type ChatTurn = { success: boolean; result?: unknown; error?: string; maxStepsReached?: boolean; goalCreated: boolean };
 
@@ -366,6 +408,13 @@ export class Chat extends Abject {
     finishedAt: number;
     resultPreview?: string;
   }> = [];
+
+  /**
+   * The last goal result this conversation delivered, until the person's
+   * next message is read as their reaction to it (site chat.reaction). Only
+   * the first message after a result counts; a new goal clears it.
+   */
+  private pendingOutcome?: PendingOutcome;
 
   /** Task info per goal, fetched from GoalManager. */
   private liveTasks = new Map<string, ChatActivityTask[]>();
@@ -1556,6 +1605,12 @@ export class Chat extends Abject {
     await this.persistActiveGoal(undefined);
     this.removeActivity();
     await this.deliverLateGoalOutcome({ status, result, error, goalId });
+    // The person's next message may react to this result. A stop they asked
+    // for is their own doing, not a result to react to.
+    this.pendingOutcome = userStopped ? undefined : {
+      goalId, title: entry.title, at: Date.now(),
+      result: oneLine(status === 'completed' ? resultText(result) ?? '' : `did not complete: ${error ?? 'unknown error'}`, 400),
+    };
     // The job lands: a burst on success, a glitch when it fell over (a stop
     // the user asked for is their own doing and plays nothing).
     if (status === 'completed') this.playEffect('burst');
@@ -1870,6 +1925,7 @@ export class Chat extends Abject {
             ...(context ? { context } : {}),
           }));
           this._currentGoalId = created.goalId;
+          this.pendingOutcome = undefined;
           this.goalPaused = false;
           this.liveGoals.set(created.goalId, { title, description, status: 'active', createdAt: Date.now() });
           this.emitGoalActivity();
@@ -2476,10 +2532,17 @@ A single successful creation goal is a complete turn. End it with **done**.
    */
   private async routeAndRunTurn(
     userText: string, initialMessages: { role: string; content: string | ContentPart[] }[], newAttachment: boolean, desktop: boolean,
+    reactingTo?: PendingOutcome,
   ): Promise<ChatTurn> {
     const mode = userText.trim() ? await this.decisionSiteMode('chat.route') : 'off';
-    if (mode === 'off') return this.runTaskTurn(userText, initialMessages, desktop);
-    const r = await this.decideRoute(userText, newAttachment);
+    // The reaction reading rides on the routing call when there is one, and
+    // runs beside the turn otherwise; it never holds up the reply.
+    const reaction = reactingTo && await this.decisionSiteMode('chat.reaction') !== 'off' ? reactingTo : undefined;
+    if (mode === 'off') {
+      if (reaction) void this.classifyReaction(reaction, userText);
+      return this.runTaskTurn(userText, initialMessages, desktop);
+    }
+    const r = await this.decideRoute(userText, newAttachment, reaction);
     if (r) log.info(`[decision:${r.outcome.mode}] chat.route: ${r.route}@${r.routeP.toFixed(2)}`);
     if (r && r.outcome.mode === 'act' && r.route === 'goal_self_contained' && r.routeP >= 0.9 && !newAttachment) {
       log.info('[decision:act] chat.route: creating the goal directly');
@@ -2491,16 +2554,69 @@ A single successful creation goal is a complete turn. End it with **done**.
     return this.runTaskTurn(userText, hinted, desktop);
   }
 
-  private async decideRoute(userText: string, newAttachment: boolean): Promise<{ outcome: DecisionOutcome; route: string; routeP: number } | null> {
+  private async decideRoute(userText: string, newAttachment: boolean, reactingTo?: PendingOutcome): Promise<{ outcome: DecisionOutcome; route: string; routeP: number } | null> {
     const recent = this.conversationHistory.filter(e => e.media !== true).slice(-7, -1)
       .map(e => ({ role: e.role, content: withCardText(e).slice(0, 500) }));
     const recentGoals = [...this.liveGoals.values()].slice(-3).map(g => ({ title: g.title, status: g.status }));
     const outcome = await this.askDecision('chat.route', {
       message: userText.slice(0, 3000), recent, recent_goals: recentGoals, has_new_attachment: newAttachment,
-    }, CHAT_ROUTE_QUESTIONS, { onBehalfOf: 'Chat' });
+      ...(reactingTo ? { last_result: { goal: reactingTo.title, result: reactingTo.result } } : {}),
+    }, reactingTo ? { ...CHAT_ROUTE_QUESTIONS, reaction: CHAT_REACTION_QUESTION } : CHAT_ROUTE_QUESTIONS, { onBehalfOf: 'Chat' });
+    if (reactingTo) {
+      // No reading came back (the routing site may want a native model the
+      // reaction site does without): ask the reaction question on its own.
+      if (outcome && choiceOf(outcome, 'reaction')) void this.takeReaction(reactingTo, userText, outcome).catch(() => { /* logged inside */ });
+      else void this.classifyReaction(reactingTo, userText);
+    }
     const route = choiceOf(outcome, 'route');
     if (!outcome || !route) return null;
     return { outcome, route: route.choice, routeP: route.probabilities[route.choice] ?? 0 };
+  }
+
+  /**
+   * The pending result the person's message reacts to, taken once: the first
+   * message after a result, within a day and with no goal running, counts.
+   */
+  private takePendingOutcome(): PendingOutcome | undefined {
+    const pending = this.pendingOutcome;
+    this.pendingOutcome = undefined;
+    if (!pending || this._currentGoalId) return undefined;
+    return Date.now() - pending.at <= REACTION_WINDOW_MS ? pending : undefined;
+  }
+
+  /** Read the person's reaction to a result in a call of its own (site chat.reaction). */
+  private async classifyReaction(reactingTo: PendingOutcome, userText: string): Promise<void> {
+    try {
+      const outcome = await this.askDecision('chat.reaction', {
+        message: userText.slice(0, 3000),
+        last_result: { goal: reactingTo.title, result: reactingTo.result },
+      }, { reaction: CHAT_REACTION_QUESTION }, { onBehalfOf: 'Chat', goalId: reactingTo.goalId });
+      await this.takeReaction(reactingTo, userText, outcome);
+    } catch (err) {
+      log.warn(`[Chat] reaction not recorded: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Record a reading of the person's reaction: any kind but neutral, read
+   * clearly enough, goes to GoalManager for the goal it answers.
+   */
+  private async takeReaction(reactingTo: PendingOutcome, userText: string, outcome: DecisionOutcome | null): Promise<void> {
+    precondition(!!reactingTo.goalId, 'a reaction answers a goal');
+    const answer = choiceOf(outcome, 'reaction');
+    const kind = reactionKindOf(answer?.choice);
+    if (!outcome || !answer || !kind) return;
+    const p = answer.probabilities[kind] ?? 0;
+    log.info(`[decision:${outcome.mode}] chat.reaction: ${kind}@${p.toFixed(2)} (goal ${reactingTo.goalId.slice(0, 8)})`);
+    if (kind === 'neutral' || p < REACTION_MIN_P || !this.goalManagerId) return;
+    // Advising, the reading is only logged (a combined routing call carries
+    // the routing site's mode, so the reaction site's own mode decides).
+    if (await this.decisionSiteMode('chat.reaction') !== 'act') return;
+    await this.request(request(this.id, this.goalManagerId, 'recordReaction', {
+      goalId: reactingTo.goalId, kind, text: userText.slice(0, 2000), source: 'chat',
+    }), 10_000).catch((err) => {
+      log.warn(`[Chat] recordReaction failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
   /**
@@ -2543,6 +2659,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     // The user's message joins the transcript. Skipped when empty (an
     // image-only send, where the image messages were already committed).
     this.turnChoices = undefined;
+    const reactingTo = userText ? this.takePendingOutcome() : undefined;
     if (userText) {
       this.markQuestionAnswered();
       const id = uuidv4();
@@ -2589,7 +2706,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       // Goal is created on the first `goal` action — Chat creates it via
       // GoalManager.createGoal, ScrumMaster runs the scrum cycle (plan,
       // execute, plan again or declare done), and emits goalCompleted.
-      let turn = await this.routeAndRunTurn(userText, initialMessages, attachmentsInjected, desktop);
+      let turn = await this.routeAndRunTurn(userText, initialMessages, attachmentsInjected, desktop, reactingTo);
 
       // Self-audit: a `done` that reports an action or a verified outcome but
       // ran NO goal this turn is ungrounded — the model can't have done or

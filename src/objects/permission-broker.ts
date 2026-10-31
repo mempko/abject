@@ -114,6 +114,12 @@ const EXPLAIN_CACHE_MAX = 64;
 /** How long a "for this task" grant survives without being renewed. */
 const SESSION_GRANT_MS = 30 * 60 * 1000;
 
+/** How long a task's read-only status is trusted before AgentAbject is asked again. */
+const READ_ONLY_CACHE_MS = 15_000;
+
+/** Task statuses kept before stale ones are swept. */
+const READ_ONLY_CACHE_MAX = 256;
+
 /** Auto-approvals one caller may take before it has to check in again. */
 const DEFAULT_BUDGET = 200;
 
@@ -298,6 +304,8 @@ export class PermissionBroker extends Abject {
 
   /** Cached workspace facts; short-lived because access mode is user-editable. */
   private wsCache?: { at: number; rows: WorkspaceRow[] };
+  /** Whether a task is a read-only check step, as its AgentAbject said (briefly cached). */
+  private readOnlyTasks = new Map<string, { at: number; readOnly: boolean }>();
 
 
 
@@ -710,6 +718,8 @@ export class PermissionBroker extends Abject {
     contractRequire(typeof req?.resource === 'string', 'resource must be a string');
 
     const ctx = await this.callerContext(req.callerId);
+    const checkStep = req.taskId ? await this.checkStepRefusal(req, ctx) : undefined;
+    if (checkStep) return checkStep;
     if (req.type === 'shell') return this.decideShell(req, ctx);
     if (req.type === 'directory') return this.decideDirectory(req, ctx);
     if (isOutward(req.type)) return this.decideOutward(req, ctx);
@@ -721,6 +731,59 @@ export class PermissionBroker extends Abject {
       return { decision: standing ? 'accept_once' : 'deny', asked: false, restrictEnv: false };
     }
     return this.ask(req, ctx, undefined, 'no policy covers this request type');
+  }
+
+  /**
+   * A read-only check step (a task the planner staged to test a belief before
+   * acting on it) only reads. Anything else it asks for is refused here
+   * without a question: the person never sees a prompt they would have to
+   * refuse. Reads go on to the usual rules, so this only ever restricts.
+   * Undefined when the request carries on as normal.
+   */
+  private async checkStepRefusal(req: PermissionRequest, ctx: CallerContext): Promise<Outcome | undefined> {
+    contractRequire(typeof req.taskId === 'string' && req.taskId.length > 0, 'a check step is named by its task');
+    if (!await this.isReadOnlyTask(req.taskId!, ctx)) return undefined;
+    let reads: boolean;
+    if (req.type === 'shell' || req.type === 'skill_shell') reads = analyzeCommand(req.resource, { cwd: req.cwd }).effect === 'read';
+    else if (req.type === 'directory') reads = (req.operation ?? 'read') === 'read';
+    // HTTP verbs are filtered in the agent runtime; the domain itself is a read.
+    else if (req.type === 'domain') reads = true;
+    else reads = false;
+    if (reads) return undefined;
+    const what = isOutward(req.type) ? 'acts outside this machine'
+      : req.type === 'directory' ? 'writes a file' : req.type === 'domain' ? 'is not a read' : 'changes something';
+    this.record(req, ctx, 'deny', false, `read-only check step: this request ${what}`);
+    return { decision: 'deny', asked: false, restrictEnv: false };
+  }
+
+  /**
+   * Whether the AgentAbject running a task reports it read-only: the caller's
+   * workspace's AgentAbject, or the global one for a caller in no workspace.
+   * False when the status is unknown, which leaves the request unchanged.
+   */
+  private async isReadOnlyTask(taskId: string, ctx: CallerContext): Promise<boolean> {
+    const now = Date.now();
+    const cached = this.readOnlyTasks.get(taskId);
+    if (cached && now - cached.at < READ_ONLY_CACHE_MS) return cached.readOnly;
+    let readOnly = false;
+    try {
+      const row = ctx.workspaceId ? (await this.workspaceRows()).find(r => r.workspaceId === ctx.workspaceId) : undefined;
+      const agentId = row
+        ? (await this.request<Array<{ id: AbjectId }>>(request(this.id, row.registryId, 'discover', { name: 'AgentAbject' }), 5_000))[0]?.id
+        : await this.discoverDep('AgentAbject');
+      if (agentId) {
+        const status = await this.request<{ readOnly?: boolean } | null>(
+          request(this.id, agentId, 'getTaskStatus', { taskId }), 5_000);
+        readOnly = status?.readOnly === true;
+      }
+    } catch {
+      // Unknown status: no change to the request.
+    }
+    this.readOnlyTasks.set(taskId, { at: now, readOnly });
+    if (this.readOnlyTasks.size > READ_ONLY_CACHE_MAX) {
+      for (const [id, entry] of this.readOnlyTasks) if (now - entry.at >= READ_ONLY_CACHE_MS) this.readOnlyTasks.delete(id);
+    }
+    return readOnly;
   }
 
   private async decideShell(req: PermissionRequest, ctx: CallerContext): Promise<Outcome> {

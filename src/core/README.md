@@ -191,6 +191,38 @@ message.
   ScriptableAbject records `saveData({ undo })`; AbjectStore sets removed
   objects aside for the session and three days. See their READMEs.
 
+## Surprise and learning
+
+`surprise.ts` is the vocabulary of the predict, judge, blame, update loop;
+the objects do the rest by message. A system that states what it expects can
+measure how surprised it was, surprise is where its model needs updating, and
+learning shows as being surprised less in repeated contexts.
+
+- **Predictions carry a confidence.** An agent's action states `expect` and
+  `confidence` (`sure`, `likely`, `guess`; `CONFIDENCE_P` maps them to 0.95,
+  0.75, 0.5). Once judged, `surpriseBits()` and `brier()` say how surprising
+  the outcome was and how calibrated the agent is. Each prediction has a
+  `contextKey()` (agent, action, target, method); surprise per context by
+  `occurrenceBucket()` is the learning curve GoalManager keeps.
+- **Goals state assumptions.** A plan names what it assumes about what the
+  person wants (`about`: intent, scope, preference) and about the world, each
+  with a confidence and a `costIfWrong` (`undoable`, `costly`,
+  `irreversible`). `needsAsking()` picks the ones to put to the person (a
+  guess, or a likely claim that cannot be taken back), within
+  `QUESTION_BUDGET`; the answer confirms or corrects the guess, which is the
+  safe way to seek surprise. `needsCheck()` picks world claims worth a
+  read-only check step (`isReadOperation()` decides what a check may call),
+  at most `CHECK_TASKS_PER_GOAL`. Nothing runs outside a goal the person
+  started.
+- **The person's reactions are the most valuable surprise.** A correction,
+  redirect or unhappy reply after a result (`ReactionKind`,
+  `isNegativeReaction()`) is recorded on the goal and reviewed first.
+- **Blame names a belief.** A miss is attributed to an `AttributionSource`:
+  prior, entry, pattern, link, world, runtime, assumption, or `unassigned`
+  (recorded and counted, never refused). `BELIEF_SOURCES` are the ones the
+  system can correct; knowledge entries keep `EntryEvidence` counters
+  (`observe_entry` in `learning.ts`).
+
 ## Files
 
 ### Object model and messages
@@ -395,7 +427,15 @@ All but `file-edit.ts` and `tool-output.ts` import Node built-ins (`fs`,
   `validateLearningEffect()` (the accepted knowledge dispositions such as
   `save_entry`, `supersede_entry`, `record_pattern_application`),
   `canonical()` and `learningFingerprint()`. `observe_pattern` is a verdict on
-  a pattern the goal did not formally apply, kept beside its recorded uses.
+  a pattern the goal did not formally apply, kept beside its recorded uses;
+  `observe_entry` counts one prediction or assumption that rested on an entry
+  and held or missed (`EntryEvidence`), without changing the entry's claim.
+- **surprise.ts**: the vocabulary of surprise (see Surprise and learning):
+  `Confidence`, `surpriseBits()`, `brier()`, `AttributionSource`,
+  `Assumption` with `parseAssumption()`, `needsAsking()`, `needsCheck()`,
+  `QUESTION_BUDGET`, `CHECK_TASKS_PER_GOAL`, `Reaction` and
+  `ReactionKind`, `contextKey()`, `occurrenceBucket()`, `weekOf()`, and
+  `isReadOperation()` for read-only check steps.
 - **evidence.ts**: learning evidence by reference. A decision or knowledge
   receipt cites a record as `{hash, digest}` (`evidenceReference()`,
   `evidenceDigest()`: expectation, outcome, verdict, explanation, attribution,

@@ -12,6 +12,7 @@ import { require as contractRequire, requireNonEmpty } from '../core/contracts.j
 import { Sandbox, SandboxTimeLimitError } from '../core/sandbox.js';
 import { Log } from '../core/timed-log.js';
 import { levenshtein } from './source-diff.js';
+import { isReadOperation } from '../core/surprise.js';
 
 const log = new Log('JobManager');
 
@@ -39,6 +40,12 @@ export interface Job {
   code: string;
   callerId: AbjectId;
   taskId?: string;
+  /**
+   * Set only for AgentAbject's own observe/think/act dispatch jobs (checked
+   * at submit): AgentAbject holds a check step's action to reads before it
+   * hands it over, so these are exempt from the read-only rule below.
+   */
+  runtimeStep?: boolean;
   /**
    * Message id of the submitJob request. Carried into the direct jobFailed
    * caller notification so the caller can reject exactly the pending
@@ -121,6 +128,8 @@ export class JobManager extends Abject {
                   { name: 'code', type: { kind: 'primitive', primitive: 'string' }, description: 'JavaScript code to execute' },
                   { name: 'queue', type: { kind: 'primitive', primitive: 'string' }, description: 'Named queue for concurrent execution (default: "default")', optional: true },
                   { name: 'timeoutMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Stop the job when it goes this long without progress: no call answered, no progress reported. At most a day; unset: no limit.', optional: true },
+                  { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'The agent task this job works for. When that task is a read-only check step (AgentAbject getTaskStatus readOnly), the job may only make calls that read.', optional: true },
+                  { name: 'runtimeStep', type: { kind: 'primitive', primitive: 'boolean' }, description: 'AgentAbject only: the job is its own observe/think/act dispatch for taskId.', optional: true },
                 ],
                 returns: { kind: 'reference', reference: 'JobResult' },
               },
@@ -231,6 +240,10 @@ export class JobManager extends Abject {
 
       const callerId = msg.routing.from;
       const jobId = `job-${++this.jobCounter}`;
+      const taskId = typeof (msg.payload as any)?.taskId === 'string' ? (msg.payload as any).taskId as string : undefined;
+      // The exemption is AgentAbject's alone; the flag from anyone else is ignored.
+      const runtimeStep = !!taskId && (msg.payload as { runtimeStep?: unknown }).runtimeStep === true
+        && await this.isBuiltInCaller(callerId, ['AgentAbject']);
       const resolvedQueue = queueName ?? JobManager.DEFAULT_QUEUE;
 
       const job: Job = {
@@ -239,7 +252,8 @@ export class JobManager extends Abject {
         description,
         code,
         callerId,
-        taskId: typeof (msg.payload as any)?.taskId === 'string' ? (msg.payload as any).taskId : undefined,
+        taskId,
+        ...(runtimeStep ? { runtimeStep: true } : {}),
         requestMessageId: msg.header.messageId,
         context: sanitisedContext,
         ...(typeof timeoutMs === 'number' && timeoutMs > 0 ? { timeoutMs: Math.min(timeoutMs, JOB_WAIT_MS) } : {}),
@@ -505,6 +519,30 @@ export class JobManager extends Abject {
       return id;
     };
 
+    /**
+     * Whether this job works for a read-only check step: asked of AgentAbject
+     * once, on the job's first call, and kept for the rest of the job.
+     */
+    let readOnlyTask: Promise<boolean> | undefined;
+    const isReadOnlyTask = (): Promise<boolean> => {
+      if (!job.taskId || job.runtimeStep) return Promise.resolve(false);
+      return readOnlyTask ??= this.taskIsReadOnly(job.taskId);
+    };
+
+    /** Send one call for the job; the helpers below decide whether it may go. */
+    const sendCall = async (resolved: AbjectId, actualMethod: string, actualPayload: unknown) => {
+      const msg = request(this.id, resolved as AbjectId, actualMethod, actualPayload);
+      this.invocationContexts.set(msg.header.messageId, { callerId, taskId: job.taskId, target: resolved as AbjectId });
+      running.awaiting.set(resolved, (running.awaiting.get(resolved) ?? 0) + 1);
+      try {
+        return await this.request<unknown>(msg, JOB_WAIT_MS);
+      } finally {
+        this.invocationContexts.delete(msg.header.messageId);
+        const left = (running.awaiting.get(resolved) ?? 1) - 1;
+        if (left > 0) running.awaiting.set(resolved, left); else running.awaiting.delete(resolved);
+      }
+    };
+
     const callFn = async (
       to: AbjectId | string | Promise<AbjectId>,
       method: string,
@@ -519,16 +557,15 @@ export class JobManager extends Abject {
         actualPayload = _unused;
       }
       const resolved = await resolveTarget(to);
-      const msg = request(this.id, resolved as AbjectId, actualMethod, actualPayload);
-      this.invocationContexts.set(msg.header.messageId, { callerId, taskId: job.taskId, target: resolved as AbjectId });
-      running.awaiting.set(resolved, (running.awaiting.get(resolved) ?? 0) + 1);
-      try {
-        return await this.request<unknown>(msg, JOB_WAIT_MS);
-      } finally {
-        this.invocationContexts.delete(msg.header.messageId);
-        const left = (running.awaiting.get(resolved) ?? 1) - 1;
-        if (left > 0) running.awaiting.set(resolved, left); else running.awaiting.delete(resolved);
+      // A check step's job reads only: a call that would change something is
+      // refused before it is sent, with the reason.
+      const args = actualPayload && typeof actualPayload === 'object' ? actualPayload as Record<string, unknown> : undefined;
+      if (!isReadOperation(actualMethod, args) && await isReadOnlyTask()) {
+        throw new Error(
+          `This job belongs to a read-only check step, so it makes only calls that read; '${actualMethod}' would change something and was not sent. ` +
+          'Read what the check needs (read, list, get, find, search, describe and the like) and return what you found.');
       }
+      return sendCall(resolved, actualMethod, actualPayload);
     };
 
     const progressFn = async (message?: string) => {
@@ -574,6 +611,9 @@ export class JobManager extends Abject {
       if (callerId && target === callerId) {
         throw new Error('ask: that object is you. Asking yourself returns your own description, or the busy notice while you are working — neither is evidence. Answer from what you already know, or do the work and report what it returns.');
       }
+      // A question to the Registry reads its catalog, so a check step may ask
+      // it; a question to anything else can set work going and goes by callFn.
+      if (asRegistry) return sendCall(target as AbjectId, 'ask', { question });
       return callFn(target as AbjectId, 'ask', { question });
     };
 
@@ -583,7 +623,8 @@ export class JobManager extends Abject {
      * emulating one). An explicit call, so no decision-site policy applies.
      */
     const decideFn = async (state: unknown, questions: Record<string, unknown>) =>
-      callFn('LLM', 'decide', { state, questions });
+      // A judgment changes nothing, so a check step's job may ask for one.
+      sendCall(await resolveTarget('LLM'), 'decide', { state, questions });
 
     // The inactivity limit: restarted by every stretch of code that runs
     // (each answered call, each timer) and by progress, the job's own or a
@@ -633,6 +674,23 @@ export class JobManager extends Abject {
       if (stallTimer) clearTimeout(stallTimer);
       this.running.delete(job.id);
       sandbox.dispose(`${job.id} finished`);
+    }
+  }
+
+  /**
+   * Whether an agent task is a read-only check step, by AgentAbject's
+   * getTaskStatus. Anything that cannot be confirmed (no AgentAbject, an
+   * unknown task, no answer) reads as not read-only: the rule restricts, and
+   * PermissionBroker still guards what reaches the host.
+   */
+  private async taskIsReadOnly(taskId: string): Promise<boolean> {
+    try {
+      const agents = await this.discoverDep('AgentAbject');
+      if (!agents) return false;
+      const status = await this.request<{ readOnly?: boolean } | null>(request(this.id, agents, 'getTaskStatus', { taskId }), 10_000);
+      return status?.readOnly === true;
+    } catch {
+      return false;
     }
   }
 
