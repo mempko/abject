@@ -1055,6 +1055,11 @@ export class PeerRegistry extends Abject {
   }
 
   private async connectSignalingImpl(url: string): Promise<boolean> {
+    // onStop disconnects only the clients that exist when it runs. A route
+    // still in flight (the boot-time reconnect waiting on Storage, gossip, a
+    // contact's address) would otherwise add a persistent client afterwards
+    // that retries for the life of the process.
+    if (this.stopping) return false;
     if (this.signalingClients.has(url)) return true;
     // The one gate for every route to a server: saved list, gossip, contacts'
     // addresses, the no-signaling fallback, explicit connects.
