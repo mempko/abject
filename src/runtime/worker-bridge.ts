@@ -104,7 +104,9 @@ export class WorkerBridge {
   protected worker: WorkerLike;
   protected bus: MessageBus;
   private readyResolve?: () => void;
+  private readyReject?: (err: Error) => void;
   private readyPromise: Promise<void>;
+  private wasReady = false;
   private pendingSpawns: Map<AbjectId, { resolve: () => void; reject: (err: Error) => void }> = new Map();
   private pendingKills: Map<AbjectId, { resolve: () => void; reject: (err: Error) => void }> = new Map();
   private pendingChildSignals: Map<number, (children: TrackedChild[]) => void> = new Map();
@@ -139,7 +141,9 @@ export class WorkerBridge {
   onLocalUnregistered?: (objectId: AbjectId) => void;
 
   /**
-   * Invoked once when the worker exits. Dedicated workers (UI, P2P) hook
+   * Invoked once when a worker that reported ready exits. One that dies
+   * before ready rejects waitReady() instead, and whoever waits on it owns
+   * the failure. Dedicated workers (UI, P2P) hook
    * this to announce the loss loudly — their objects are registered via
    * registerDedicatedBridge rather than hostedObjects, so the generic
    * "lost N objects" line under-reports what actually died.
@@ -153,20 +157,23 @@ export class WorkerBridge {
     this.worker = worker;
     this.bus = bus;
 
-    this.readyPromise = new Promise((resolve) => {
+    this.readyPromise = new Promise((resolve, reject) => {
       this.readyResolve = resolve;
+      this.readyReject = reject;
     });
+    // The worker can fail before anyone calls waitReady(); that must not
+    // count as an unhandled rejection. waitReady() still sees it.
+    this.readyPromise.catch(() => {});
 
     this.worker.onmessage = this.handleWorkerMessage.bind(this);
     this.worker.onerror = (e) => {
       log.error('Worker error:', e.message);
       // Reject pending ready if worker errors during init
-      if (this.readyResolve) {
-        this.readyResolve = undefined;
-      }
+      this.failReady(new Error(`Worker failed before ready: ${e.message}`));
     };
     this.worker.onexit = (e) => {
       this._dead = true;
+      this.failReady(new Error(`Worker exited with code ${e.code} before ready`));
       const objectIds = [...this.hostedObjects];
       if (this.terminating) {
         log.info(`Worker exited (code ${e.code}) after terminate(), releasing ${objectIds.length} objects`);
@@ -199,18 +206,27 @@ export class WorkerBridge {
       this.pendingKills.clear();
       this.settleChildSignals();
       // Only an unexpected exit is a death. A terminate() we issued during
-      // shutdown must not trip the "the UI is gone" alarms.
-      if (!this.terminating) {
+      // shutdown must not trip the "the UI is gone" alarms, and a worker that
+      // never came up has already failed its waitReady(); reporting it again
+      // had WorkerPool replace a replacement that failed at boot, forever.
+      if (!this.terminating && this.wasReady) {
         try { this.onDead?.(e.code, objectIds); } catch { /* observer error must not mask the exit */ }
       }
     };
   }
 
   /**
-   * Wait for the worker to report ready.
+   * Wait for the worker to report ready. Rejects if it errors or exits first.
    */
   async waitReady(): Promise<void> {
     return this.readyPromise;
+  }
+
+  private failReady(err: Error): void {
+    const reject = this.readyReject;
+    this.readyResolve = undefined;
+    this.readyReject = undefined;
+    reject?.(err);
   }
 
   /**
@@ -272,6 +288,9 @@ export class WorkerBridge {
     parentId?: AbjectId;
     typeId?: TypeId;
   }): Promise<void> {
+    // Nothing will answer a spawn posted into an exited worker. A shard whose
+    // replacement failed stays dead, and WorkerRecovery's respawns land on it.
+    if (this._dead) throw new Error(`Worker has exited; cannot spawn ${constructorName} ${objectId}`);
     return new Promise((resolve, reject) => {
       this.pendingSpawns.set(objectId, { resolve, reject });
       const msg: WorkerInboundMessage = {
@@ -443,8 +462,10 @@ export class WorkerBridge {
     switch (type) {
       case 'ready':
         if (this.readyResolve) {
+          this.wasReady = true;
           this.readyResolve();
           this.readyResolve = undefined;
+          this.readyReject = undefined;
         }
         break;
 
