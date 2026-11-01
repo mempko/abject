@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.16.2",
+    "date": "2026-11-01",
+    "title": "Agents that notice when they were wrong",
+    "summary": "Abject's agents now state what they expect, notice when they turn out wrong, work out which belief caused the miss, and adjust how far they trust that belief. You can see this learning in the Knowledge window and watch it improve over time.",
+    "highlights": [
+      "Agents now say how sure they are (sure, likely or a guess) when they predict an outcome. Each prediction is later scored against what actually happened, so the system can measure how surprised it was.",
+      "Before starting a goal, the planner lists the assumptions it is making. If it is unsure what you meant, it asks you, at most one question at the start and one during the work. If it is unsure about a fact, it first runs a short read-only check step. The goal's result includes an 'Assumed:' line so you can see what it took for granted.",
+      "Your first reply after a result is treated as a reaction to that result. A correction or a change of direction is recorded as a learning signal and can reopen the goal, even one that finished a while ago. Notes you send to redirect a goal while it runs count as reactions too.",
+      "When a prediction misses, the reviewer works out what caused it: a knowledge entry, a pattern, a link, an assumption, the outside world or the runtime. Misses it cannot place are marked unassigned rather than guessed.",
+      "Knowledge entries now keep a test record: how often they were confirmed or contradicted, plus a confidence and an uncertainty that fade over time. Recall can put the least certain entries first. Entries with a poor record are flagged and reviewed first, and an entry's record starts over when its claim changes.",
+      "The Knowledge window has a new Learning tab. It shows how often predictions are stated, judged and traced to a cause, and a learning curve of how much surprise drops as the same kind of situation comes up again. Each entry's detail view shows its test record.",
+      "Check steps are strictly read-only: the job runner refuses anything that would change state, and permission requests from a check step are denied without asking you."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.16.1",
     "date": "2026-10-27",
     "title": "Fork a conversation from any message",
