@@ -386,6 +386,12 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     const proc = spawn(this.bin, argv, { stdio: ['pipe', 'pipe', 'pipe'], cwd: this.sandboxDir() });
     trackChild(proc.pid, `CLI: ${this.bin}`, { group: false });
     proc.on('exit', () => untrackChild(proc.pid));
+    // A failed spawn (agy missing: ENOENT) arrives as 'error'. Unheard, it is
+    // an uncaught exception and 'close' never fires. Thrown after the loop.
+    let spawnError: Error | undefined;
+    proc.on('error', (err) => { if (proc.pid === undefined) spawnError ??= err; });
+    // As in runCli: the exit code already reports an early exit's EPIPE.
+    proc.stdin.on('error', () => {});
     if (stdin.length > 0) proc.stdin.end(stdin);
     else proc.stdin.end();
 
@@ -467,6 +473,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     if (timeoutFired) {
       throw new Error(`agy idle for ${this.idleTimeoutMs}ms — no output, subprocess killed`);
     }
+    if (spawnError) throw spawnError;
     // agy can report {status:'ERROR'} in the result event yet still exit 0;
     // surfacing it here keeps the caller from treating an empty stream as
     // success.

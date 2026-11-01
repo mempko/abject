@@ -140,6 +140,10 @@ function runCli(
       resolve({ code: code ?? 0, stdout, stderr });
     });
 
+    // A child that exits before reading stdin fails the write with EPIPE.
+    // 'close' reports that exit with its code and stderr. Unheard, the EPIPE
+    // is an uncaught exception.
+    proc.stdin.on('error', () => {});
     proc.stdin.end(opts.stdin ?? '');
   });
 }
