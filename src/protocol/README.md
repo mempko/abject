@@ -96,7 +96,10 @@ worker.
   least `minMessages` in the window) sends `renegotiate` to the Negotiator
   with the last five errors and resets the counters.
 - `startMonitoring` starts the timer; `onStop()` stops it. It subscribes to
-  the Registry and drops objects on `objectUnregistered`.
+  the Registry and gates objects on `objectUnregistered` (no more pings, and
+  the missed-ping count starts over): `Factory.respawn` unregisters an object
+  before re-registering it under the same id, and the Supervisor's
+  `markObjectReady` re-arms it.
 - `INCOMPREHENSION_ERRORS` and `isIncomprehensionError()` name the error
   codes that mean "the other side did not understand" (`PARSE_ERROR`,
   `UNKNOWN_METHOD`, `INVALID_PAYLOAD`, `SCHEMA_MISMATCH`, `TYPE_ERROR`,

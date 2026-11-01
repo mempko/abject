@@ -337,9 +337,17 @@ export class HealthMonitor extends Abject {
       return true;
     });
 
+    // Gate rather than drop: Factory.respawn unregisters an object before it
+    // re-registers it under the same id, and the Supervisor then sends
+    // markObjectReady, which only re-arms an entry that still exists. The
+    // next instance starts with no missed pings.
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
       const objectId = msg.payload as AbjectId;
-      this.unmonitorObject(objectId);
+      const liveness = this.monitoredObjects.get(objectId);
+      if (liveness) {
+        liveness.ready = false;
+        liveness.consecutiveFailures = 0;
+      }
     });
   }
 
@@ -357,7 +365,7 @@ export class HealthMonitor extends Abject {
       // Supervisor may not be spawned yet — that's OK
     }
 
-    // Subscribe to Registry for object-deletion cleanup
+    // Subscribe to Registry: objectUnregistered gates a monitored object
     const registryId = await this.discoverDep('Registry');
     if (registryId) {
       try {
