@@ -736,7 +736,9 @@ export class RemoteUIAccess extends Abject {
     this.connectedTransports.set(peerId, transport);
 
     if (this.attachHandler) {
-      const ui = new WebRTCUITransport(transport);
+      // The wrapper's onDisconnect replaces the cleanupTransport handler set
+      // in handleIncomingOffer, so hand the cleanup to the wrapper.
+      const ui = new WebRTCUITransport(transport, () => this.cleanupTransport(peerId, transport));
       const client = this.authorizedClients.get(peerId);
       this.attachHandler(peerId, ui, { name: client?.name });
       log.info(`accepted ${mode} from ${peerId.slice(0, 16)} (${this.connectedTransports.size} active)`);

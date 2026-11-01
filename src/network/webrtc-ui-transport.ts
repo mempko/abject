@@ -34,13 +34,19 @@ export class WebRTCUITransport implements UITransportLike {
   private closeHandler?: () => void;
   private _closed = false;
 
-  constructor(peer: PeerTransport) {
+  /**
+   * `peer.on()` keeps one handler per event, so the onDisconnect set here
+   * replaces any the owner set. The owner passes its cleanup as
+   * `onPeerDisconnect`; it runs after the close handler.
+   */
+  constructor(peer: PeerTransport, onPeerDisconnect?: () => void) {
     this.peer = peer;
     this.peer.onRawMessage((bytes) => this.msgHandler?.(bytes));
     this.peer.on({
       onDisconnect: () => {
         this._closed = true;
         this.closeHandler?.();
+        onPeerDisconnect?.();
       },
     });
   }
