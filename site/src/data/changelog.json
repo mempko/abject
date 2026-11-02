@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.16.3",
+    "date": "2026-11-02",
+    "title": "Steadier Under Failure",
+    "summary": "A small maintenance release that makes Abject recover more reliably when something goes wrong: a crashed object, a missing command-line AI tool, a worker that dies at startup, or a remote session that drops. Nothing new to learn; things just fail more gracefully.",
+    "highlights": [
+      "Objects that crash and restart stay watched: the health monitor keeps checking on them after their first restart, so a second failure is caught and handled too",
+      "Command-line AI providers fail cleanly: if the tool is missing, won't start, or closes its input early, you get an error in place of a crashed backend",
+      "Startup no longer hangs when a worker thread dies before it is ready; the failure is reported so boot can respond"
+    ],
+    "fixes": [
+      "Health monitoring kept pinging an object after its first supervised restart, so later failures are no longer missed",
+      "Settings can detect installed command-line AI tools again (the probe now loads child_process with import())",
+      "CLI-based LLM providers now catch child stdin and spawn errors, so a missing or crashing tool no longer brings down the backend",
+      "Waiting for a worker to become ready now fails promptly when the worker dies first, in place of waiting forever",
+      "Shutting down no longer leaves peer signaling connections dialing in the background",
+      "Remote UI sessions over a peer connection are cleaned up properly when they disconnect"
+    ]
+  },
+  {
     "version": "0.16.2",
     "date": "2026-11-01",
     "title": "Agents that notice when they were wrong",
