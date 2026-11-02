@@ -964,6 +964,13 @@ export class Compositor {
     // Handle resize
     this.handleResize();
     window.addEventListener('resize', () => this.handleResize());
+    // The canvas can also change size with no window resize. Safari runs the
+    // module entry before a pending stylesheet applies, so the first measure
+    // above sees the unstyled canvas (300x150 aspect, body margin) and the
+    // real size only arrives once the page's CSS does.
+    if (typeof ResizeObserver !== 'undefined') {
+      new ResizeObserver(() => this.handleResize()).observe(this.canvas);
+    }
     this.watchDevicePixelRatio();
 
     // Start render loop
