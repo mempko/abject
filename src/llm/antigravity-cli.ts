@@ -540,9 +540,14 @@ export class AntigravityCliProvider extends BaseLLMProvider {
       // Claude models. Migrate saved tier routing on every id this list ever
       // carried that agy no longer accepts: flash lines to 3.8 flash at the
       // same effort (unsuffixed ids to medium), the retired pro models to 3.8
-      // flash at the same effort (Gemini 4 Argon is the pro-class successor,
-      // but its availability outside some plans is unverified), the 4.6 Claude
-      // models to their 5.5 successors at high effort (both were thinking variants).
+      // flash at the same effort, the 4.6 Claude models to their 5.5
+      // successors at high effort (both were thinking variants).
+      // The pro ids stay on flash although Gemini 4 Argon (High) is now the
+      // smart/code default: a migration rewrites a choice the user saved,
+      // silently, with nothing to fall back on if their plan lacks Argon,
+      // whereas a default is visible and changeable in Settings. Argon's
+      // availability was checked on one plan, and only its high effort was
+      // measured; the low and medium pro ids would land on unmeasured efforts.
       modelMigrations: {
         'gemini-3.5-flash-high': 'gemini-3.8-flash-high',
         'gemini-3.5-flash-medium': 'gemini-3.8-flash-medium',
