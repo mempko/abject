@@ -21,9 +21,10 @@
  * custom `--agent` may become an isolation surface once agent definitions
  * are documented. Consequences callers should know about:
  *
- *  1. Every request pays ~24.2k input tokens for a 57-tool catalog Abjects
- *     can never use (measured; capabilities are routed through objects on
- *     the message bus rather than the CLI's own tool layer). The prefill is
+ *  1. Every request pays ~12.4k input tokens for a tool catalog Abjects
+ *     can never use (measured on agy 1.4.12; earlier agy versions sent ~24.2k;
+ *     capabilities are routed through objects on the message bus rather
+ *     than the CLI's own tool layer). The prefill is
  *     never cache-hit across requests either - agy assembles the request,
  *     so the cross-request cache miss is an upstream problem; caching does
  *     work between turns inside one multi-turn call.
@@ -166,17 +167,21 @@ function shouldOmitModelFlag(model: string | undefined): boolean {
  * amplifier on hard prompts (LINC#571). Explicit suffixes bound thinking
  * per tier; AUTO_MODEL remains user-selectable in AGY_MODELS.
  *
- * code and smart share flash-high DELIBERATELY. The pro models of earlier agy
- * versions paid pro-grade latency, wrong for a tier default. Gemini 4 Argon
- * is listed in AGY_MODELS for anyone who wants it on a tier, but is not a
- * default until its latency and plan availability are measured. Kept honest
- * by the opt-in `agy models` tripwire test (AGY_LIVE=1, antigravity-cli.test.ts).
+ * code and smart share gemini-4-argon-high. Measured on agy 1.4.12 through
+ * this provider with the antigravity-v2 guidance applied (10 runs each of a
+ * small, an ~18 KB and an agent-loop prompt): Argon high answered all 30
+ * with 3-17x fewer reasoning tokens than flash-high, p50 21 s against 74 s on
+ * the 18 KB prompt and level on the others; neither returned an empty answer.
+ * Flash keeps balanced and fast, whose medium and low efforts already bound
+ * its thinking. Plan availability was checked on one Google plan only; the
+ * opt-in tripwire test (AGY_LIVE=1, antigravity-cli.test.ts) fails when the
+ * installed agy does not list a tier default.
  */
 export const AGY_TIER_MODELS: Record<ModelTier, AgyModelId> = {
-  smart: 'gemini-3.8-flash-high',
+  smart: 'gemini-4-argon-high',
   balanced: 'gemini-3.8-flash-medium',
   fast: 'gemini-3.8-flash-low',
-  code: 'gemini-3.8-flash-high',
+  code: 'gemini-4-argon-high',
 };
 
 /**
