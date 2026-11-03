@@ -671,6 +671,8 @@ interface SlabGhost {
   state: SurfaceGlState;
   run: SlabEffectRun;
   kind: 'close' | 'minimize';
+  /** Whether it had focus when it left (its print shadow keeps that colour). */
+  focused: boolean;
 }
 
 /** The composite of every effect running on a slab this frame. */
@@ -1141,15 +1143,15 @@ export class Compositor {
       const glState = this.surfaceGl.get(surfaceId);
       const surface = this.lastDestroyed;
       this.lastDestroyed = undefined;
-      // A visible slab dematerializes: its ghost keeps the texture until the
-      // fold finishes (drawGhosts frees it). The surface itself is gone, so
+      // A visible slab plays the close transition: its ghost keeps the
+      // texture until the transition finishes (drawGhosts frees it). The surface itself is gone, so
       // input and hit-testing no longer see it.
       const close = surface && this.hasMotion(surface)
         ? this.resolveEffect(this.slabMotionConfig.transitions.close) : undefined;
       if (close && glState?.texture && surface && surface.visible && surface.drawn
           && !this.isWorkspaceFiltered(surface)) {
         const run = this.makeRun(close, performance.now(), surface.rect.width, surface.rect.height);
-        this.ghosts.push({ surface, state: glState, run, kind: 'close' });
+        this.ghosts.push({ surface, state: glState, run, kind: 'close', focused: surfaceId === this.focusedSurfaceId });
       } else if (glState?.texture) {
         this.renderer.deleteTexture(glState.texture);
       }
@@ -2002,6 +2004,33 @@ export class Compositor {
     }
   }
 
+  /**
+   * Constructivist print shadow: a solid, unblurred slab offset down-right
+   * (red under the focused window, ink under the rest). The sub-pixel sigma
+   * turns the glow shader into a hard-edged fill. While the slab fades its
+   * shadow fades faster (opacity squared), so the shadow never shows through
+   * a half-transparent window as a dark smear.
+   */
+  private drawPrintShadow(
+    cx: number, cy: number, z: number, w: number, h: number,
+    rot: number[], viewProj: Mat4, parent: Mat4 | undefined,
+    focused: boolean, opacity: number, radius = 0,
+  ): void {
+    const chrome = this.chromeColors();
+    const off = chrome.block.offset;
+    const bw = w + 2;
+    const bh = h + 2;
+    const m = mat4TRS(cx + off, cy + off, z - 1, rot[0], rot[1], rot[2], bw + 4, bh + 4, 1);
+    this.renderer.drawGlow({
+      model: parent ? mat4Multiply(parent, m) : m, viewProj,
+      quadWidth: bw + 4, quadHeight: bh + 4,
+      halfWidth: w / 2, halfHeight: h / 2,
+      radius,
+      color: focused ? chrome.block.focus : chrome.block.rest,
+      a1: opacity * opacity, sigma1: 0.4,
+    });
+  }
+
   /** Draw slabs that are closing or minimizing; drops the finished ones. */
   private drawGhosts(now: number): boolean {
     if (this.ghosts.length === 0) return false;
@@ -2026,6 +2055,8 @@ export class Compositor {
       const h = rect.height * pose.sy;
       const rot = [pose.rx, pose.ry, pose.rz];
       const cam = (parent && g.state.attachCam) ? g.state.attachCam : this.windowCamera(cx, cy, z, g.state.pinView);
+      // The print shadow leaves with the slab instead of vanishing first.
+      if (!g.surface.transparent) this.drawPrintShadow(cx, cy, z, w, h, rot, cam.viewProj, parent, g.focused, pose.opacity);
       this.drawPoseAuras(pose, cx, cy, z, w, h, rot, cam.viewProj, parent);
       const slab = mat4TRS(cx, cy, z, rot[0], rot[1], rot[2], w, h, 1);
       this.renderer.drawSurface({
@@ -2082,7 +2113,10 @@ export class Compositor {
         const minimize = this.resolveEffect(this.slabMotionConfig.transitions.minimize);
         const restore = this.resolveEffect(this.slabMotionConfig.transitions.restore);
         if (!visible && state.texture && minimize) {
-          this.ghosts.push({ surface, state, run: this.makeRun(minimize, now, width, height), kind: 'minimize' });
+          this.ghosts.push({
+            surface, state, run: this.makeRun(minimize, now, width, height), kind: 'minimize',
+            focused: surfaceId === this.focusedSurfaceId,
+          });
         } else if (visible && restore) {
           (state.effects ??= []).push(this.makeRun(restore, now, width, height));
         }
@@ -3236,28 +3270,10 @@ export class Compositor {
 
       const radius = surface.transparent ? 0 : Math.min(chrome.radius, rect.width / 2, rect.height / 2);
 
-      if (!surface.transparent) {
-        // Constructivist print shadow: a solid, unblurred slab offset
-        // down-right (red under the focused window, ink under the rest).
-        // The sub-pixel sigma turns the glow shader into a hard-edged fill.
-        const off = chrome.block.offset;
-        const bw = rect.width + 2;
-        const bh = rect.height + 2;
-        const blockModel = place(mat4TRS(
-          cx + off, cy + off, z - 1,
-          state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
-          bw + 4, bh + 4, 1,
-        ));
-        this.renderer.drawGlow({
-          model: blockModel, viewProj: cam.viewProj,
-          quadWidth: bw + 4, quadHeight: bh + 4,
-          halfWidth: rect.width / 2, halfHeight: rect.height / 2,
-          radius,
-          color: focused ? chrome.block.focus : chrome.block.rest,
-          a1: motion.opacity, sigma1: 0.4,
-        });
-      }
       const tilt = [state.tiltX + rot[0], state.tiltY + rot[1], rot[2]];
+      if (!surface.transparent) {
+        this.drawPrintShadow(cx, cy, z, rect.width, rect.height, tilt, cam.viewProj, parent, focused, motion.opacity, radius);
+      }
       this.drawPoseAuras(motion, cx, cy, z, rect.width, rect.height, tilt, cam.viewProj, parent);
 
       this.drawSurfaceSlab(surface, state, model, {

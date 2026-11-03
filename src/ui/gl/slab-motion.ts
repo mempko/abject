@@ -120,6 +120,26 @@ export interface SlabMotionConfig {
 
 /** The default effects. Registered names shadow these. */
 export const BUILTIN_SLAB_EFFECTS: Readonly<Record<string, SlabEffectSpec>> = {
+  /**
+   * Rise a few px into place while it fades in. The curve front-loads the
+   * motion, so the window is readable within a frame or two and the rest is
+   * a soft landing.
+   */
+  appear: {
+    duration: 190,
+    easing: [0.16, 1, 0.3, 1],
+    y: [8, 0],
+    scale: [0.97, 1],
+    opacity: [0, 1],
+  },
+  /** Ease back and fade out, quicker than it came. */
+  vanish: {
+    duration: 120,
+    easing: [0.3, 0, 0.6, 1],
+    y: [0, 4],
+    scale: [1, 0.975],
+    opacity: [1, 0],
+  },
   /** Out of depth behind a living-light scan line. */
   materialize: {
     duration: 340,
@@ -189,14 +209,14 @@ export const BUILTIN_SLAB_EFFECTS: Readonly<Record<string, SlabEffectSpec>> = {
 export const DEFAULT_SLAB_MOTION: SlabMotionConfig = {
   effects: {},
   transitions: {
-    open: 'materialize',
-    close: 'dematerialize',
+    open: 'appear',
+    close: 'vanish',
     minimize: 'sink',
-    restore: 'materialize',
-    workspaceIn: 'materialize',
+    restore: 'appear',
+    workspaceIn: 'appear',
   },
   modal: { z: 110, dim: 0.65 },
-  stagger: 45,
+  stagger: 30,
   minHeight: 80,
 };
 

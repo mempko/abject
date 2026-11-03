@@ -238,7 +238,7 @@ export class WindowAbject extends Abject {
               },
               {
                 name: 'effect',
-                description: 'Play a slab effect on this window (visual only, animated client-side). effect: a registered or built-in name (materialize, dematerialize, sink, shake, flash, pulse, burst, glitch) or an inline SlabEffectSpec (see WidgetManager registerWindowEffect). ANY abject may call this.',
+                description: 'Play a slab effect on this window (visual only, animated client-side). effect: a registered or built-in name (appear, vanish, materialize, dematerialize, sink, shake, flash, pulse, burst, glitch) or an inline SlabEffectSpec (see WidgetManager registerWindowEffect). ANY abject may call this.',
                 parameters: [
                   { name: 'effect', type: { kind: 'reference', reference: 'string | SlabEffectSpec' }, description: 'Effect name or inline spec' },
                   { name: 'color', type: { kind: 'primitive', primitive: 'string' }, description: 'Override light colour (CSS or $token)', optional: true },

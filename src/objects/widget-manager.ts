@@ -525,7 +525,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'windowEffect',
-                description: 'Play a slab effect on a window (visual only, animated client-side: geometry and input are unchanged). effect: a registered or built-in name (materialize, dematerialize, sink, shake, flash, pulse, burst, glitch) or an inline SlabEffectSpec. Built-ins follow the design: shake/glitch for errors and rejection, flash for arrival or success, pulse for attention, burst for completion. ANY abject may call this on any window it can name.',
+                description: 'Play a slab effect on a window (visual only, animated client-side: geometry and input are unchanged). effect: a registered or built-in name (appear, vanish, materialize, dematerialize, sink, shake, flash, pulse, burst, glitch) or an inline SlabEffectSpec. Built-ins follow the design: shake/glitch for errors and rejection, flash for arrival or success, pulse for attention, burst for completion. ANY abject may call this on any window it can name.',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId' },
                   { name: 'effect', type: { kind: 'reference', reference: 'string | SlabEffectSpec' }, description: 'Effect name or inline spec' },
@@ -591,7 +591,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'setWindowTransitions',
-                description: 'Choose which effect plays on each window lifecycle moment, desktop-wide: { open?, close?, minimize?, restore?, workspaceIn? }, each an effect name, an inline spec, or null for none. Omitted keys keep their current value. Defaults: materialize, dematerialize, sink, materialize, materialize.',
+                description: 'Choose which effect plays on each window lifecycle moment, desktop-wide: { open?, close?, minimize?, restore?, workspaceIn? }, each an effect name, an inline spec, or null for none. Omitted keys keep their current value. Defaults: appear, vanish, sink, appear, appear.',
                 parameters: [
                   { name: 'transitions', type: { kind: 'reference', reference: 'Partial<SlabTransitions>' }, description: 'Transitions to change' },
                   { name: 'stagger', type: { kind: 'primitive', primitive: 'number' }, description: 'ms between windows on workspaceIn', optional: true },
@@ -2375,7 +2375,7 @@ Windows are slabs in a 3D scene, and everything below is DATA any abject can use
 
 **Window effects** (client-side, visual only: geometry, input and events never change):
   this.call(this.dep('WidgetManager'), 'windowEffect', { windowId, effect: 'shake' })
-Built-ins: materialize, dematerialize, sink, shake, glitch (errors, rejection), flash (arrival, success),
+Built-ins: appear, vanish (the default open and close), materialize, dematerialize, sink, shake, glitch (errors, rejection), flash (arrival, success),
 pulse (attention), burst (completion: particles fly off the edges). Optional color: CSS or $token.
 Or pass an inline spec instead of a name. A SlabEffectSpec is
   { duration (ms), easing?: linear|standard|decelerate|accelerate|emphasize|[x1,y1,x2,y2],
