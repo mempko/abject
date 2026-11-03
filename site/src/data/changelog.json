@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.16.4",
+    "date": "2026-11-03",
+    "title": "Private conversations, and a clearer chat list",
+    "summary": "You can now start a conversation that stays private: nothing in it is learned, stored where other objects can read it, or shown outside its own window. The chat list is also easier to scan, with conversations grouped by when you last used them and a clear sign of which are working or private.",
+    "highlights": [
+      "Private conversations: a chat you mark private when you create it keeps its contents inside its own window. Nothing in it goes into memory or the knowledge base; the goals it starts are kept in memory only and deleted once their result reaches the chat; shared stores (Storage, SharedState, TupleSpace and the LLM ledger) never hold its contents.",
+      "A private window can't be captured, read or typed into by other objects: it shows a placeholder title in window lists, desktop screenshots are refused while it is on screen, and only the window and its owner can send it input.",
+      "Agents can no longer get at a private chat through side routes: the agent browser won't open this instance's own desktop page, a message from another machine can't pretend to come from a local object, and a private task's error text stays inside that task.",
+      "The chat list now groups conversations by when they were last active (Today, Yesterday, This week, Earlier) and has All, Working and Private tabs; each row shows its time and status, with a green dot while it is working and a gold lock when it is private.",
+      "Rename (F2) and delete (Del) a conversation straight from its row; the buttons appear on the selected or hovered row. Private chats can't be renamed from the list, and their toasts never show their names.",
+      "The chat list header shows how many conversations are working, and a chat that starts working shows up right away instead of on the next refresh.",
+      "List widgets gained grouped section headings with counts, leading icons, coloured status notes, per-row icon actions, keyboard shortcuts for actions and a flat row style. The selection now follows its item when the list changes, so package authors can use all of this too."
+    ],
+    "fixes": [
+      "Private chats no longer vanish after a restart: an object that was still starting up could read its saved list of private chats as empty and then overwrite it.",
+      "Searching the chat list rereads a conversation's text only when the conversation has been active since the last read, so search stays fast with many chats."
+    ]
+  },
+  {
     "version": "0.16.3",
     "date": "2026-11-02",
     "title": "Steadier Under Failure",
