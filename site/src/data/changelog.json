@@ -1,5 +1,19 @@
 [
   {
+    "version": "0.16.5",
+    "date": "2026-11-03",
+    "title": "Windows that arrive and leave more gently",
+    "summary": "This release changes one thing: how windows open and close. They now come in and go out faster and more softly, so the desktop feels calmer, and a whole workspace appears together when you switch to it.",
+    "highlights": [
+      "Windows open with a short rise and fade (8px over 190ms) and close by easing out in 120ms; this is now the default open and close motion for every window",
+      "The open and close motions are built-in effects, so any abject can ask for them by name for its own windows",
+      "Switching workspaces feels more unified: windows appear 30ms apart instead of 45ms, so the workspace arrives at once rather than one window at a time"
+    ],
+    "fixes": [
+      "Windows that are closing or minimizing keep their printed drop shadow as they fade out (in the focus colour if the window had focus), instead of losing it partway through"
+    ]
+  },
+  {
     "version": "0.16.4",
     "date": "2026-11-03",
     "title": "Private conversations, and a clearer chat list",
