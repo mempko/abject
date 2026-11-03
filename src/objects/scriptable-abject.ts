@@ -454,11 +454,14 @@ export class ScriptableAbject extends Abject {
     // only: this path must stay synchronous for UI handlers, so a recorder
     // not yet discovered means this invocation is not recorded and the lookup
     // is kicked off for the next one. Requests only -- events delivered to a
-    // handler have no reply to compare against. A source's override of a
-    // system verb (ask, describe, undo, redo, getUndoState) is not recorded:
-    // its answer comes from state the recording does not carry (super.ask,
-    // the undo history), so no replay could reproduce it.
-    const recordable = msg.header?.type === 'request' && !ScriptableAbject.INHERITED_HANDLERS.has(name);
+    // handler have no reply to compare against. Two kinds of request are not
+    // recorded, because their answer comes from state the recording does not
+    // carry, so no replay could reproduce it: a source's override of a system
+    // verb (ask, describe, undo, redo, getUndoState: super.ask, the undo
+    // history), and a request the object addressed to itself (afterRestore's
+    // restored / hide / show, run after an undo changed this.data).
+    const recordable = msg.header?.type === 'request' && msg.routing.from !== this.id
+      && !ScriptableAbject.INHERITED_HANDLERS.has(name);
     const recorderId = recordable ? this.recorderId : undefined;
     if (!recorderId && recordable) void this.resolveRecorder();
     const trace: InvocationTrace | undefined = recorderId ? { calls: [], truncated: false } : undefined;
