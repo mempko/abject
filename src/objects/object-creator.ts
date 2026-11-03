@@ -44,6 +44,23 @@ const log = new Log('OBJECT-CREATOR');
 /** How long a deploy waits for the FitnessJudge; the judgment stops at the same deadline. */
 const JUDGE_TIMEOUT_MS = 90000;
 
+/**
+ * The task timeout ObjectCreator asks AgentAbject for. AgentAbject also waits
+ * at most this long for each act (the `agentAct` request, or the job that
+ * carries it), so an action still running past it has been given up on.
+ */
+const AGENT_TASK_TIMEOUT_MS = 600000;
+/** Headroom for the reply's trip back: an act this close to the caller's timeout is treated as abandoned. */
+const ACT_REPLY_MARGIN_MS = 5000;
+
+/** What an action knows about the request that asked for it. */
+interface ActCall {
+  /** Past this time the caller has stopped waiting for the reply. */
+  deadline: number;
+  /** False once the task this action belongs to has ended or been cancelled. */
+  live: () => boolean;
+}
+
 /** Minimal structural view of an acorn/ESTree node (acorn's own types omit the
  *  ESTree node shapes; we read only type/start/end and a few fields). */
 interface AstNode {
@@ -2656,7 +2673,9 @@ ${source}
    * agent pivot mid-loop when Chat dispatched the task as a `kind: create`
    * but the goal turned out to be a modify of an existing object.
    */
-  private async opDeployUpdate(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+  private async opDeployUpdate(state: LoopState, action: AgentAction, call?: ActCall): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+    // Without the request's own deadline (an internal call), count from here.
+    const deadline = call?.deadline ?? Date.now() + AGENT_TASK_TIMEOUT_MS - ACT_REPLY_MARGIN_MS;
     if (!this.registryId) return { ok: false, summary: 'deploy_update: Registry unavailable', error: 'Registry not resolved' };
     // A redrafted manifest with the source untouched is a deploy too: it
     // reaches the live object, the Registry, and the snapshot, the same three
@@ -2732,10 +2751,19 @@ ${source}
     // source's own updateSource) do not take it, which is why the base check
     // below reads the live object rather than trusting the lock.
     return withKeyedLock(`abject-source:${targetId}`, async () => {
-      // The judgment can take a while, and the source may have changed under
-      // it. Then no swap: the other writer's change survives.
+      // The judgment can take a while: the source may have changed under it,
+      // and the caller may have stopped waiting. Either way, no swap.
       const changedDuringJudgment = await this.detectSourceConflict(state, targetId!);
       if (changedDuringJudgment) return changedDuringJudgment;
+      if (call && !call.live()) {
+        return { ok: false, summary: 'deploy_update: not deployed, the task ended while the draft was being judged',
+          error: 'The task this deploy belonged to was cancelled or finished; the live object is untouched.' };
+      }
+      if (Date.now() >= deadline) {
+        return { ok: false, summary: 'deploy_update: not deployed, the request timed out before the swap',
+          error: `The judgment and the wait for the source lock took past the action's deadline, so its caller has stopped waiting. ` +
+            `Nothing was deployed: the live object is untouched. Deploy again.` };
+      }
       let manifestNote = '';
 
     // 1. Hot-swap on the live ScriptableAbject.
@@ -4108,7 +4136,7 @@ ${source}
             // cycles + deploy + behavioral/visual verification. AgentAbject
             // additionally grants progress-aware extensions at the cap.
             maxSteps: plannedStepBudget(args.plannedMaxSteps, { min: 20, default: 45, max: 80 }),
-            timeout: 600000,
+            timeout: AGENT_TASK_TIMEOUT_MS,
             queueName: `object-creator-${taskId}`,
           },
         },
@@ -4962,6 +4990,8 @@ ${source}
    * checks run once, on the last edit of the response, instead of after each one.
    */
   private async handleAct(taskId: string, action: AgentAction, _callerId: AbjectId, batchRemaining = 0): Promise<AgentActionResult> {
+    // AgentAbject waits AGENT_TASK_TIMEOUT_MS for this reply (see ActCall).
+    const actDeadline = Date.now() + AGENT_TASK_TIMEOUT_MS - ACT_REPLY_MARGIN_MS;
     const extra = this.tasks.get(taskId);
     if (!extra) {
       return { success: false, error: 'No active task' };
@@ -5028,7 +5058,7 @@ ${source}
           res = await this.opDeploySpawn(state, action);
           break;
         case 'deploy_update':
-          res = await this.opDeployUpdate(state, action);
+          res = await this.opDeployUpdate(state, action, { deadline: actDeadline, live: () => this.tasks.get(taskId)?.state === state });
           break;
         case 'compose_organism':
           res = await this.opComposeOrganism(state, action);
