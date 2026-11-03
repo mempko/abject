@@ -8,8 +8,14 @@
  * browser auto-open once on a fresh workspace so users discover the feature.
  * Ctrl+Z in its window undoes the last deletion made here: ChatManager keeps
  * the step (this browser is the caller that made it), the browser forwards.
- * Private conversations show a Private mark, search matches only their
- * titles (their history is never fetched for it), and toasts never name them.
+ * Private conversations show a lock and a "not remembered" note, search
+ * matches only their titles (their history is never fetched for it), and
+ * toasts never name them.
+ *
+ * The window: the count and the New chat / Private buttons, tabs (All,
+ * Working, Private), and the list grouped by when each chat was last active.
+ * A click or Enter opens a chat; arrows only move the selection. Rename and
+ * delete show on the selected or hovered row, and F2 / Del reach them.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -20,7 +26,16 @@ import { undoMethods, type UndoAction, type UndoResult, type UndoState } from '.
 import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { PersistedConversation } from './chat-manager.js';
-import { PRIVATE_TITLE } from '../core/privacy.js';
+
+/** A roster row as listConversations returns it to a view. */
+type RosterRow = PersistedConversation & { working?: boolean };
+
+/** The list's filter tabs, in order. */
+const TABS = ['all', 'working', 'private'] as const;
+type Tab = typeof TABS[number];
+
+/** What the footer teaches: the keys, and that a delete can be undone. */
+const FOOTER_TEXT = '\u2191\u2193 Move    Enter Open    F2 Rename    Del Delete    \u00B7    Ctrl+Z undoes a delete';
 
 const log = new Log('ChatBrowser');
 
@@ -28,9 +43,11 @@ const CHAT_BROWSER_INTERFACE: InterfaceId = 'abjects:chat-browser';
 
 const ONBOARDING_KEY = 'chat-browser:seen-onboarding';
 
-const OVERVIEW_W = 440;
-const OVERVIEW_H = 520;
-const HEADER_BTN_H = 40;
+const OVERVIEW_W = 520;
+const OVERVIEW_H = 620;
+const HEADER_BTN_H = 38;
+const TAB_BAR_H = 34;
+const FOOTER_H = 18;
 
 export class ChatBrowser extends Abject {
   private widgetManagerId?: AbjectId;
@@ -42,10 +59,19 @@ export class ChatBrowser extends Abject {
   private listWidgetId?: AbjectId;
   private newChatBtnId?: AbjectId;
   private newPrivateChatBtnId?: AbjectId;
+  private tabBarId?: AbjectId;
   /** Section header ("N chats"), restyled while a chat is working. */
   private headerLabelId?: AbjectId;
+  /** The tab whose rows the list shows. */
+  private tab: Tab = 'all';
+  /** The roster as last fetched, for re-filtering on a tab switch. */
+  private rows: RosterRow[] = [];
+  /** Each regular chat's message text for search, and the lastActiveAt it was read at. */
+  private historyText = new Map<string, { at: number; text: string }>();
   /** Conversation count behind the header text. */
   private chatCount = 0;
+  /** Conversations working now, from the roster rows. */
+  private workingCount = 0;
   /** Aggregate goalActivity from ChatManager: some chat is working. */
   private anyChatWorking = false;
 
@@ -150,21 +176,31 @@ export class ChatBrowser extends Abject {
         await this.requestNewConversation(true);
         return;
       }
+      if (aspect === 'change' && fromId === this.tabBarId) {
+        const next = TABS[typeof value === 'number' ? value : Number(value)];
+        if (next && next !== this.tab) {
+          this.tab = next;
+          await this.pushItems();
+        }
+        return;
+      }
 
-      // Rich list events: clicking a row opens it; the inline Delete action
-      // removes it. Both carry the conversationId in the item's `value`.
+      // List events: a click or Enter opens a chat (arrows only move the
+      // selection); the row's actions, or F2 and Del, rename and delete it.
+      // All carry the conversationId in the item's `value`.
       if (fromId === this.listWidgetId) {
-        if (aspect === 'selectionChanged') {
-          const convId = parseItemValue(value)?.value;
-          if (convId) await this.requestShowConversation(convId);
+        const data = parseItemValue(value);
+        if (!data?.value) return;
+        if ((aspect === 'selectionChanged' && data.via === 'click') || aspect === 'confirm') {
+          await this.requestShowConversation(data.value);
           return;
         }
-        if (aspect === 'action') {
-          const data = parseItemValue(value);
-          if (data?.actionId === 'delete' && data.value) {
-            await this.requestDeleteConversation(data.value);
-          }
+        if (aspect === 'action' && data.actionId === 'delete') {
+          await this.requestDeleteConversation(data.value);
           return;
+        }
+        if (aspect === 'action' && data.actionId === 'rename') {
+          await this.requestRenameConversation(data.value);
         }
         return;
       }
@@ -172,6 +208,7 @@ export class ChatBrowser extends Abject {
       // ChatManager roster events → refresh the list
       if (fromId === this.chatManagerId) {
         if (aspect === 'rosterChanged'
+          || aspect === 'activityChanged'
           || aspect === 'conversationCreated'
           || aspect === 'conversationDeleted'
           || aspect === 'conversationRenamed') {
@@ -231,13 +268,36 @@ export class ChatBrowser extends Abject {
     try {
       // Generous: the conversation's cards are set aside with it.
       await this.request(request(this.id, this.chatManagerId, 'deleteConversation', { conversationId }), 60_000);
-      // A toast is seen beyond this window: a private chat is named only as one.
-      const named = this.privateIds.has(conversationId) ? PRIVATE_TITLE : title;
-      await this.notify(`Deleted ${named ? `"${named}"` : 'the conversation'}. Ctrl+Z to undo`, 'success');
+      // A toast is seen beyond this window: a private chat is named only as
+      // one, and its undo lasts until a restart (it is kept in memory only).
+      if (this.privateIds.has(conversationId)) {
+        await this.notify('Deleted a private chat. Ctrl+Z undoes it until Abjects restarts', 'success');
+      } else {
+        await this.notify(`Deleted ${title ? `"${title}"` : 'the conversation'}. Ctrl+Z to undo`, 'success');
+      }
     } catch (err) {
       log.warn(`deleteConversation failed: ${String(err)}`);
       this.playEffect('shake');
       await this.notify('Delete failed', 'error');
+    }
+  }
+
+  /** Ask for a new name and rename the conversation (a private one is renamed only from its own window). */
+  private async requestRenameConversation(conversationId: string): Promise<void> {
+    if (!this.chatManagerId || this.privateIds.has(conversationId)) return;
+    const current = this.titles.get(conversationId) ?? '';
+    const title = await this.prompt({
+      title: 'Rename chat',
+      message: 'A new name for this chat.',
+      defaultValue: current,
+      confirmLabel: 'Rename',
+    });
+    if (title === null || !title.trim() || title.trim() === current) return;
+    try {
+      await this.request(request(this.id, this.chatManagerId, 'renameConversation', { conversationId, title: title.trim() }), 5000);
+    } catch (err) {
+      log.warn(`renameConversation failed: ${String(err)}`);
+      this.playEffect('shake');
     }
   }
 
@@ -251,16 +311,43 @@ export class ChatBrowser extends Abject {
 
   // ─── Header ────────────────────────────────────────────────────────
 
-  /** Header text: the chat count, plus "working" while a chat is busy. */
+  /** Header text: the chat count, plus how many are working. */
   private headerText(): string {
     const count = this.chatCount === 1 ? '1 chat' : `${this.chatCount} chats`;
-    return sectionHeaderText(this.theme, this.anyChatWorking ? `${count} \u00B7 working` : count);
+    const working = this.workingCount || (this.anyChatWorking ? 1 : 0);
+    return sectionHeaderText(this.theme, working > 0 ? `${count} \u00B7 ${working} working` : count);
   }
 
   /** Heading style at rest; the living light while a chat is working. */
   private headerStyle(): Record<string, unknown> {
     const base = { ...sectionHeaderStyle(this.theme, 14), align: 'left', wordWrap: false, selectable: false };
-    return this.anyChatWorking ? { ...base, color: livingStyle(this.theme).color } : base;
+    return this.workingCount > 0 || this.anyChatWorking ? { ...base, color: livingStyle(this.theme).color } : base;
+  }
+
+  /** Tab labels with their counts. */
+  private tabLabels(): string[] {
+    const privateCount = this.rows.filter(r => r.private).length;
+    return [`All ${this.rows.length}`, `Working ${this.workingCount}`, `Private ${privateCount}`];
+  }
+
+  /** The rows the selected tab shows. */
+  private rowsInTab(): RosterRow[] {
+    if (this.tab === 'working') return this.rows.filter(r => r.working);
+    if (this.tab === 'private') return this.rows.filter(r => r.private);
+    return this.rows;
+  }
+
+  /** Re-filter the list for the selected tab and refresh the tab counts (no refetch). */
+  private async pushItems(): Promise<void> {
+    if (this.tabBarId) {
+      try {
+        this.send(event(this.id, this.tabBarId, 'update', { tabs: this.tabLabels(), selectedIndex: TABS.indexOf(this.tab) }));
+      } catch { /* widget gone */ }
+    }
+    if (!this.listWidgetId) return;
+    try {
+      await this.request(request(this.id, this.listWidgetId, 'update', { items: this.itemsInTab() }));
+    } catch { /* list gone */ }
   }
 
   /** Push the header's text and style (on working-state flips). */
@@ -278,10 +365,10 @@ export class ChatBrowser extends Abject {
    * timeout is generous because ChatManager can be briefly busy under load,
    * and a slow reply must not be read as "no conversations".
    */
-  private async fetchRoster(): Promise<PersistedConversation[] | null> {
+  private async fetchRoster(): Promise<RosterRow[] | null> {
     if (!this.chatManagerId) return null;
     try {
-      const rows = await this.request<PersistedConversation[]>(
+      const rows = await this.request<RosterRow[]>(
         request(this.id, this.chatManagerId, 'listConversations', {}), 5000,
       );
       return rows ?? [];
@@ -370,6 +457,7 @@ export class ChatBrowser extends Abject {
     this.listWidgetId = undefined;
     this.newChatBtnId = undefined;
     this.newPrivateChatBtnId = undefined;
+    this.tabBarId = undefined;
     this.headerLabelId = undefined;
     this.changed('visibility', false);
     return true;
@@ -401,19 +489,16 @@ export class ChatBrowser extends Abject {
         if (!this.windowId || !this.rootLayoutId) return;
         const rows = await this.fetchRoster();
         if (rows === null) continue; // keep current; re-loop if more arrived
-        const items = await this.listItems(rows);
+        await this.takeRows(rows);
 
         // A list already on screen that stays a list is updated in place.
         // Rebuilding it put an empty list in the window while every
         // conversation's history loaded, a visible blink on each roster change,
         // and it threw away the search text and scroll position.
         if (this.listWidgetId && rows.length > 0) {
-          this.chatCount = rows.length;
           this.refreshHeader();
-          try {
-            await this.request(request(this.id, this.listWidgetId, 'update', { items }));
-            continue;
-          } catch { /* list gone; rebuild below */ }
+          await this.pushItems();
+          continue;
         }
 
         // Switching between the empty state and the list changes what the
@@ -424,8 +509,9 @@ export class ChatBrowser extends Abject {
         this.listWidgetId = undefined;
         this.newChatBtnId = undefined;
         this.newPrivateChatBtnId = undefined;
+        this.tabBarId = undefined;
         this.headerLabelId = undefined;
-        await this.populate(rows, items);
+        await this.populate(rows, true);
       }
     } finally {
       this.refreshInFlight = false;
@@ -434,12 +520,16 @@ export class ChatBrowser extends Abject {
 
   // ─── Rendering ─────────────────────────────────────────────────────
 
-  private async populate(rows: PersistedConversation[], prepared?: ListItem[]): Promise<void> {
+  /**
+   * Lay out the window: the header row, then (with any chats) the tabs, the
+   * list and the key hints, or the empty state. `taken` says the rows were
+   * already taken in (takeRows) by the refresh that called this.
+   */
+  private async populate(rows: RosterRow[], taken = false): Promise<void> {
     if (!this.rootLayoutId || !this.windowId) return;
     // Rows first, so the list goes on screen already filled.
-    const items = prepared ?? await this.listItems(rows);
+    if (!taken) await this.takeRows(rows);
 
-    // Header row: section header with the count, "+ New chat" and "+ Private chat"
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
@@ -448,7 +538,6 @@ export class ChatBrowser extends Abject {
       })
     );
 
-    this.chatCount = rows.length;
     const headerSpecs: Array<Record<string, unknown>> = [
       {
         type: 'label', windowId: this.windowId,
@@ -456,21 +545,23 @@ export class ChatBrowser extends Abject {
         style: this.headerStyle(),
       },
       {
-        type: 'button', windowId: this.windowId, text: '+ New chat',
+        type: 'button', windowId: this.windowId, text: 'Private',
+        style: {
+          background: this.theme.buttonBg,
+          color: this.theme.buttonText,
+          borderColor: this.theme.buttonBorder,
+          fontSize: 13,
+          icon: 'lock',
+        },
+      },
+      {
+        type: 'button', windowId: this.windowId, text: 'New chat',
         style: {
           background: this.theme.actionBg,
           color: this.theme.actionText,
           borderColor: this.theme.actionBorder,
           fontSize: 13,
-        },
-      },
-      {
-        type: 'button', windowId: this.windowId, text: '+ Private chat',
-        style: {
-          background: this.theme.buttonBg,
-          color: this.theme.buttonText,
-          borderColor: this.theme.actionBorder,
-          fontSize: 13,
+          icon: 'plus',
         },
       },
     ];
@@ -479,14 +570,14 @@ export class ChatBrowser extends Abject {
     );
     const titleLabelId = headerIds[0];
     this.headerLabelId = titleLabelId;
-    this.newChatBtnId = headerIds[1];
-    this.newPrivateChatBtnId = headerIds[2];
+    this.newPrivateChatBtnId = headerIds[1];
+    this.newChatBtnId = headerIds[2];
 
     await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
       children: [
         { widgetId: titleLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: HEADER_BTN_H } },
+        { widgetId: this.newPrivateChatBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 104, height: HEADER_BTN_H } },
         { widgetId: this.newChatBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 120, height: HEADER_BTN_H } },
-        { widgetId: this.newPrivateChatBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 130, height: HEADER_BTN_H } },
       ],
     }));
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
@@ -502,38 +593,69 @@ export class ChatBrowser extends Abject {
       return;
     }
 
-    // A single rich ListWidget renders each conversation as a card: title on
-    // the first line, relative time muted below, and an inline Delete action.
-    // Clicking a row opens the conversation; the action button deletes it.
-    const { widgetIds: [listId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // Tabs, then one rich ListWidget: rows grouped by when they were last
+    // active, flat, with a marker, the title on up to two lines and the time
+    // and status below. Rename and delete show on the selected or hovered row.
+    const { widgetIds: [tabBarId, listId, footerId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{ type: 'list', windowId: this.windowId, items, searchable: true }],
+        specs: [
+          { type: 'tabBar', windowId: this.windowId, tabs: this.tabLabels(), selectedIndex: TABS.indexOf(this.tab) },
+          {
+            type: 'list', windowId: this.windowId, items: this.itemsInTab(), searchable: true,
+            searchPlaceholder: 'Search titles and messages',
+            rowStyle: 'flat', actionsOn: 'active', maxTitleLines: 2,
+            keyActions: { Delete: 'delete', F2: 'rename' },
+          },
+          {
+            type: 'label', windowId: this.windowId, text: FOOTER_TEXT,
+            style: { fontSize: 11, color: this.theme.textMeta, align: 'left', wordWrap: false, selectable: false },
+          },
+        ],
       })
     );
+    this.tabBarId = tabBarId;
     this.listWidgetId = listId;
 
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.listWidgetId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
+      children: [
+        { widgetId: tabBarId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: TAB_BAR_H } },
+        { widgetId: listId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: footerId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: FOOTER_H } },
+      ],
     }));
+    this.send(request(this.id, this.tabBarId, 'addDependent', {}));
     this.send(request(this.id, this.listWidgetId, 'addDependent', {}));
   }
 
   /**
-   * One list row per conversation, with its history as searchable text. A
-   * private conversation is searched by its title alone: its history is not
-   * fetched into the list.
+   * Take a fetched roster in: the counts, titles and private ids, and each
+   * regular chat's message text for search. A chat's text is read again only
+   * when it has been active since it was read, and a private chat's never is.
    */
-  private async listItems(rows: PersistedConversation[]): Promise<ListItem[]> {
+  private async takeRows(rows: RosterRow[]): Promise<void> {
+    this.rows = rows;
+    this.chatCount = rows.length;
+    this.workingCount = rows.filter(r => r.working).length;
     this.titles = new Map(rows.map(c => [c.conversationId, c.title]));
     this.privateIds = new Set(rows.filter(c => c.private).map(c => c.conversationId));
-    return Promise.all(
-      rows.map(async (c) => {
-        if (c.private) return this.toListItem(c);
-        const historyText = await this.fetchConversationHistory(c.conversationId);
-        return this.toListItem(c, historyText);
-      })
-    );
+    const listed = new Set(rows.map(c => c.conversationId));
+    for (const id of this.historyText.keys()) if (!listed.has(id)) this.historyText.delete(id);
+    await Promise.all(rows.map(async (c) => {
+      if (c.private || this.historyText.get(c.conversationId)?.at === c.lastActiveAt) return;
+      const text = await this.fetchConversationHistory(c.conversationId);
+      this.historyText.set(c.conversationId, { at: c.lastActiveAt, text });
+    }));
+  }
+
+  /** The list's rows for the selected tab, or one quiet line when the tab has none. */
+  private itemsInTab(): ListItem[] {
+    const rows = this.rowsInTab();
+    if (rows.length === 0) {
+      const label = this.tab === 'working' ? 'No chat is working right now' : 'No private chats';
+      return [{ label, value: '' }];
+    }
+    const now = Date.now();
+    return rows.map(c => this.toListItem(c, now));
   }
 
   private async fetchConversationHistory(conversationId: string): Promise<string> {
@@ -562,21 +684,38 @@ export class ChatBrowser extends Abject {
     }
   }
 
-  private toListItem(c: PersistedConversation, searchableContent?: string): ListItem {
+  /**
+   * One row: a marker (working, private, or a quiet dot), the title, when it
+   * was last active, and its status. The message text rides as `secondary`,
+   * which the list searches but does not show. A private chat gets no rename:
+   * its title changes only from its own window.
+   */
+  private toListItem(c: RosterRow, now: number): ListItem {
+    const marker = c.working
+      ? { iconName: 'dot' as const, iconColor: this.theme.accentSecondary }
+      : c.private
+        ? { iconName: 'lock' as const, iconColor: this.theme.accentTertiary }
+        : { iconName: 'dot' as const, iconColor: this.theme.textTertiary };
+    const note = c.working
+      ? { text: 'Working on a goal', color: this.theme.accentSecondary }
+      : c.private
+        ? { text: 'Private, not remembered', color: this.theme.accentTertiary }
+        : undefined;
+    const rename = { id: 'rename', label: 'Rename', iconName: 'pencil' as const };
+    const remove = {
+      id: 'delete', label: 'Delete', iconName: 'trash' as const,
+      textColor: this.theme.destructiveText, borderColor: this.theme.destructiveBorder,
+    };
+    const searchText = c.private ? undefined : this.historyText.get(c.conversationId)?.text;
     return {
       label: c.title,
       value: c.conversationId,
+      section: sectionOf(c.lastActiveAt, now),
       detail: formatRelativeTime(c.lastActiveAt),
-      secondary: searchableContent || undefined,
-      ...(c.private ? { badge: { text: 'Private', color: this.theme.buttonBg, textColor: this.theme.buttonText } } : {}),
-      actions: [
-        {
-          id: 'delete',
-          label: 'Delete',
-          color: this.theme.destructiveBg,
-          textColor: this.theme.destructiveText,
-        },
-      ],
+      ...(note ? { note } : {}),
+      ...marker,
+      secondary: searchText || undefined,
+      actions: c.private ? [remove] : [rename, remove],
     };
   }
 
@@ -584,7 +723,7 @@ export class ChatBrowser extends Abject {
     if (!this.rootLayoutId || !this.windowId) return;
     const text = emptyStateMarkdown(
       'Start a conversation',
-      'Each chat is its own window and keeps its own history. Click **+ New chat** above to begin, or **+ Private chat** for one nothing is learned from.',
+      'Ask for anything with **New chat**. A **Private** chat keeps nothing: no memory, no learning, and its goals are deleted when they finish.',
     );
     const { widgetIds: [cardId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
@@ -603,13 +742,25 @@ export class ChatBrowser extends Abject {
   }
 }
 
-/** Parse a ListWidget event payload (`selectionChanged`/`action`) into fields. */
-function parseItemValue(value: unknown): { value?: string; actionId?: string } | undefined {
+/** Parse a ListWidget event payload (`selectionChanged`/`confirm`/`action`) into fields. */
+function parseItemValue(value: unknown): { value?: string; actionId?: string; via?: string } | undefined {
   try {
     if (typeof value === 'string') return JSON.parse(value);
-    if (value && typeof value === 'object') return value as { value?: string; actionId?: string };
+    if (value && typeof value === 'object') return value as { value?: string; actionId?: string; via?: string };
   } catch { /* malformed */ }
   return undefined;
+}
+
+/** The group a chat falls in by when it was last active: Today, Yesterday, This week, Earlier. */
+function sectionOf(ts: number, now: number): string {
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const today = startOfToday.getTime();
+  const day = 24 * 60 * 60 * 1000;
+  if (ts >= today) return 'Today';
+  if (ts >= today - day) return 'Yesterday';
+  if (ts >= today - 6 * day) return 'This week';
+  return 'Earlier';
 }
 
 function formatRelativeTime(ts: number): string {
@@ -618,11 +769,11 @@ function formatRelativeTime(ts: number): string {
   const s = Math.floor(diff / 1000);
   if (s < 60) return 'just now';
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
+  if (m < 60) return `${m} min ago`;
   const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
+  if (h < 24) return `${h} h ago`;
   const d = Math.floor(h / 24);
-  if (d < 7) return `${d}d ago`;
+  if (d < 7) return d === 1 ? '1 day ago' : `${d} days ago`;
   return new Date(ts).toLocaleDateString();
 }
 

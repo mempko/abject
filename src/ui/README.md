@@ -45,7 +45,8 @@ it). Server-side code may import the pure modules here (`icons.ts`,
   [gl/](gl/README.md).
 - **`icons.ts`**: the vector icon set. `iconCommands(name, opts)` returns draw
   commands for an icon in a box; `isIconName`. Used by buttons, lists, trees,
-  window chrome and the dock (server side).
+  window chrome and the dock (server side). `pencil` and `trash` are row
+  actions (rename, delete).
 - **`motion.ts`**: cubic-bezier easings (`STANDARD`, `ACCELERATE`,
   `DECELERATE`, `EMPHASIZE`, `LINEAR`), `Tween`, and `fadeIn` / `fadeOut` /
   `scaleIn` / `pulse` / `shimmer`. Pure timing math with no canvas;

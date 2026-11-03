@@ -250,7 +250,13 @@ which lists it in `listLayoutIssues`.
 ### Data widgets
 
 - **`list-widget.ts`**: `ListWidget`. Selectable, scrollable rows with optional
-  search and per-row action buttons; `selectionChanged`, `action`, `confirm`.
+  search and per-row action buttons; `selectionChanged` (`via` click or key),
+  `action`, `confirm`. Rich rows can carry a leading icon, a coloured `note`
+  after the detail, a `section` (a heading over each run of rows, with its
+  count) and icon actions. Options: `actionsOn: 'active'` (actions only on
+  the selected or hovered row), `keyActions` (keys that fire them),
+  `maxTitleLines`, `rowStyle: 'flat'`, `searchPlaceholder`. The selection
+  follows its item when the items change.
 - **`tree-widget.ts`**: `TreeWidget`. Flat rows with depth; the owner keeps the
   expand state. `selectionChanged`, `toggle`.
 - **`table-widget.ts`**: `TableWidget`. Sortable columns, row selection,

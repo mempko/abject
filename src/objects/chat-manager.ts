@@ -172,7 +172,7 @@ export class ChatManager extends Abject {
             },
             {
               name: 'listConversations',
-              description: 'Return the current conversation roster, sorted by lastActiveAt descending. Private conversations are listed (with private: true) only for the person\'s own views.',
+              description: 'Return the current conversation roster, sorted by lastActiveAt descending. Private conversations are listed (with private: true) only for the person\'s own views. A row carries working: true while its conversation is working.',
               parameters: [],
               returns: { kind: 'array', elementType: { kind: 'reference', reference: 'PersistedConversation' } },
             },
@@ -316,6 +316,11 @@ export class ChatManager extends Abject {
               description: 'Fires whenever the roster changes for any reason (create/rename/delete/lastActive bump/rect move). UI surfaces use this as a catch-all signal to refresh their view.',
               payload: { kind: 'object', properties: {} },
             },
+            {
+              name: 'activityChanged',
+              description: 'A conversation started or stopped working (a turn or a goal it owns). Names none: listConversations rows carry working: true.',
+              payload: { kind: 'object', properties: {} },
+            },
           ],
         },
         tags: ['system'],
@@ -403,6 +408,8 @@ export class ChatManager extends Abject {
           chatId: c.chatId,
           // Only views get private rows at all (rosterFor).
           ...(c.private ? { private: true } : {}),
+          // A turn is running or a goal it started is active.
+          ...(c.chatId && this.busyChats.has(c.chatId) ? { working: true } : {}),
         }));
     });
 
@@ -544,8 +551,12 @@ export class ChatManager extends Abject {
       // taskbar) can mark the chat icon.
       if (aspect === 'goalActivity') {
         const active = !!(value as { active?: boolean } | undefined)?.active;
+        const was = this.busyChats.has(fromId);
         if (active) this.busyChats.add(fromId); else this.busyChats.delete(fromId);
         this.emitGoalActivity();
+        // Which chat is working rides on the roster rows (listConversations),
+        // where private rows reach only views; the event names none.
+        if (was !== active) this.changed('activityChanged', {});
         return;
       }
       // `messageAdded` → bump that conversation's lastActiveAt

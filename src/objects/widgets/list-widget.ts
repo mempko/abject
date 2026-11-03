@@ -5,6 +5,11 @@
  * highlights it (stays selected). Emits 'selectionChanged' when selection
  * changes. Supports ArrowUp/Down navigation and mouse wheel scrolling.
  * Optional search filtering via `searchable: true`.
+ *
+ * Rich rows can be grouped (an item's `section` heads a run of rows), carry a
+ * leading icon and a coloured note, and offer icon actions shown only on the
+ * selected or hovered row (`actionsOn: 'active'`), which `keyActions` can fire
+ * from the keyboard. A selection follows its item when the items change.
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
@@ -20,6 +25,10 @@ export interface ListActionSpec {
   color?: string;
   /** Button label color; defaults to theme.buttonText. */
   textColor?: string;
+  /** Draw a square icon button in place of the label (the label stays its name). */
+  iconName?: IconName;
+  /** Frame color of an icon button; defaults to theme.inputBorder. */
+  borderColor?: string;
 }
 
 export interface ListItem {
@@ -42,6 +51,10 @@ export interface ListItem {
   detail?: string;
   /** Right-aligned inline buttons; clicking one fires an 'action' event. Makes the row a rich card row. */
   actions?: ListActionSpec[];
+  /** Group heading: a row whose section differs from the row above starts a group headed by it. */
+  section?: string;
+  /** A short coloured note after `detail` on a rich row's second line (a status). */
+  note?: { text: string; color?: string };
 }
 
 export interface ListWidgetConfig extends WidgetConfig {
@@ -49,6 +62,16 @@ export interface ListWidgetConfig extends WidgetConfig {
   selectedIndex?: number;
   searchable?: boolean;
   itemHeight?: number;
+  /** 'active': a rich row's actions show, and take clicks, only on the selected or hovered row. */
+  actionsOn?: 'always' | 'active';
+  /** Most title lines a rich row wraps to; a cut last line ends in an ellipsis. Default 4. */
+  maxTitleLines?: number;
+  /** 'flat': rows without frames, the selected one outlined in the accent. Default 'card'. */
+  rowStyle?: 'card' | 'flat';
+  /** The search box's empty text, drawn after a search icon. */
+  searchPlaceholder?: string;
+  /** Keys that fire an action of the selected row while the list (not its search) has focus: { key: actionId }. */
+  keyActions?: Record<string, string>;
 }
 
 const DEFAULT_ITEM_HEIGHT = 26;
@@ -72,6 +95,12 @@ const SCROLLBAR_WIDTH = 8;
 const SCROLL_STEP = 30;
 const SEARCH_HEIGHT = 30;
 const SEARCH_PADDING = 4;
+/** Height of a group heading above the first row of a section. */
+const SECTION_H = 30;
+/** Leading icon size in a rich row. */
+const LEAD_ICON = 14;
+/** Side of a square icon action button. */
+const ICON_ACTION = 28;
 
 export class ListWidget extends WidgetAbject {
   private items: ListItem[] = [];
@@ -91,6 +120,14 @@ export class ListWidget extends WidgetAbject {
   private _contentHeight = 0;
   private _layoutWidth = -1;
   private _layoutDirty = true;
+  /** Per filtered row: the height of the group heading above it (0 for none), and the group's size. */
+  private _headH: number[] = [];
+  private _groupSize: number[] = [];
+  private actionsOn: 'always' | 'active';
+  private maxTitleLines: number;
+  private rowStyle: 'card' | 'flat';
+  private searchPlaceholder?: string;
+  private keyActions: Record<string, string>;
 
   constructor(config: ListWidgetConfig) {
     super(config);
@@ -99,6 +136,11 @@ export class ListWidget extends WidgetAbject {
     this.selectedIndex = config.selectedIndex ?? -1;
     this.searchable = config.searchable ?? false;
     this._itemHeight = config.itemHeight ?? DEFAULT_ITEM_HEIGHT;
+    this.actionsOn = config.actionsOn ?? 'always';
+    this.maxTitleLines = Math.max(1, config.maxTitleLines ?? MAX_TITLE_LINES);
+    this.rowStyle = config.rowStyle ?? 'card';
+    this.searchPlaceholder = config.searchPlaceholder;
+    this.keyActions = config.keyActions ?? {};
   }
 
   /** Plain (non-rich) row height. Rich rows compute their own height. */
@@ -115,8 +157,17 @@ export class ListWidget extends WidgetAbject {
     const w = this.rect.width;
     if (!this._layoutDirty && this._layoutWidth === w) return;
     const tops = [0];
-    for (let i = 0; i < this.filteredItems.length; i++) {
-      tops.push(tops[i] + this.rowHeightFor(this.filteredItems[i], w));
+    const rows = this.filteredItems;
+    this._headH = [];
+    this._groupSize = [];
+    for (let i = 0; i < rows.length; i++) {
+      const section = rows[i].section;
+      const starts = !!section && (i === 0 || rows[i - 1].section !== section);
+      let size = 0;
+      if (starts) while (i + size < rows.length && rows[i + size].section === section) size++;
+      this._headH.push(starts ? SECTION_H : 0);
+      this._groupSize.push(size);
+      tops.push(tops[i] + this._headH[i] + this.rowHeightFor(rows[i], w));
     }
     this._rowTops = tops;
     this._contentHeight = tops[tops.length - 1];
@@ -129,14 +180,19 @@ export class ListWidget extends WidgetAbject {
     return this.richRowMetrics(item, w).height;
   }
 
-  /** Index of the row containing local y (list-relative, scroll already applied). */
+  /** Index of the row containing local y (list-relative, scroll already applied); -1 on a group heading. */
   private rowIndexAt(localContentY: number): number {
     const tops = this._rowTops;
     if (localContentY < 0 || tops.length < 2) return -1;
     for (let i = 0; i < tops.length - 1; i++) {
-      if (localContentY < tops[i + 1]) return i;
+      if (localContentY < tops[i + 1]) return localContentY < tops[i] + (this._headH[i] ?? 0) ? -1 : i;
     }
     return -1;
+  }
+
+  /** Whether row i shows its actions now. */
+  private showsActions(i: number): boolean {
+    return this.actionsOn === 'always' || i === this.selectedIndex || i === this.hoveredIndex;
   }
 
   // ── Filtering ────────────────────────────────────────────────────
@@ -234,10 +290,13 @@ export class ListWidget extends WidgetAbject {
    * (card) row. Independent of the row's vertical position, so it can be used
    * both to lay out the list (heights) and to render/hit-test a row. Always
    * reserves the scrollbar gutter to avoid a circular height/scrollbar
-   * dependency.
+   * dependency, and always reserves the actions' room, so a row keeps its
+   * height when its actions show only on hover.
    */
   private richRowMetrics(item: ListItem, w: number): {
     cardW: number;
+    iconX: number;
+    badgeX: number;
     badgeW: number;
     textX: number;
     textW: number;
@@ -252,6 +311,9 @@ export class ListWidget extends WidgetAbject {
     const cardW = Math.max(10, w - 8 - gutter);
 
     let leftX = cardX + PAD;
+    const iconX = leftX;
+    if (item.iconName) leftX += LEAD_ICON + PAD;
+    const badgeX = leftX;
     let badgeW = 0;
     if (item.badge) {
       badgeW = Math.max(34, item.badge.text.length * 7 + 14);
@@ -259,19 +321,26 @@ export class ListWidget extends WidgetAbject {
     }
 
     const specs = item.actions ?? [];
-    const actionWidths = specs.map((s) => Math.max(52, s.label.length * 6.5 + 20));
+    const actionWidths = specs.map((s) => s.iconName ? ICON_ACTION : Math.max(52, s.label.length * 6.5 + 20));
     const actionsTotal = actionWidths.reduce((a, b) => a + b + 6, 0);
     const textX = leftX;
     const textRight = specs.length ? cardX + cardW - PAD - actionsTotal - 2 : cardX + cardW - PAD;
     const textW = Math.max(10, textRight - textX);
 
-    const lines = this.wrapText(item.label, textW, 13).slice(0, MAX_TITLE_LINES);
-    const hasDetail = (item.detail ?? item.secondary ?? '') !== '';
+    let lines = this.wrapText(item.label, textW, 13);
+    if (lines.length > this.maxTitleLines) {
+      lines = lines.slice(0, this.maxTitleLines);
+      const maxChars = Math.max(4, Math.floor(textW / (13 * 0.52)));
+      const last = lines[lines.length - 1];
+      lines[lines.length - 1] = `${last.length + 1 > maxChars ? last.slice(0, maxChars - 1).trimEnd() : last}\u2026`;
+    }
+    const hasDetail = (item.detail ?? item.secondary ?? '') !== '' || !!item.note;
     const contentH = lines.length * TITLE_LINE_H + (hasDetail ? DETAIL_LINE_H : 0);
-    const cardH = Math.max(contentH + CARD_PAD_V, BADGE_HEIGHT + CARD_PAD_V, ACTION_HEIGHT + CARD_PAD_V);
+    const actionH = specs.some((s) => s.iconName) ? ICON_ACTION : specs.length ? ACTION_HEIGHT : 0;
+    const cardH = Math.max(contentH + CARD_PAD_V, BADGE_HEIGHT + CARD_PAD_V, actionH + CARD_PAD_V);
     const height = Math.max(cardH + CARD_GAP_V, RICH_MIN_ITEM_HEIGHT);
 
-    return { cardW, badgeW, textX, textW, actionWidths, lines, hasDetail, height };
+    return { cardW, iconX, badgeX, badgeW, textX, textW, actionWidths, lines, hasDetail, height };
   }
 
   /**
@@ -286,6 +355,7 @@ export class ListWidget extends WidgetAbject {
     item: ListItem
   ): {
     card: { x: number; y: number; w: number; h: number };
+    icon: { x: number; y: number } | null;
     badge: { x: number; y: number; w: number; h: number } | null;
     textX: number;
     textW: number;
@@ -298,28 +368,29 @@ export class ListWidget extends WidgetAbject {
     const cardX = originX + 4;
     const card = { x: cardX, y: rowTopY + CARD_GAP_V / 2, w: m.cardW, h: rowHeight - CARD_GAP_V };
 
+    // The icon and the badge sit on the first title line, so multi-line rows look right.
+    const firstLineMid = card.y + CARD_PAD_V / 2 + TITLE_LINE_H / 2;
+    const icon = item.iconName ? { x: originX + m.iconX, y: firstLineMid - LEAD_ICON / 2 } : null;
     let badge: { x: number; y: number; w: number; h: number } | null = null;
     if (item.badge) {
-      // Align the badge to the first title line so multi-line rows look right.
-      const badgeY = card.y + CARD_PAD_V / 2 + (TITLE_LINE_H - BADGE_HEIGHT) / 2;
-      badge = { x: cardX + PAD, y: badgeY, w: m.badgeW, h: BADGE_HEIGHT };
+      badge = { x: originX + m.badgeX, y: firstLineMid - BADGE_HEIGHT / 2, w: m.badgeW, h: BADGE_HEIGHT };
     }
 
     const actions: Array<{ spec: ListActionSpec; x: number; y: number; w: number; h: number }> = [];
     const specs = item.actions ?? [];
-    const by = card.y + (card.h - ACTION_HEIGHT) / 2;
     let rightX = cardX + m.cardW - PAD;
     for (let k = specs.length - 1; k >= 0; k--) {
       const bw = m.actionWidths[k];
+      const bh = specs[k].iconName ? ICON_ACTION : ACTION_HEIGHT;
       rightX -= bw;
-      actions.unshift({ spec: specs[k], x: rightX, y: by, w: bw, h: ACTION_HEIGHT });
+      actions.unshift({ spec: specs[k], x: rightX, y: card.y + (card.h - bh) / 2, w: bw, h: bh });
       rightX -= 6;
     }
 
-    return { card, badge, textX: originX + m.textX, textW: m.textW, lines: m.lines, hasDetail: m.hasDetail, actions };
+    return { card, icon, badge, textX: originX + m.textX, textW: m.textW, lines: m.lines, hasDetail: m.hasDetail, actions };
   }
 
-  private buildRichRow(
+  private async buildRichRow(
     surfaceId: string,
     ox: number,
     itemY: number,
@@ -327,31 +398,56 @@ export class ListWidget extends WidgetAbject {
     w: number,
     item: ListItem,
     isSelected: boolean,
-    isHovered: boolean
-  ): unknown[] {
+    isHovered: boolean,
+    showActions: boolean
+  ): Promise<unknown[]> {
     const cmds: unknown[] = [];
     const g = this.richRowGeometry(ox, itemY, rowHeight, w, item);
+    const flat = this.rowStyle === 'flat';
+    // The card style inverts the selected row into an ink band; flat keeps its colours.
+    const inverted = isSelected && !flat;
 
-    // Card surface: square paper slab with an ink hairline; the
-    // selected card becomes an ink band with a red block at its left edge.
     const card = { x: g.card.x, y: g.card.y, width: g.card.w, height: g.card.h };
-    cmds.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        ...card,
-        fill: isSelected
-          ? this.theme.textPrimary
-          : isHovered
-            ? withAlpha(this.theme.textPrimary, 0.07)
-            : this.theme.inputBg,
-        radius: this.style.radius ?? 0,
-      },
-    });
-    if (isSelected) {
-      cmds.push({ type: 'rect', surfaceId, params: { x: card.x, y: card.y, width: 5, height: card.height, fill: this.theme.accent } });
+    if (flat) {
+      // Flat: rows sit on the ground; the selected one is outlined in the accent.
+      if (isSelected || isHovered) {
+        cmds.push({
+          type: 'rect',
+          surfaceId,
+          params: { ...card, fill: isSelected ? this.theme.activeItemBg : withAlpha(this.theme.textPrimary, 0.05), radius: this.style.radius ?? 0 },
+        });
+      }
+      if (isSelected) cmds.push(...inkFrame(surfaceId, card, this.theme.activeItemBorder, 1));
     } else {
-      cmds.push(...inkFrame(surfaceId, card, this.theme.inputBorder, 1));
+      // Card surface: square paper slab with an ink hairline; the
+      // selected card becomes an ink band with a red block at its left edge.
+      cmds.push({
+        type: 'rect',
+        surfaceId,
+        params: {
+          ...card,
+          fill: isSelected
+            ? this.theme.textPrimary
+            : isHovered
+              ? withAlpha(this.theme.textPrimary, 0.07)
+              : this.theme.inputBg,
+          radius: this.style.radius ?? 0,
+        },
+      });
+      if (isSelected) {
+        cmds.push({ type: 'rect', surfaceId, params: { x: card.x, y: card.y, width: 5, height: card.height, fill: this.theme.accent } });
+      } else {
+        cmds.push(...inkFrame(surfaceId, card, this.theme.inputBorder, 1));
+      }
+    }
+
+    // Leading icon
+    if (item.iconName && g.icon) {
+      cmds.push(...iconCommands(item.iconName, {
+        surfaceId, x: Math.round(g.icon.x), y: Math.round(g.icon.y), size: LEAD_ICON,
+        color: item.iconColor ?? (inverted ? this.theme.windowBg : this.theme.textSecondary),
+        caps: shapeOf(this.theme).iconCaps,
+      }));
     }
 
     // Leading badge chip
@@ -378,12 +474,13 @@ export class ListWidget extends WidgetAbject {
       });
     }
 
-    // Word-wrapped title lines, then an optional muted detail line below.
-    // `detail` is the explicit field; fall back to `secondary` so a caller that
-    // reused the plain-row field still gets a second line. Clip the text column
-    // (rather than passing maxWidth, which horizontally squishes overflow) so
-    // any minor over-fill is cut off cleanly.
+    // Word-wrapped title lines, then an optional muted detail line below,
+    // with the note after it. `detail` is the explicit field; fall back to
+    // `secondary` so a caller that reused the plain-row field still gets a
+    // second line. Clip the text column (rather than passing maxWidth, which
+    // horizontally squishes overflow) so any minor over-fill is cut off cleanly.
     const detailText = item.detail ?? item.secondary;
+    const detailFont = `11px ${fontStacks(this.theme).body}`;
     const titleTop = g.card.y + CARD_PAD_V / 2;
     cmds.push({ type: 'save', surfaceId, params: {} });
     cmds.push({ type: 'clip', surfaceId, params: { x: g.textX, y: g.card.y, width: g.textW, height: g.card.h } });
@@ -394,27 +491,62 @@ export class ListWidget extends WidgetAbject {
         params: {
           x: g.textX, y: titleTop + i * TITLE_LINE_H + TITLE_LINE_H / 2, text: line,
           font: `13px ${fontStacks(this.theme).body}`,
-          fill: isSelected ? this.theme.windowBg : this.theme.textPrimary,
+          fill: inverted ? this.theme.windowBg : this.theme.textPrimary,
           baseline: 'middle',
         },
       });
     });
-    if (g.hasDetail && detailText) {
-      cmds.push({
-        type: 'text',
-        surfaceId,
-        params: {
-          x: g.textX, y: titleTop + g.lines.length * TITLE_LINE_H + DETAIL_LINE_H / 2, text: detailText,
-          font: `11px ${fontStacks(this.theme).body}`,
-          fill: isSelected ? withAlpha(this.theme.windowBg, 0.75) : this.theme.textTertiary,
-          baseline: 'middle',
-        },
-      });
+    if (g.hasDetail) {
+      const detailY = titleTop + g.lines.length * TITLE_LINE_H + DETAIL_LINE_H / 2;
+      let noteX = g.textX;
+      if (detailText) {
+        cmds.push({
+          type: 'text',
+          surfaceId,
+          params: {
+            x: g.textX, y: detailY, text: detailText,
+            font: detailFont,
+            fill: inverted ? withAlpha(this.theme.windowBg, 0.75) : flat ? this.theme.textMeta : this.theme.textTertiary,
+            baseline: 'middle',
+          },
+        });
+        noteX += (await this.measureText(surfaceId, detailText, detailFont)) + 10;
+      }
+      if (item.note?.text) {
+        cmds.push({
+          type: 'text',
+          surfaceId,
+          params: {
+            x: noteX, y: detailY, text: item.note.text,
+            font: detailFont,
+            fill: inverted ? this.theme.windowBg : item.note.color ?? this.theme.textSecondary,
+            baseline: 'middle',
+          },
+        });
+      }
     }
     cmds.push({ type: 'restore', surfaceId, params: {} });
 
     // Right-aligned action buttons
+    if (!showActions) return cmds;
     for (const a of g.actions) {
+      if (a.spec.iconName) {
+        cmds.push({
+          type: 'rect',
+          surfaceId,
+          params: {
+            x: a.x, y: a.y, width: a.w, height: a.h,
+            ...(a.spec.color ? { fill: a.spec.color } : {}),
+            stroke: a.spec.borderColor ?? this.theme.inputBorder,
+            radius: 0,
+          },
+        });
+        cmds.push(...iconCommands(a.spec.iconName, {
+          surfaceId, x: Math.round(a.x + (a.w - LEAD_ICON) / 2), y: Math.round(a.y + (a.h - LEAD_ICON) / 2), size: LEAD_ICON,
+          color: a.spec.textColor ?? this.theme.buttonText, caps: shapeOf(this.theme).iconCaps,
+        }));
+        continue;
+      }
       cmds.push({
         type: 'rect',
         surfaceId,
@@ -441,6 +573,30 @@ export class ListWidget extends WidgetAbject {
     return cmds;
   }
 
+  /** A group heading: the section's name, a rule, and how many rows it holds. */
+  private async sectionHeading(surfaceId: string, ox: number, y: number, w: number, label: string, count: number): Promise<unknown[]> {
+    const stacks = fontStacks(this.theme);
+    const labelFont = `500 11px ${stacks.display}`;
+    const countFont = `11px ${stacks.mono}`;
+    const text = label.toUpperCase();
+    const countText = String(count);
+    const midY = y + SECTION_H / 2 + 3;
+    const left = ox + 8;
+    const right = ox + w - SCROLLBAR_WIDTH - 8;
+    const labelW = await this.measureText(surfaceId, text, labelFont);
+    const countW = await this.measureText(surfaceId, countText, countFont);
+    const cmds: unknown[] = [
+      { type: 'text', surfaceId, params: { x: left, y: midY, text, font: labelFont, fill: this.theme.textSecondary, baseline: 'middle' } },
+      { type: 'text', surfaceId, params: { x: right, y: midY, text: countText, font: countFont, fill: this.theme.textMeta, align: 'right', baseline: 'middle' } },
+    ];
+    const ruleFrom = left + labelW + 10;
+    const ruleTo = right - countW - 10;
+    if (ruleTo > ruleFrom) {
+      cmds.push({ type: 'line', surfaceId, params: { x1: ruleFrom, y1: midY, x2: ruleTo, y2: midY, stroke: this.theme.divider, lineWidth: 1, lineCap: 'butt' } });
+    }
+    return cmds;
+  }
+
   // ── Rendering ────────────────────────────────────────────────────
 
   protected async buildDrawCommands(
@@ -453,7 +609,10 @@ export class ListWidget extends WidgetAbject {
     const h = this.rect.height;
 
     // Background
-    if (!this.style.radius) {
+    if (this.rowStyle === 'flat') {
+      // Flat rows sit on the window's ground, with no well around them.
+      commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: h, fill: this.theme.windowBg } });
+    } else if (!this.style.radius) {
       // Square paper well inside an ink rule.
       commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: h, fill: this.theme.inputBg } });
       commands.push(...inkFrame(surfaceId, { x: ox, y: oy, width: w, height: h }, this.theme.inputBorder, shapeOf(this.theme).ruleWidth));
@@ -483,7 +642,7 @@ export class ListWidget extends WidgetAbject {
         surfaceId,
         params: {
           x: sx, y: sy, width: sw, height: sh,
-          fill: this.theme.windowBg,
+          fill: this.rowStyle === 'flat' ? this.theme.inputBg : this.theme.windowBg,
           stroke: borderColor,
           radius: 0,
         },
@@ -494,12 +653,20 @@ export class ListWidget extends WidgetAbject {
         commands.push({ type: 'rect', surfaceId, params: { x: sx, y: sy, width: 4, height: sh, fill: this.theme.accent } });
       }
 
+      // A configured placeholder comes with a search icon, and the text starts after it.
+      const textInset = this.searchPlaceholder !== undefined ? 26 : 6;
+      if (this.searchPlaceholder !== undefined) {
+        commands.push(...iconCommands('search', {
+          surfaceId, x: sx + 8, y: Math.round(sy + (sh - 12) / 2), size: 12,
+          color: this.theme.textSecondary, caps: shapeOf(this.theme).iconCaps,
+        }));
+      }
       if (this.searchText) {
         commands.push({
           type: 'text',
           surfaceId,
           params: {
-            x: sx + 6, y: sy + sh / 2,
+            x: sx + textInset, y: sy + sh / 2,
             text: this.searchText,
             font: `12px ${fontStacks(this.theme).body}`,
             fill: this.theme.textPrimary,
@@ -511,10 +678,10 @@ export class ListWidget extends WidgetAbject {
           type: 'text',
           surfaceId,
           params: {
-            x: sx + 6, y: sy + sh / 2,
-            text: '\u{1F50D} Search...',
+            x: sx + textInset, y: sy + sh / 2,
+            text: this.searchPlaceholder ?? '\u{1F50D} Search...',
             font: `12px ${fontStacks(this.theme).body}`,
-            fill: this.theme.textPlaceholder,
+            fill: this.searchPlaceholder !== undefined ? this.theme.textMeta : this.theme.textPlaceholder,
             baseline: 'middle',
           },
         });
@@ -523,7 +690,7 @@ export class ListWidget extends WidgetAbject {
       // Cursor
       if (this.searchFocused) {
         const beforeCursor = this.searchText.substring(0, this.searchCursorPos);
-        const cursorX = sx + 6 + (beforeCursor.length > 0
+        const cursorX = sx + textInset + (beforeCursor.length > 0
           ? await this.measureText(surfaceId, beforeCursor, `12px ${fontStacks(this.theme).body}`)
           : 0);
         commands.push({
@@ -568,18 +735,27 @@ export class ListWidget extends WidgetAbject {
       const item = this.filteredItems[i];
       if (!item) continue;
 
-      const itemY = listY + rowTop - this.scrollTop;
+      // A group heading sits in the top of the first row of its section.
+      const headH = this._headH[i] ?? 0;
+      if (headH > 0 && item.section) {
+        commands.push(...await this.sectionHeading(surfaceId, ox, listY + rowTop - this.scrollTop, w, item.section, this._groupSize[i] ?? 0));
+      }
+      const itemY = listY + rowTop + headH - this.scrollTop;
       const isSelected = i === this.selectedIndex;
       const isHovered = i === this.hoveredIndex && !isSelected;
 
       // Rich (card) rows draw their own surface, badge, text, and buttons.
       if (this.isRichItem(item)) {
-        commands.push(...this.buildRichRow(surfaceId, ox, itemY, rowH, w, item, isSelected, isHovered));
+        commands.push(...await this.buildRichRow(surfaceId, ox, itemY, rowH - headH, w, item, isSelected, isHovered, this.showsActions(i)));
         continue;
       }
 
       // Selection/hover background
-      if (isSelected) {
+      if (isSelected && this.rowStyle === 'flat') {
+        const band = { x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight };
+        commands.push({ type: 'rect', surfaceId, params: { ...band, fill: this.theme.activeItemBg } });
+        commands.push(...inkFrame(surfaceId, band, this.theme.activeItemBorder, 1));
+      } else if (isSelected) {
         // Ink band with inverted text and a red block at the left.
         commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight, fill: this.theme.textPrimary } });
         commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: itemY, width: 5, height: this.itemHeight, fill: this.theme.accent } });
@@ -593,7 +769,7 @@ export class ListWidget extends WidgetAbject {
       const iconPad = item.iconName ? 8 : 0;
       const textX = ox + 10 + iconSize + iconPad;
       if (item.iconName) {
-        const iconColor = item.iconColor ?? (isSelected ? this.theme.windowBg : this.theme.textSecondary);
+        const iconColor = item.iconColor ?? (isSelected && this.rowStyle !== 'flat' ? this.theme.windowBg : this.theme.textSecondary);
         commands.push(...iconCommands(item.iconName, {
           surfaceId,
           x: ox + 10,
@@ -604,7 +780,8 @@ export class ListWidget extends WidgetAbject {
       }
 
       // Label + secondary as a single truncated line
-      const labelColor = isSelected ? this.theme.windowBg : this.theme.textPrimary;
+      const inverted = isSelected && this.rowStyle !== 'flat';
+      const labelColor = inverted ? this.theme.windowBg : this.theme.textPrimary;
       const maxTextWidth = w - (textX - ox) - 14;
       const secondary = item.secondary ?? '';
       const fullText = secondary ? `${item.label}  ${secondary}` : item.label;
@@ -636,7 +813,7 @@ export class ListWidget extends WidgetAbject {
             x: textX + labelPartWidth, y: itemY + this.itemHeight / 2,
             text: secondaryPart,
             font: secondaryFont,
-            fill: isSelected ? withAlpha(this.theme.windowBg, 0.75) : this.theme.textTertiary,
+            fill: inverted ? withAlpha(this.theme.windowBg, 0.75) : this.theme.textTertiary,
             baseline: 'middle',
           },
         });
@@ -733,9 +910,10 @@ export class ListWidget extends WidgetAbject {
         clickedIndex >= 0 && clickedIndex < this.filteredItems.length
           ? this.filteredItems[clickedIndex]
           : undefined;
-      if (clickedItem && this.isRichItem(clickedItem) && clickedItem.actions?.length) {
-        const rowTopY = this.listTop + this._rowTops[clickedIndex] - this.scrollTop;
-        const rowH = this._rowTops[clickedIndex + 1] - this._rowTops[clickedIndex];
+      if (clickedItem && this.isRichItem(clickedItem) && clickedItem.actions?.length && this.showsActions(clickedIndex)) {
+        const headH = this._headH[clickedIndex] ?? 0;
+        const rowTopY = this.listTop + this._rowTops[clickedIndex] + headH - this.scrollTop;
+        const rowH = this._rowTops[clickedIndex + 1] - this._rowTops[clickedIndex] - headH;
         const g = this.richRowGeometry(0, rowTopY, rowH, this.rect.width, clickedItem);
         for (const a of g.actions) {
           if (mx >= a.x && mx <= a.x + a.w && my >= a.y && my <= a.y + a.h) {
@@ -771,7 +949,7 @@ export class ListWidget extends WidgetAbject {
         this.ensureLayout();
         const listLocalY = my - this.listTop + this.scrollTop;
         const hoverIdx = this.rowIndexAt(listLocalY);
-        if (hoverIdx !== this.hoveredIndex && hoverIdx >= 0 && hoverIdx < this.filteredItems.length) {
+        if (hoverIdx !== this.hoveredIndex && hoverIdx < this.filteredItems.length) {
           this.hoveredIndex = hoverIdx;
           await this.requestRedraw();
         }
@@ -839,6 +1017,7 @@ export class ListWidget extends WidgetAbject {
               index: 0,
               value: item.value,
               label: item.label,
+              via: 'key',
             }));
           }
         }
@@ -917,6 +1096,7 @@ export class ListWidget extends WidgetAbject {
             index: this.selectedIndex,
             value: item.value,
             label: item.label,
+            via: 'key',
           }));
         }
       } else if (this.searchable) {
@@ -938,10 +1118,26 @@ export class ListWidget extends WidgetAbject {
             index: this.selectedIndex,
             value: item.value,
             label: item.label,
+            via: 'key',
           }));
         }
       }
       return { consumed: true };
+    }
+
+    // A key bound to an action fires it on the selected row, when the row offers it.
+    const keyAction = this.keyActions[key];
+    if (keyAction && this.selectedIndex >= 0) {
+      const item = this.filteredItems[this.selectedIndex];
+      if (item?.actions?.some((a) => a.id === keyAction)) {
+        this.changed('action', JSON.stringify({
+          index: this.selectedIndex,
+          value: item.value,
+          actionId: keyAction,
+          via: 'key',
+        }));
+        return { consumed: true };
+      }
     }
 
     if (key === 'Enter' && this.selectedIndex >= 0) {
@@ -982,12 +1178,14 @@ export class ListWidget extends WidgetAbject {
 
   protected applyUpdate(updates: Record<string, unknown>): void {
     if (updates.items !== undefined && Array.isArray(updates.items)) {
+      // The selection follows its item: rows that move or go must not leave
+      // it on another one (a key action would act on the wrong row).
+      const selectedValue = this.filteredItems[this.selectedIndex]?.value;
       this.items = updates.items as ListItem[];
       this.applyFilter(); // also invalidates layout
-      // Reset selection if out of range
-      if (this.selectedIndex >= this.filteredItems.length) {
-        this.selectedIndex = -1;
-      }
+      this.selectedIndex = selectedValue === undefined ? -1
+        : this.filteredItems.findIndex((item) => item.value === selectedValue);
+      if (this.hoveredIndex >= this.filteredItems.length) this.hoveredIndex = -1;
       this.clampScrollTop();
     }
     if (updates.selectedIndex !== undefined) {

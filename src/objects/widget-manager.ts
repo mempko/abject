@@ -970,6 +970,11 @@ export class WidgetManager extends Abject {
           items?: ListItem[];
           searchable?: boolean;
           itemHeight?: number;
+          actionsOn?: 'always' | 'active';
+          maxTitleLines?: number;
+          rowStyle?: 'card' | 'flat';
+          searchPlaceholder?: string;
+          keyActions?: Record<string, string>;
           orientation?: 'horizontal' | 'vertical';
           dividerPosition?: number;
           minSize?: number;
@@ -2877,7 +2882,7 @@ select - Dropdown select (options: string[], selectedIndex, searchable?). Fires 
 tabBar - Tab bar (tabs: string[] of labels, selectedIndex). Fires 'change' with the selected index as a NUMBER. Keyboard: ArrowLeft/Right to switch tabs.
 slider - Numeric range slider (spec fields: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
 image - Image display (spec fields: url, fit 'contain'|'cover'|'fill', alt). Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, clicking opens the URL in the user's browser. Update URL via this.call(imgId, 'update', { url: '...' }).
-list - Scrollable list (items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged' with value a JSON string { index, value, label, via } (JSON.parse it). Each item is { label, value, secondary?, iconName?, iconColor? }. RICH CARD ROWS: add any of badge, detail, or actions to an item and it renders as a two-line card row instead of a plain text line. badge: { text, color?, textColor? } is a colored leading chip (e.g. a percentage or status). detail (or secondary) is a muted second line under label. actions: [{ id, label, color?, textColor? }] are right-aligned buttons; clicking one fires a 'changed' event with aspect 'action' and value JSON { index, value, actionId } (row selection is unaffected). Rich rows auto-size to a comfortable height, so itemHeight is optional (set it only to make rows even taller). Example item: { label: 'Bitcoin above $100k by year end', value: 'p1', detail: 'created 2026-01-02  ·  #crypto', badge: { text: '80%', color: '#7ad19a', textColor: '#0f1226' }, actions: [{ id: 'right', label: '✓ Right', color: '#2e6b3c' }, { id: 'wrong', label: '✗ Wrong', color: '#7a2e36' }] }.
+list - Scrollable list (items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged' with value a JSON string { index, value, label, via } (JSON.parse it). Each item is { label, value, secondary?, iconName?, iconColor? }. RICH CARD ROWS: add any of badge, detail, or actions to an item and it renders as a two-line card row instead of a plain text line. badge: { text, color?, textColor? } is a colored leading chip (e.g. a percentage or status). detail (or secondary) is a muted second line under label. actions: [{ id, label, color?, textColor? }] are right-aligned buttons; clicking one fires a 'changed' event with aspect 'action' and value JSON { index, value, actionId } (row selection is unaffected). Rich rows auto-size to a comfortable height, so itemHeight is optional (set it only to make rows even taller). More for rich rows: iconName/iconColor draw a leading icon; note: { text, color? } follows detail in colour (a status); section: '<name>' groups consecutive rows under a heading with their count; an action with iconName (and borderColor?) is a square icon button. List options: actionsOn: 'active' shows actions only on the selected or hovered row; maxTitleLines caps title wrapping (ellipsis); rowStyle: 'flat' drops the card frames and outlines the selected row; searchPlaceholder sets the search box's empty text; keyActions: { Delete: 'delete' } fires that action on the selected row from the keyboard. Keyboard selection changes carry via: 'key', clicks via: 'click'; Enter fires 'confirm'. Example item: { label: 'Bitcoin above $100k by year end', value: 'p1', detail: 'created 2026-01-02  ·  #crypto', badge: { text: '80%', color: '#7ad19a', textColor: '#0f1226' }, actions: [{ id: 'right', label: '✓ Right', color: '#2e6b3c' }, { id: 'wrong', label: '✗ Wrong', color: '#7a2e36' }] }.
 tree - Hierarchical tree view (treeItems[], selectedId?, itemHeight?). Items have id, label, icon?, iconColor?, secondary?, depth, expanded?, hasChildren?. Fires 'selectionChanged' (value: JSON string { id, label }) and 'toggle' (value: JSON string { id }).
 splitPane - Resizable split view (orientation?, dividerPosition?, minSize?).
 contentBlock - Auto-height wrapped rich text (a markdown label that measures itself). Give it an expanding width and a provisional fixed height in the layout, register via addDependent, and listen for the 'contentHeight' aspect (value: number) — then call updateLayoutChild on its layout with preferredSize: { h: <that number> }. Use this for chat bubbles, feed entries, and any text whose height you would otherwise have to estimate. Defaults: markdown + wordWrap + selectable on; pass style: { markdown: false } for plain wrapped text. Also fires 'click' like a label.
@@ -3984,6 +3989,11 @@ async timerFired(msg) {
     selectedId?: string;
     searchable?: boolean;
     itemHeight?: number;
+    actionsOn?: 'always' | 'active';
+    maxTitleLines?: number;
+    rowStyle?: 'card' | 'flat';
+    searchPlaceholder?: string;
+    keyActions?: Record<string, string>;
     orientation?: 'horizontal' | 'vertical';
     dividerPosition?: number;
     minSize?: number;
@@ -4122,7 +4132,9 @@ async timerFired(msg) {
         return this.createTypedWidget(spec.windowId, new ListWidget({
           type: 'list', rect, style: spec.style,
           items: spec.items, selectedIndex: spec.selectedIndex,
-          searchable: spec.searchable, itemHeight: spec.itemHeight, ...base,
+          searchable: spec.searchable, itemHeight: spec.itemHeight,
+          actionsOn: spec.actionsOn, maxTitleLines: spec.maxTitleLines, rowStyle: spec.rowStyle,
+          searchPlaceholder: spec.searchPlaceholder, keyActions: spec.keyActions, ...base,
         }), rect);
       case 'tree':
         return this.createTypedWidget(spec.windowId, new TreeWidget({

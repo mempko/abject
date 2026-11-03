@@ -45,6 +45,9 @@ export type IconName =
   | 'eye'
   | 'bell'
   | 'lock'
+  // Row actions: rename and delete.
+  | 'pencil'
+  | 'trash'
   | 'grid'
   | 'diamond'
   | 'activity'
@@ -552,6 +555,27 @@ const lockIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
   ];
 };
 
+/** A pencil on the slant: rename, edit. */
+const pencilIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const p = at(x, y, size);
+  return [
+    polyline(surfaceId, [p(0.18, 0.82), p(0.24, 0.6), p(0.66, 0.18), p(0.82, 0.34), p(0.4, 0.76)], color, lw, true),
+    line(surfaceId, p(0.56, 0.28).x, p(0.56, 0.28).y, p(0.72, 0.44).x, p(0.72, 0.44).y, color, lw),
+  ];
+};
+
+/** A bin with its lid: delete. */
+const trashIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const p = at(x, y, size);
+  return [
+    line(surfaceId, p(0.16, 0.28).x, p(0.16, 0.28).y, p(0.84, 0.28).x, p(0.84, 0.28).y, color, lw),
+    polyline(surfaceId, [p(0.38, 0.28), p(0.38, 0.16), p(0.62, 0.16), p(0.62, 0.28)], color, lw, false),
+    polyline(surfaceId, [p(0.26, 0.28), p(0.31, 0.86), p(0.69, 0.86), p(0.74, 0.28)], color, lw, false),
+  ];
+};
+
 const gridIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
   const s = size * 0.3;
   const a = size * 0.16, b = size * 0.54;
@@ -641,6 +665,8 @@ const ICONS: Record<IconName, Renderer> = {
   eye: eyeIcon,
   bell: bellIcon,
   lock: lockIcon,
+  pencil: pencilIcon,
+  trash: trashIcon,
   grid: gridIcon,
   diamond: diamondIcon,
   activity: activityIcon,
