@@ -1,6 +1,6 @@
 {
   "name": "KnowledgeBaseCpp",
-  "version": "3.10.0",
+  "version": "3.11.0",
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace",
@@ -211,6 +211,15 @@
                 "kind": "primitive",
                 "primitive": "number"
               }
+            },
+            {
+              "description": "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)",
+              "name": "track",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
+              }
             }
           ],
           "returns": {
@@ -264,6 +273,15 @@
                 "kind": "primitive",
                 "primitive": "number"
               }
+            },
+            {
+              "description": "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)",
+              "name": "track",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
+              }
             }
           ],
           "returns": {
@@ -300,6 +318,15 @@
                 "kind": "primitive",
                 "primitive": "number"
               }
+            },
+            {
+              "description": "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)",
+              "name": "track",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
+              }
             }
           ],
           "returns": {
@@ -321,6 +348,15 @@
             {
               "description": "Include the entry's whole learning history (receipts); by default only its summary",
               "name": "includeLearning",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
+              }
+            },
+            {
+              "description": "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)",
+              "name": "track",
               "optional": true,
               "type": {
                 "kind": "primitive",
@@ -451,6 +487,15 @@
                 "kind": "primitive",
                 "primitive": "boolean"
               }
+            },
+            {
+              "description": "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)",
+              "name": "track",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
+              }
             }
           ],
           "returns": {
@@ -468,6 +513,15 @@
               "type": {
                 "kind": "primitive",
                 "primitive": "number"
+              }
+            },
+            {
+              "description": "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)",
+              "name": "track",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
               }
             }
           ],

@@ -13,6 +13,15 @@ export const SCREENSHOT_ID = 'abjects:screenshot' as AbjectId;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+type Shot = { imageBase64: string; width: number; height: number };
+/** UIServer's answer for a private window, which it shows only to its owner. */
+type PrivateRefusal = { error: string; private: true };
+
+function isPrivateRefusal(reply: unknown): reply is PrivateRefusal {
+  return !!reply && typeof reply === 'object' && (reply as { private?: unknown }).private === true
+    && typeof (reply as { error?: unknown }).error === 'string';
+}
+
 /**
  * Screenshot capability object.
  * Captures screenshots of object windows and the full desktop via the UIServer.
@@ -35,7 +44,7 @@ export class Screenshot extends Abject {
           methods: [
             {
               name: 'captureWindow',
-              description: 'Capture a screenshot of an object\'s window, wherever it is: off-screen, under other windows, or in a workspace other than the one on screen. Returns base64-encoded PNG image data, or { error } describing why nothing could be captured.',
+              description: 'Capture a screenshot of an object\'s window, wherever it is: off-screen, under other windows, or in a workspace other than the one on screen. Returns base64-encoded PNG image data, or { error } describing why nothing could be captured. A private window is captured only for the object whose window it is.',
               parameters: [
                 {
                   name: 'objectId',
@@ -61,7 +70,7 @@ export class Screenshot extends Abject {
             },
             {
               name: 'captureDesktop',
-              description: 'Capture a screenshot of the desktop the user is looking at: the active workspace only. Returns base64-encoded PNG image data. To see one object\'s window, use captureWindow.',
+              description: 'Capture a screenshot of the desktop the user is looking at: the active workspace only. Returns base64-encoded PNG image data. To see one object\'s window, use captureWindow. While a private window is on the desktop it answers { error } with no image.',
               parameters: [],
               returns: {
                 kind: 'object',
@@ -74,7 +83,7 @@ export class Screenshot extends Abject {
             },
             {
               name: 'listWindows',
-              description: 'List all visible windows with their objectId, title, and position.',
+              description: 'List all visible windows with their objectId, title, and position. A private window is listed with a placeholder title and private: true.',
               parameters: [],
               returns: {
                 kind: 'array',
@@ -98,16 +107,19 @@ export class Screenshot extends Abject {
       require(typeof objectId === 'string' && objectId.length > 0, 'captureWindow needs objectId or windowId');
       require(this.uiServerId !== undefined, 'UIServer not discovered');
 
-      const shot = await this.captureForOwner(objectId as AbjectId);
-      if (shot) return shot;
+      // UIServer shows a private window only to the object whose window it
+      // is, so every capture says who it is for.
+      const requester = msg.routing.from;
+      const shot = await this.captureForOwner(objectId as AbjectId, requester);
+      if (shot) return isPrivateRefusal(shot) ? { error: shot.error } : shot;
 
       // Callers frequently hold a registered NAME ("RacingGame") rather than
       // an AbjectId — resolve it via the Registry and retry.
       if (!UUID_RE.test(objectId)) {
         const resolved = await this.resolveRegisteredName(objectId);
         if (resolved) {
-          const named = await this.captureForOwner(resolved);
-          if (named) return named;
+          const named = await this.captureForOwner(resolved, requester);
+          if (named) return isPrivateRefusal(named) ? { error: named.error } : named;
         }
       }
 
@@ -118,23 +130,24 @@ export class Screenshot extends Abject {
       };
     });
 
-    this.on('captureDesktop', async () => {
+    this.on('captureDesktop', async (msg: AbjectMessage) => {
       require(this.uiServerId !== undefined, 'UIServer not discovered');
-      return this.request<{ imageBase64: string; width: number; height: number }>(
-        request(this.id, this.uiServerId!, 'captureDesktop', {}),
+      return this.request<{ imageBase64: string; width: number; height: number; error?: string }>(
+        request(this.id, this.uiServerId!, 'captureDesktop', { onBehalfOf: msg.routing.from }),
         15000,
       );
     });
 
-    this.on('listWindows', async () => {
+    this.on('listWindows', async (msg: AbjectMessage) => {
       require(this.uiServerId !== undefined, 'UIServer not discovered');
       return this.request<Array<{
         objectId: AbjectId;
         title: string;
         surfaceId: string;
         rect: { x: number; y: number; width: number; height: number };
+        private?: true;
       }>>(
-        request(this.id, this.uiServerId!, 'listWindows', {}),
+        request(this.id, this.uiServerId!, 'listWindows', { onBehalfOf: msg.routing.from }),
       );
     });
   }
@@ -147,15 +160,18 @@ export class Screenshot extends Abject {
    * Try every capture route for an owning object's id: direct surface hit,
    * then owner → window(s) via WidgetManager. An empty imageBase64 is a
    * failed capture, never a result — returning it would short-circuit the
-   * remaining routes with an image the caller cannot see.
+   * remaining routes with an image the caller cannot see. A private window
+   * ends the search with UIServer's refusal.
    */
   private async captureForOwner(
     objectId: AbjectId,
-  ): Promise<{ imageBase64: string; width: number; height: number; ownerId: AbjectId; windowId?: AbjectId } | null> {
-    const direct = await this.request<{ imageBase64: string; width: number; height: number } | null>(
-      request(this.id, this.uiServerId!, 'captureScreenshot', { objectId }),
+    requester: AbjectId,
+  ): Promise<(Shot & { ownerId: AbjectId; windowId?: AbjectId }) | PrivateRefusal | null> {
+    const direct = await this.request<Shot | PrivateRefusal | null>(
+      request(this.id, this.uiServerId!, 'captureScreenshot', { objectId, onBehalfOf: requester }),
       15000,
     );
+    if (isPrivateRefusal(direct)) return direct;
     if (direct?.imageBase64) {
       const manager = await this.discoverDep('WidgetManager');
       const owner = manager ? await this.request<{ ownerId: AbjectId; windowId: AbjectId } | null>(request(this.id, manager, 'getOwnership', { objectId })).catch(() => null) : null;
@@ -175,10 +191,11 @@ export class Screenshot extends Abject {
         );
         for (const w of windows ?? []) {
           if (w.ownerId !== objectId) continue;
-          const shot = await this.request<{ imageBase64: string; width: number; height: number } | null>(
-            request(this.id, this.uiServerId!, 'captureScreenshot', { objectId: w.windowId }),
+          const shot = await this.request<Shot | PrivateRefusal | null>(
+            request(this.id, this.uiServerId!, 'captureScreenshot', { objectId: w.windowId, onBehalfOf: requester }),
             15000,
           );
+          if (isPrivateRefusal(shot)) return shot;
           if (shot?.imageBase64) return { ...shot, ownerId: w.ownerId, windowId: w.windowId };
         }
       }
@@ -256,6 +273,7 @@ Use listWindows to get surfaceIds, then click/type/keyPress to interact.
 - When nothing can be captured, captureWindow returns { error: "..." } explaining why — a result WITHOUT imageBase64 means you have NOT seen the window; do not treat it as visual confirmation.
 - Screenshots capture the current rendered state; ensure the target has drawn before capturing.
 - captureWindow shows the window AS COMPOSITED — widgets, 2D canvas content, AND the window's 3D scene nodes (meshes/lights/bloom) — so it verifies 3D rendering. It works wherever the window is: off-screen, under other windows, or in a workspace other than the one the user is looking at. The capture brings the window forward for that one shot and puts everything back, so capture each window where it lives.
+- A private window (a private conversation's) is listed with a placeholder title and cannot be captured; while one is on the desktop, captureDesktop answers { error } with no image. captureWindow still works for every other window.
 - captureDesktop shows only the workspace the user is looking at; windows of other workspaces are not on it. That is normal: the user moves between workspaces while you work, and every object stays in its own workspace.
 - Click/type/keyPress are on UIServer, not Screenshot. Use both together for visual interaction.`;
   }

@@ -21,6 +21,7 @@ import * as path from 'node:path';
 import { DatabaseSync, StatementSync } from 'node:sqlite';
 import { Storage, StorageEntry } from '../src/objects/capabilities/storage.js';
 import { Log } from '../src/core/timed-log.js';
+import { isPrivateKey } from '../src/core/privacy.js';
 
 const STORAGE_DIR = process.env.ABJECTS_DATA_DIR ?? '.abjects';
 const STORAGE_FILE = 'storage.json';
@@ -91,6 +92,9 @@ export class NodeStorage extends Storage {
   override async deleteValue(key: string): Promise<boolean> {
     if (!this.sqlite) return super.deleteValue(key);
     const info = this.delStmt!.run(key);
+    // The write-ahead log still holds earlier versions of the row until it is
+    // checkpointed and reset; a private key's go with it at once.
+    if (isPrivateKey(key) && Number(info.changes) > 0) this.sqlite.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     return Number(info.changes) > 0;
   }
 
@@ -129,6 +133,9 @@ export class NodeStorage extends Storage {
     // return without a full fsync on every set.
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = NORMAL');
+    // Deleted and overwritten rows are zeroed rather than left in free pages,
+    // so a deleted private conversation leaves no readable copy in the file.
+    db.exec('PRAGMA secure_delete = ON');
     db.exec(`
       CREATE TABLE IF NOT EXISTS kv(
         key TEXT PRIMARY KEY,

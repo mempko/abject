@@ -7,7 +7,8 @@ import { describeMessages, protocolText } from '../core/protocol-description.js'
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { AbjectId, AbjectMessage } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { require, invariant } from '../core/contracts.js';
+import { require, ensure, invariant } from '../core/contracts.js';
+import { isPrivatePayload, shown, PRIVATE_TEXT } from '../core/privacy.js';
 import { Log } from '../core/timed-log.js';
 import * as msg from '../core/message.js';
 import { event } from '../core/message.js';
@@ -359,6 +360,12 @@ export interface LLMLedgerEntry {
   site?: string;
   /** For `decide` calls: the policy mode, whether a chat model emulated it, and the answers in brief. */
   decision?: { mode: string; emulated: boolean; answers: string };
+  /**
+   * True for a call made in a private conversation or for a private goal or
+   * task. Such an entry keeps its cost, tokens, times and route, but no
+   * prompt or output text and no goal or task id.
+   */
+  private?: boolean;
 }
 
 /** The name the monitor's detail view speaks: an entry with its text filled in. */
@@ -602,6 +609,14 @@ export class LLMObject extends Abject {
   private _pendingText: Map<string, string> = new Map();
   /** Fired by killRequest; each in-flight call stops waiting on it. */
   private _killSwitches: Map<string, AbortController> = new Map();
+  /** Goal and task ids whose calls are private (markPrivate). Memory only. */
+  private privateScopes: Set<string> = new Set();
+  /**
+   * The task a private ledger entry ran for, kept beside the entry instead of
+   * on it so getTaskUsage can still total a private task's spend. Memory
+   * only; dropped when the task's privacy scope ends.
+   */
+  private _privateTaskOf: Map<string, string> = new Map();
   private readonly _sessionStartedAt = Date.now();
   private storageId?: AbjectId;
 
@@ -629,6 +644,10 @@ export class LLMObject extends Abject {
   // was up when this object started, and it holds every call's text.
   // Storage is found when first needed, for this record only.
   private static readonly DAILY_SPEND_KEY = 'llm:daily-spend';
+  /** The built-in objects that may mark a goal or task private (markPrivate). */
+  // Not JobManager: every job's calls arrive from it, so job code could
+  // otherwise unmark a private goal. Its own private calls carry the flag.
+  private static readonly PRIVATE_SCOPE_MARKERS = ['GoalManager', 'AgentAbject', 'Chat', 'ScrumMaster'] as const;
   private dailySpend: { day: string; byCaller: Record<string, number> } = { day: '', byCaller: {} };
   private dailySpendLoad?: Promise<void>;
   private dailySpendStorageId?: AbjectId;
@@ -698,6 +717,12 @@ export class LLMObject extends Abject {
                     description: 'Completion options',
                     optional: true,
                   },
+                  {
+                    name: 'private',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'true for a call made in a private conversation or for private work: metered as usual, with no prompt or output text kept in the ledger',
+                    optional: true,
+                  },
                 ],
                 returns: { kind: 'reference', reference: 'LLMCompletionResult' },
               },
@@ -721,6 +746,12 @@ export class LLMObject extends Abject {
                     description: 'Additional context (e.g., existing code)',
                     optional: true,
                   },
+                  {
+                    name: 'private',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'true for a call made in a private conversation or for private work: metered as usual, with no prompt or output text kept in the ledger',
+                    optional: true,
+                  },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -737,6 +768,12 @@ export class LLMObject extends Abject {
                     name: 'task',
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'Analysis task',
+                  },
+                  {
+                    name: 'private',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'true for a call made in a private conversation or for private work: metered as usual, with no prompt or output text kept in the ledger',
+                    optional: true,
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
@@ -757,6 +794,12 @@ export class LLMObject extends Abject {
                     name: 'options',
                     type: { kind: 'reference', reference: 'LLMCompletionOptions' },
                     description: 'Completion options',
+                    optional: true,
+                  },
+                  {
+                    name: 'private',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'true for a call made in a private conversation or for private work: metered as usual, with no prompt or output text kept in the ledger',
                     optional: true,
                   },
                 ],
@@ -780,6 +823,12 @@ export class LLMObject extends Abject {
                     name: 'options',
                     type: { kind: 'reference', reference: 'CompressOptions' },
                     description: 'Optional: targetChars (default 180000), pinnedCount (leading messages kept verbatim, default 2), keepRecent (trailing messages kept verbatim, default 4), taskHint (what the conversation is working on — improves distillation relevance)',
+                    optional: true,
+                  },
+                  {
+                    name: 'private',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'true for a call made in a private conversation or for private work: metered as usual, with no prompt or output text kept in the ledger',
                     optional: true,
                   },
                 ],
@@ -987,11 +1036,21 @@ export class LLMObject extends Abject {
               },
               {
                 name: 'getRequestDetail',
-                description: 'Get the full detail of a request including prompt and output',
+                description: 'Get the full detail of a request including prompt and output (a private call shows no text)',
                 parameters: [
                   { name: 'requestId', type: { kind: 'primitive', primitive: 'string' }, description: 'The request ID' },
                 ],
                 returns: { kind: 'reference', reference: 'LLMHistoryEntry' },
+              },
+              {
+                name: 'markPrivate',
+                description: 'Mark a goal or task private, or end its privacy (built-in goal, agent and chat objects only; memory only). Calls carrying that goalId or taskId are then private: metered and budgeted as usual, with no prompt or output text, goal or task id kept in the ledger, and no prompt cache keepalive.',
+                parameters: [
+                  { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal whose calls are private', optional: true },
+                  { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task whose calls are private (also matched against options.cacheKey)', optional: true },
+                  { name: 'active', type: { kind: 'primitive', primitive: 'boolean' }, description: 'true to mark private, false when the goal or task is gone' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'listProviderModels',
@@ -1100,6 +1159,7 @@ export class LLMObject extends Abject {
                   { name: 'site', type: { kind: 'primitive', primitive: 'string' }, description: 'Decision site id (src/core/decision-sites.ts); omit for an explicit call, which always runs', optional: true },
                   { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal to charge the call to', optional: true },
                   { name: 'onBehalfOf', type: { kind: 'primitive', primitive: 'string' }, description: 'Name to attribute the call to in the ledger', optional: true },
+                  { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'true for a decision about private material: metered as usual, with no state or answers kept in the ledger or logs', optional: true },
                 ],
                 returns: { kind: 'object', properties: {
                   answers: { kind: 'object', properties: {} },
@@ -1185,9 +1245,26 @@ export class LLMObject extends Abject {
     );
   }
 
-  private usageContext = new AsyncLocalStorage<{ callerId: AbjectId; goalId?: string; taskId?: string }>();
+  private usageContext = new AsyncLocalStorage<{ callerId: AbjectId; goalId?: string; taskId?: string; private?: true }>();
   private onMetered(method: string, handler: (m: AbjectMessage) => Promise<unknown>): void {
-    this.on(method, m => { const p=m.payload as {goalId?:string;taskId?:string;options?:{cacheKey?:string}}; return this.usageContext.run({callerId:m.routing.from,goalId:p.goalId,taskId:p.taskId??p.options?.cacheKey}, () => handler(m)); });
+    this.on(method, m => { const p=m.payload as {goalId?:string;taskId?:string;options?:{cacheKey?:string}}; const taskId=p.taskId??p.options?.cacheKey; return this.usageContext.run({callerId:m.routing.from,goalId:p.goalId,taskId,...(this.isPrivateCall(m.payload,p.goalId,taskId)?{private:true as const}:{})}, () => handler(m)); });
+  }
+
+  /**
+   * A call is private when its payload says so or it belongs to a goal or
+   * task marked private (markPrivate). The flag only takes things away: a
+   * private call is metered and budgeted as usual, but its ledger entry keeps
+   * no text and no goal or task id, and it never enters the warm registry.
+   */
+  private isPrivateCall(payload: unknown, goalId: string | undefined, taskId: string | undefined): boolean {
+    return isPrivatePayload(payload)
+      || (typeof goalId === 'string' && this.privateScopes.has(goalId))
+      || (typeof taskId === 'string' && this.privateScopes.has(taskId));
+  }
+
+  /** True while the current call runs in a private scope. */
+  private inPrivateCall(): boolean {
+    return this.usageContext.getStore()?.private === true;
   }
 
   private async usageManagerFor(callerId: AbjectId): Promise<AbjectId | null> {
@@ -1217,9 +1294,10 @@ export class LLMObject extends Abject {
 
   /** Reserve goal budget for one model call and return the settle step (a no-op outside a goal). */
   private async reserveUsageFor(providerName: string, model: string, inputTokens: number, outputTokens: number): Promise<UsageSettle> {
-    const scope = this.usageContext.getStore();
+    const store = this.usageContext.getStore();
     const finish: UsageSettle = async () => {};
-    if (!scope?.goalId) return finish;
+    if (!store?.goalId) return finish;
+    const { private: _private, ...scope } = store;
     const manager = await this.usageManagerFor(scope.callerId);
     if (!manager) throw new Error('GoalManager unavailable in the requesting workspace for resource accounting');
     const operationId = `llm-${crypto.randomUUID()}`;
@@ -1266,7 +1344,7 @@ export class LLMObject extends Abject {
     this.setupDecisionHandlers();
     this.on('getTaskUsage', msg=>{
       const {taskId,sessionId}=msg.payload as {taskId:string;sessionId?:string};
-      const rows=this._ledger.filter(r=>r.taskId===taskId || (sessionId && (r.taskId===sessionId || r.taskId?.startsWith(`${sessionId}:attempt-`))));
+      const rows=this._ledger.filter(r=>{const t=r.taskId??this._privateTaskOf.get(r.id); return t===taskId || (sessionId && (t===sessionId || t?.startsWith(`${sessionId}:attempt-`)));});
       return {tokens:rows.reduce((n,r)=>n+(r.usage?.inputTokens??0)+(r.usage?.outputTokens??0),0),cost:rows.reduce((n,r)=>n+(r.costUsd??0),0),
         elapsedMs:rows.reduce((n,r)=>n+r.elapsedMs,0),unpricedCalls:rows.filter(r=>r.costUsd===undefined).length,unreportedCalls:rows.filter(r=>!r.usage).length};
     });
@@ -1289,12 +1367,20 @@ export class LLMObject extends Abject {
     this.on('generateCode', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
       const { language, description, context } = m.payload as LLMGenerateCodePayload;
+      if (isPrivatePayload(m.payload)) {
+        return this.usageContext.run({ callerId: m.routing.from, private: true },
+          () => this.generateCode(language, description, context, m.routing.from, m.header.messageId));
+      }
       return this.generateCode(language, description, context, m.routing.from, m.header.messageId);
     });
 
     this.on('analyze', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
       const { content, task } = m.payload as LLMAnalyzePayload;
+      if (isPrivatePayload(m.payload)) {
+        return this.usageContext.run({ callerId: m.routing.from, private: true },
+          () => this.analyze(content, task, m.routing.from, m.header.messageId));
+      }
       return this.analyze(content, task, m.routing.from, m.header.messageId);
     });
 
@@ -1705,6 +1791,7 @@ export class LLMObject extends Abject {
       const { requestId } = m.payload as { requestId: string };
       const entry = this._byId.get(requestId);
       if (!entry) return null;
+      if (entry.private) return this.withText(entry);
 
       if (entry.status === 'active') {
         return {
@@ -1749,6 +1836,24 @@ export class LLMObject extends Abject {
       this._paused = false;
       log.info('LLM unpaused');
       this.changed('unpaused', true);
+      return true;
+    });
+
+    this.on('markPrivate', async (m: AbjectMessage) => {
+      const { goalId, taskId, active } = (m.payload ?? {}) as { goalId?: string; taskId?: string; active?: boolean };
+      require(await this.isBuiltInCaller(m.routing.from, LLMObject.PRIVATE_SCOPE_MARKERS),
+        'markPrivate is taken from built-in goal, agent and chat objects only');
+      require(typeof active === 'boolean', 'markPrivate needs active: true or false');
+      require(goalId === undefined || (typeof goalId === 'string' && goalId.length > 0), 'goalId must be a non-empty string');
+      require(taskId === undefined || (typeof taskId === 'string' && taskId.length > 0), 'taskId must be a non-empty string');
+      require(goalId !== undefined || taskId !== undefined, 'markPrivate needs a goalId or a taskId');
+      for (const id of [goalId, taskId]) {
+        if (id === undefined) continue;
+        if (active) { this.privateScopes.add(id); continue; }
+        this.privateScopes.delete(id);
+        for (const [entryId, task] of this._privateTaskOf) if (task === id) this._privateTaskOf.delete(entryId);
+      }
+      this.checkInvariants();
       return true;
     });
 
@@ -2224,7 +2329,7 @@ export class LLMObject extends Abject {
     }
     if (!result) result = await this.decideEmulated(request, site, mode, callerId, requestId, onBehalfOf, fallbackOf);
 
-    this.decisionMemo.set(memoKey, { at: Date.now(), result });
+    if (!this.inPrivateCall()) this.decisionMemo.set(memoKey, { at: Date.now(), result });
     if (this.decisionMemo.size > LLMObject.DECISION_MEMO_MAX) {
       const oldest = this.decisionMemo.keys().next().value;
       if (oldest !== undefined) this.decisionMemo.delete(oldest);
@@ -2266,8 +2371,9 @@ export class LLMObject extends Abject {
         await settle();
       }
       const entry = this._byId.get(requestId);
-      if (entry) entry.decision = { mode, emulated: false, answers: summarizeAnswers(result) };
-      log.info(`← ${providerName} decide | site=${site ?? 'explicit'} | ${Date.now() - start}ms | ${summarizeAnswers(result)} | tokens=${result.usage?.inputTokens ?? '?'}in`);
+      const answers = shown(summarizeAnswers(result), this.inPrivateCall());
+      if (entry) entry.decision = { mode, emulated: false, answers };
+      log.info(`← ${providerName} decide | site=${site ?? 'explicit'} | ${Date.now() - start}ms | ${answers} | tokens=${result.usage?.inputTokens ?? '?'}in`);
       this.trackRequestEnd(requestId, JSON.stringify(result.answers), settleUsageOf(result), 'stop');
       return result;
     } catch (err) {
@@ -2310,11 +2416,12 @@ export class LLMObject extends Abject {
     };
     const result = await emulateDecision(request, transport);
     const first = ledgerIds[0] ? this._byId.get(ledgerIds[0]) : undefined;
+    const answers = shown(summarizeAnswers(result), this.inPrivateCall());
     if (first) {
-      first.decision = { mode, emulated: true, answers: summarizeAnswers(result) };
+      first.decision = { mode, emulated: true, answers };
       if (fallbackOf) first.fallbackOf = fallbackOf;
     }
-    log.info(`decide ${site ?? '(explicit)'} emulated on ${result.provider}/${result.model} in ${calls} call(s) | ${summarizeAnswers(result)}` +
+    log.info(`decide ${site ?? '(explicit)'} emulated on ${result.provider}/${result.model} in ${calls} call(s) | ${answers}` +
       (result.missing?.length ? ` | missing=${result.missing.join(',')}` : ''));
     return result;
   }
@@ -2867,9 +2974,14 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     // Attribute to the subject when the sender named one; keep the sender as
     // `via` so the route is still inspectable rather than erased.
     const callerName = onBehalfOf ?? senderName;
+    // A private call's entry keeps what it cost and where it ran, never what
+    // it said or which goal or task it served.
+    const scope = this.usageContext.getStore();
+    const isPrivate = scope?.private === true;
+    if (isPrivate && scope?.taskId) this._privateTaskOf.set(requestId, scope.taskId);
     const entry: LLMLedgerEntry = {
       id: requestId,
-      taskId:this.usageContext.getStore()?.taskId, goalId:this.usageContext.getStore()?.goalId,
+      taskId:isPrivate ? undefined : scope?.taskId, goalId:isPrivate ? undefined : scope?.goalId,
       callerId,
       callerName,
       ...(onBehalfOf && senderName && senderName !== onBehalfOf ? { via: senderName } : {}),
@@ -2888,10 +3000,13 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       effort: routing?.effort,
       maxTokens: routing?.maxTokens,
       ...(routing?.site ? { site: routing.site } : {}),
+      ...(isPrivate ? { private: true } : {}),
     };
     this._ledger.push(entry);
     this._byId.set(requestId, entry);
-    if (messages) this._pendingText.set(requestId, this.serializeMessages(messages));
+    if (messages && !isPrivate) this._pendingText.set(requestId, this.serializeMessages(messages));
+    ensure(!isPrivate || (entry.taskId === undefined && entry.goalId === undefined && !this._pendingText.has(requestId)),
+      'a private ledger entry keeps no text, goal or task id');
     this.changed('requestStarted', { ...entry });
     return entry;
   }
@@ -3004,7 +3119,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     const prompt = this._pendingText.get(entry.id);
     this._pendingText.delete(entry.id);
 
-    if (this._retention.keepText) {
+    if (this._retention.keepText && !entry.private) {
       const inputMessages = prompt ?? '';
       const output = this.truncate(outputContent);
       if (inputMessages || output) {
@@ -3014,6 +3129,8 @@ Only output the code, no explanations. Use proper formatting and comments.`;
         void this.writeText(entry.id, { inputMessages, outputContent: output });
       }
     }
+    ensure(!entry.private || (entry.inputMessages === undefined && entry.outputContent === undefined && !entry.hasText),
+      'a private ledger entry keeps no prompt or output text');
 
     this.dirtyDays.add(LLMObject.dayKey(entry.startTime));
     this.enforceRetention();
@@ -3267,6 +3384,10 @@ Only output the code, no explanations. Use proper formatting and comments.`;
    * read as "the model was sent nothing and said nothing".
    */
   private async withText(entry: LLMLedgerEntry): Promise<LLMLedgerEntry> {
+    if (entry.private) {
+      const { inputMessages: _in, outputContent: _out, ...meta } = entry;
+      return { ...meta, inputMessages: '', outputContent: PRIVATE_TEXT };
+    }
     if (entry.inputMessages !== undefined || entry.outputContent !== undefined) {
       return { ...entry };
     }
@@ -3956,6 +4077,8 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     usage: { inputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number } | undefined,
   ): void {
     if (!this.cacheKeepaliveEnabled || this.cacheKeepaliveTripped || this._paused) return;
+    // The registry holds the prompt itself, so a private call never enters it.
+    if (this.inPrivateCall()) return;
     try {
       const { provider, modelOverride, effortOverride } = this.resolveProviderAndModel(providerName, options?.tier);
       const effectiveOptions = this.applyRouting(options, modelOverride, effortOverride);

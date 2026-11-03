@@ -61,6 +61,7 @@ import {
   type Assumption, type AssumptionStatus,
 } from '../core/surprise.js';
 import type { EntryEvidence } from '../core/learning.js';
+import { isPrivatePayload, shown, PRIVATE_REFUSAL_GUIDANCE } from '../core/privacy.js';
 
 const log = new Log('ScrumMaster');
 
@@ -74,6 +75,12 @@ const SCRUM_QUESTIONS_KEY = 'scrum/questions';
 
 /** GoalManager's scratchpad key for a goal's stated assumptions (read only as a fallback). */
 const GOAL_ASSUMPTIONS_KEY = 'goal/assumptions';
+
+/** What the planner hears in place of a knowledge write on a private goal. */
+const PRIVATE_KNOWLEDGE_NOTE = 'This goal is private, so nothing from it is saved to or removed from knowledge. Carry on with the goal itself.';
+
+/** The line a private goal's snapshot carries, so the planner knows its limits. */
+const PRIVATE_PLANNING_NOTE = 'This goal is private. Knowledge is read only (save_knowledge and forget_knowledge change nothing), and `team` lists the built-in agents, the only ones that may work on it.';
 
 /** Statuses `resolve_assumption` may set. */
 const RESOLVABLE_STATUSES: readonly AssumptionStatus[] = ['held', 'missed', 'confirmed', 'corrected'];
@@ -273,6 +280,7 @@ export class ScrumMaster extends Abject {
     try {
       if (!this.goalManagerId) return false;
       const goal = await this.request<{ creatorPeerId?: string } | null>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
+      this.notePrivacy(goalId, goal);
       const creator = (goal as { creatorPeerId?: string } | null)?.creatorPeerId;
       if (!creator) return false;
       if (!this.localPeerId) await this.resolveLocalPeerId();
@@ -280,6 +288,85 @@ export class ScrumMaster extends Abject {
       return creator !== this.localPeerId;
     } catch { return false; }
   }
+  // ─── Private goals ────────────────────────────────────────────────
+  //
+  // A goal started from a private conversation carries `private: true` on
+  // its record and on every event about it. Its planning runs as usual with
+  // the doors to shared places closed: every task it enqueues is private,
+  // only built-in agents work on it or answer its polls, knowledge is read
+  // without a trace and never written, and its logs and LLM calls keep no
+  // text of it.
+
+  /** True when the goal is private (learned from its record or an event about it). */
+  private isPrivateGoal(goalId: string | undefined): boolean {
+    return !!goalId && this.privateGoals.has(goalId);
+  }
+
+  /** Note a goal as private when its record or an event about it says so. */
+  private notePrivacy(goalId: string | undefined, carrier: unknown): void {
+    if (!goalId || this.privateGoals.has(goalId) || this.forgottenGoals.has(goalId) || !isPrivatePayload(carrier)) return;
+    this.privateGoals.set(goalId, { receipts: new Map(), planned: new Set(), tickets: new Set() });
+  }
+
+  /** `{ private: true }` to spread into a payload made for a private goal; nothing otherwise. */
+  private privateFlag(goalId: string | undefined): { private?: true } {
+    return this.isPrivateGoal(goalId) ? { private: true } : {};
+  }
+
+  /** The agents a goal may draw on: all of them, or for a private goal the built-in ones. Returns `team` itself when unfiltered. */
+  private async rosterFor<T extends { agentId: AbjectId }>(goalId: string, team: T[]): Promise<T[]> {
+    if (!this.isPrivateGoal(goalId)) return team;
+    const builtIn = await Promise.all(team.map(a => this.isBuiltInCaller(a.agentId)));
+    return team.filter((_, i) => builtIn[i]);
+  }
+
+  /** A scrum operation's commit receipt: from the goal's scratchpad, or kept here for a private goal. */
+  private commitReceipt(goalId: string, scratchpad: Record<string, unknown> | undefined, operationId: string): unknown {
+    const kept = this.privateGoals.get(goalId);
+    if (kept) return kept.receipts.get(operationId);
+    return scratchpad?.[`learning/commit/${operationId}`];
+  }
+
+  /** Record a scrum commit with GoalManager, or here for a private goal (GoalManager keeps no learning record of one). */
+  private async recordCommit(goalId: string, operationId: string, outcome?: { outcome: 'replanned'; error?: string }): Promise<void> {
+    const kept = this.privateGoals.get(goalId);
+    if (kept) {
+      if (!kept.receipts.has(operationId)) kept.receipts.set(operationId, outcome ?? true);
+      return;
+    }
+    await this.request(request(this.id, this.goalManagerId!, 'recordScrumCommit', { goalId, operationId, ...(outcome ?? {}) }));
+  }
+
+  /** Drop everything held for a private goal that has ended; later events about it start nothing. */
+  private forgetPrivateGoal(goalId: string, taskIds: string[]): void {
+    const kept = this.privateGoals.get(goalId);
+    const tickets = new Set(kept?.tickets ?? []);
+    for (const [taskId, info] of this.scrumInFlight) if (info.goalId === goalId) tickets.add(taskId);
+    for (const [taskId, info] of this.scrumAttempts) if (info.goalId === goalId) tickets.add(taskId);
+    for (const ticket of tickets) {
+      this.scrumInFlight.delete(ticket);
+      this.scrumAttempts.delete(ticket);
+      this.refreshObservations.delete(ticket);
+      this.takeTaskResult(ticket);
+      this.pendingTickets.get(ticket)?.reject(new Error('The private goal ended'));
+    }
+    for (const [taskId, info] of this.pendingDeps) if (info.goalId === goalId) this.pendingDeps.delete(taskId);
+    for (const taskId of taskIds) { this.pendingDeps.delete(taskId); this.recoveredEnqueues.delete(taskId); }
+    for (const key of this.scrummedRounds) if (key.startsWith(`${goalId}#`)) this.scrummedRounds.delete(key);
+    for (const key of this.judgedAnswers) if (key.startsWith(`${goalId}:`)) this.judgedAnswers.delete(key);
+    for (const key of this.reactedNotes) if (key.startsWith(`${goalId}:`)) this.reactedNotes.delete(key);
+    const timer = this.interjectionTimers.get(goalId);
+    if (timer) { this.cancelTimer(timer); this.interjectionTimers.delete(goalId); }
+    this.oneShotGoals.delete(goalId);
+    this.forceFullScrum.delete(goalId);
+    this.scrumRetryGoals.delete(goalId);
+    this.patternReceipts.delete(goalId);
+    this.privateGoals.delete(goalId);
+    this.forgottenGoals.add(goalId);
+    while (this.forgottenGoals.size > 200) this.forgottenGoals.delete(this.forgottenGoals.keys().next().value!);
+    log.info(`Forgot private goal ${goalId.slice(0, 8)} (${tickets.size} scrum task(s), ${taskIds.length} task id(s))`);
+  }
+
   /** Optional. Used by review_scrum auto-recall, save_knowledge, lookup_knowledge. */
   private knowledgeBaseId?: AbjectId;
   /**
@@ -335,6 +422,24 @@ export class ScrumMaster extends Abject {
     /** A read-only check task, delivered as such. */
     check?: boolean;
   }>();
+
+  /**
+   * Private goals this object plans, with what it keeps for them in memory
+   * only: GoalManager keeps no learning record for a private goal, so the
+   * scrum commit receipts and the plans already dispatched live here, with
+   * the scrum tickets whose results this object may still hold. Everything
+   * goes at forgetPrivateGoal.
+   */
+  private privateGoals = new Map<string, {
+    receipts: Map<string, true | { outcome: 'replanned'; error?: string }>;
+    planned: Set<string>;
+    tickets: Set<string>;
+  }>();
+  /**
+   * Ids of private goals already forgotten, so a late event or a pending
+   * retry for one starts nothing. Ids only, bounded.
+   */
+  private forgottenGoals = new Set<string>();
 
   /**
    * Answers already judged against a goal's asked assumptions, keyed by goal
@@ -457,6 +562,15 @@ export class ScrumMaster extends Abject {
                 reason: { kind: 'primitive', primitive: 'string' },
               } },
             },
+            {
+              name: 'forgetPrivateGoal',
+              description: 'A private goal has ended and been delivered: drop everything this object holds for it (scrum state, staged and pending tasks, receipts, retries). Taken from GoalManager only.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'The private root goal' },
+                { name: 'taskIds', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Every task of the goal and its children', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
           ],
           events: [
             {
@@ -559,6 +673,13 @@ export class ScrumMaster extends Abject {
     // taskCompleted/taskPermanentlyFailed drive dep tracking.
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value: unknown };
+      // GoalManager marks every event about a private goal `private: true`.
+      // A goal already forgotten starts nothing more here.
+      const aboutGoal = (value as { goalId?: unknown } | undefined)?.goalId;
+      if (typeof aboutGoal === 'string') {
+        if (this.forgottenGoals.has(aboutGoal)) return;
+        this.notePrivacy(aboutGoal, value);
+      }
 
       if (aspect === 'goalCreated') {
         const { goalId, parentId } = value as { goalId: string; parentId?: string };
@@ -659,6 +780,8 @@ export class ScrumMaster extends Abject {
         tupleId?: string; dispatchTupleId?: string; taskId?: string; goalId?: string; description: string;
       };
       const taskId = explicitTaskId ?? tupleId ?? `scrum-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      if (goalId) this.notePrivacy(goalId, msg.payload);
+      this.privateGoals.get(goalId ?? '')?.tickets.add(taskId);
 
       // Pre-populate the in-flight entry with the goalId. We need this so
       // `lookupGoalIdForOTATask` works even from the `taskResult` listener,
@@ -676,6 +799,7 @@ export class ScrumMaster extends Abject {
             task: description,
             goalId,
             dispatchTupleId,
+            ...this.privateFlag(goalId),
             config: {
               maxSteps: 12,
               knowledgeScope: goalId ? await this.knowledgeScopeForGoal(goalId) : undefined,
@@ -717,12 +841,23 @@ export class ScrumMaster extends Abject {
       if (goal?.status !== 'active') return { started: false, reason: 'Goal is not active' };
       if (goal.parentId) return { started: false, reason: 'Sub-goals are planned by their parent goal' };
       const round = goal.currentScrumNumber ?? 0;
-      log.warn(`Goal ${goalId.slice(0, 8)} stalled after round ${round} (${(reason ?? 'nothing left to run').slice(0, 160)}) — starting a review scrum`);
+      log.warn(`Goal ${goalId.slice(0, 8)} stalled after round ${round} (${shown((reason ?? 'nothing left to run').slice(0, 160), this.isPrivateGoal(goalId))}) — starting a review scrum`);
       this.scrummedRounds.delete(`${goalId}#${round}`);
       await this.enqueueScrumTask(goalId, round, 1,
         `Nothing is running or queued for this goal and no task is left to run (${reason ?? 'the watchdog found it idle'}). ` +
         'Review what the earlier rounds produced and what failed, then plan the remaining work, or complete or fail the goal.');
       return { started: this.scrumActiveFor(goalId) };
+    });
+
+    // A private goal ended and its outcome reached its chat: GoalManager has
+    // purged it, and nothing of it stays here either.
+    this.on('forgetPrivateGoal', async (msg: AbjectMessage) => {
+      precondition(await this.isBuiltInCaller(msg.routing.from, ['GoalManager']),
+        'ScrumMaster takes forgetPrivateGoal from GoalManager only');
+      const { goalId, taskIds } = msg.payload as { goalId: string; taskIds?: string[] };
+      requireNonEmpty(goalId, 'goalId');
+      this.forgetPrivateGoal(goalId, Array.isArray(taskIds) ? taskIds : []);
+      return { success: true };
     });
 
     // Agent-callback handlers. AgentAbject's runStateMachine calls these
@@ -756,7 +891,7 @@ export class ScrumMaster extends Abject {
           if (!goal || ['completed', 'failed', 'archived'].includes(goal.status ?? '')) { obsolete = true; return; }
           // A committed receipt is acknowledged even on a paused goal: an
           // executed ask_user is what paused it, and its scrum has finished.
-          const receipt = goal?.scratchpad?.[`learning/commit/${payload.ticketId}`] as { outcome?: string; error?: string } | undefined;
+          const receipt = this.commitReceipt(goalId, goal?.scratchpad, payload.ticketId) as { outcome?: string; error?: string } | undefined;
           if (!receipt && goal.status === 'paused') throw new Error('Goal is paused; defer the scrum result until resumed');
           if (receipt) {
             if (receipt.outcome === 'replanned') {
@@ -765,7 +900,7 @@ export class ScrumMaster extends Abject {
               obsolete = true;
             }
             // A prior receipt write may have failed after updating memory.
-            await this.request(request(this.id, this.goalManagerId, 'recordScrumCommit', { goalId, operationId: payload.ticketId }));
+            await this.recordCommit(goalId, payload.ticketId);
             return;
           }
           if (payload.success !== false || payload.lastAction?.action === 'fail_goal') {
@@ -779,13 +914,13 @@ export class ScrumMaster extends Abject {
               obsolete = true; // Recovery already admitted the replacement.
             }
           }
-          await this.request(request(this.id, this.goalManagerId, 'recordScrumCommit', { goalId, operationId: payload.ticketId, ...(obsolete ? { outcome: 'replanned', error: payload.error } : {}) }));
+          await this.recordCommit(goalId, payload.ticketId, obsolete ? { outcome: 'replanned', error: payload.error } : undefined);
         } else if (!goalId) obsolete = true;
         else throw new Error('GoalManager unavailable; defer the scrum result');
       });
-      this.retainTaskResult(payload);
-
       const pending = this.pendingTickets.get(payload.ticketId);
+      // A private scrum's result is held only until its waiter takes it.
+      if (!(pending && this.isPrivateGoal(this.scrumInFlight.get(payload.ticketId)?.goalId))) this.retainTaskResult(payload);
       if (pending) pending.resolve(payload);
       this.scrumInFlight.delete(payload.ticketId);
       if (obsolete) { this.scrumAttempts.delete(payload.ticketId); return; }
@@ -868,7 +1003,7 @@ export class ScrumMaster extends Abject {
    * the round guard).
    */
   private async enqueueScrumTask(goalId: string, priorScrumNumber: number, attempt = 1, note?: string): Promise<void> {
-    if (!this.agentAbjectId) return;
+    if (!this.agentAbjectId || this.forgottenGoals.has(goalId)) return;
     try { if (await this.isRemoteGoal(goalId)) { log.info(`enqueueScrumTask skipped for remote goal ${goalId.slice(0, 8)} (passive observer mode)`); return; } } catch { /* default to owned */ }
     const roundKey = `${goalId}#${priorScrumNumber}`;
     if (this.scrummedRounds.has(roundKey)) {
@@ -886,9 +1021,10 @@ export class ScrumMaster extends Abject {
 
     const taskId = `scrum-${crypto.randomUUID()}`;
     this.scrumAttempts.set(taskId, { goalId, priorScrumNumber, attempt });
+    this.privateGoals.get(goalId)?.tickets.add(taskId);
     try {
       await this.request<{ taskId: string }>(request(this.id, this.agentAbjectId, 'enqueueTask', {
-        agentId: this.id, taskId, task: taskDesc, goalId,
+        agentId: this.id, taskId, task: taskDesc, goalId, ...this.privateFlag(goalId),
       }));
     } catch (err) {
       this.scrumAttempts.delete(taskId);
@@ -909,11 +1045,14 @@ export class ScrumMaster extends Abject {
     const recoveryKey = `learning/scrum-recovery/${taskId}`;
     const prior = scratchpad[recoveryKey] as { attempt: number } | undefined;
     const attempt = prior?.attempt ?? 1 + Object.keys(scratchpad).filter(k => k.startsWith('learning/scrum-recovery/')).length;
-    await this.request(request(this.id, this.goalManagerId!, 'recordObservation', {
-      goalId, operationId: `scrum-recovery/${taskId}`,
-      observation: { taskId, kind: 'dispatch', verdict: 'contradicted', semanticVerdict: 'contradicted',
-        expect: 'The Scrum decision dispatches the planned work', actual: error, material: true },
-    }));
+    // A private goal keeps no learning record, so no observation of it.
+    if (!this.isPrivateGoal(goalId)) {
+      await this.request(request(this.id, this.goalManagerId!, 'recordObservation', {
+        goalId, operationId: `scrum-recovery/${taskId}`,
+        observation: { taskId, kind: 'dispatch', verdict: 'contradicted', semanticVerdict: 'contradicted',
+          expect: 'The Scrum decision dispatches the planned work', actual: error, material: true },
+      }));
+    }
     await this.request(request(this.id, this.goalManagerId!, 'writeGoalData', {
       goalId, key: recoveryKey, value: { attempt, error, replacementTaskId: `${taskId}:replan` },
     }));
@@ -921,9 +1060,11 @@ export class ScrumMaster extends Abject {
       await this.request(request(this.id, this.goalManagerId!, 'failGoal', { goalId, error: `Scrum dispatch could not recover after ${attempt} planning conflicts: ${error}` }));
       return;
     }
+    this.privateGoals.get(goalId)?.tickets.add(`${taskId}:replan`);
     await this.request(request(this.id, this.agentAbjectId!, 'enqueueTask', {
       agentId: this.id, taskId: `${taskId}:replan`, goalId,
       task: `The previous Scrum decision was not dispatched: ${error}. Review the current goal state and plan again. Preserve work already admitted by the current plan.`,
+      ...this.privateFlag(goalId),
     }));
   }
 
@@ -960,7 +1101,7 @@ export class ScrumMaster extends Abject {
     const timer = this.setTimer(() => {
       this.scrumRetryTimers.delete(timer);
       void (async () => {
-        if (this.scrumActiveFor(info.goalId) || !this.goalManagerId) return;
+        if (this.scrumActiveFor(info.goalId) || !this.goalManagerId || this.forgottenGoals.has(info.goalId)) return;
         const goal = await this.request<{ status?: string } | null>(
           request(this.id, this.goalManagerId, 'getGoal', { goalId: info.goalId }), 10000,
         ).catch(() => null);
@@ -1006,6 +1147,7 @@ export class ScrumMaster extends Abject {
    */
   private async retryScrum(goalId: string, priorScrumNumber: number, attempt: number): Promise<void> {
     if (!this.goalManagerId) return;
+    if (this.forgottenGoals.has(goalId)) { this.scrumRetryGoals.delete(goalId); return; }
     let status: string | undefined;
     try {
       const goal = await this.request<{ status?: string } | null>(
@@ -1122,8 +1264,10 @@ export class ScrumMaster extends Abject {
           `(outstanding tasks are cancelled automatically). If they mean stop, fail_goal with a friendly explanation. ` +
           `If they are ambiguous, ask_user.` + (triage?.hint ? ` ${triage.hint}` : ''),
         goalId,
+        ...this.privateFlag(goalId),
       }),
     );
+    this.privateGoals.get(goalId)?.tickets.add(taskId);
     this.scrumAttempts.set(taskId, {
       goalId,
       priorScrumNumber: goal.currentScrumNumber ?? 0,
@@ -1236,10 +1380,12 @@ export class ScrumMaster extends Abject {
         case 'add_task':
           return await this.actAddTask(taskId, goalId, action);
         case 'save_knowledge':
+          if (this.isPrivateGoal(goalId)) return { success: true, data: { saved: false, note: PRIVATE_KNOWLEDGE_NOTE } };
           return await this.actSaveKnowledge(action);
         case 'lookup_knowledge':
-          return await this.actLookupKnowledge(action, await this.knowledgeScopeForGoal(goalId));
+          return await this.actLookupKnowledge(action, await this.knowledgeScopeForGoal(goalId), this.isPrivateGoal(goalId));
         case 'forget_knowledge':
+          if (this.isPrivateGoal(goalId)) return { success: true, data: { forgotten: false, note: PRIVATE_KNOWLEDGE_NOTE } };
           return await this.actForgetKnowledge(action);
         case 'state_assumptions':
           return await this.actStateAssumptions(taskId, goalId, action);
@@ -1258,12 +1404,12 @@ export class ScrumMaster extends Abject {
           }
           await withKeyedLock(`${this.id}:scrum-commit`, async () => {
             const goal = await this.request<{ scratchpad?: Record<string, unknown> }>(request(this.id, this.goalManagerId!, 'getGoal', { goalId }));
-            if (goal?.scratchpad?.[`learning/commit/${taskId}`]) {
-              await this.request(request(this.id, this.goalManagerId!, 'recordScrumCommit', { goalId, operationId: taskId }));
+            if (this.commitReceipt(goalId, goal?.scratchpad, taskId)) {
+              await this.recordCommit(goalId, taskId);
               return;
             }
             await this.executeTerminalAction(taskId, action);
-            await this.request(request(this.id, this.goalManagerId!, 'recordScrumCommit', { goalId, operationId: taskId }));
+            await this.recordCommit(goalId, taskId);
           });
           return { success: true, data: action.action === 'ask_user'
             ? 'Question put to the person; the goal waits for their answer.'
@@ -1427,7 +1573,7 @@ export class ScrumMaster extends Abject {
       }
     }
 
-    log.info(`ask_user: goal ${goalId.slice(0, 8)}: "${question.slice(0, 80)}"${toAsk.length ? ` (with ${toAsk.length} assumption(s))` : ''}`);
+    log.info(`ask_user: goal ${goalId.slice(0, 8)}: "${shown(question.slice(0, 80), this.isPrivateGoal(goalId))}"${toAsk.length ? ` (with ${toAsk.length} assumption(s))` : ''}`);
     const ok = await this.request<boolean>(
       request(this.id, this.goalManagerId, 'requestClarification', {
         goalId, question, ...(choices ? { choices } : {}),
@@ -1659,7 +1805,7 @@ export class ScrumMaster extends Abject {
       question: asked.question.slice(0, 2000),
       answer: answer.slice(0, 2000),
       assumptions: open.map(a => ({ id: a.id, claim: a.claim, about: a.about })),
-    }, questions, { goalId, onBehalfOf: 'ScrumMaster' });
+    }, questions, { goalId, onBehalfOf: 'ScrumMaster', ...this.privateFlag(goalId) });
     if (!outcome) return;
     for (const a of open) {
       const verdict = choiceOf(outcome, a.id);
@@ -1753,6 +1899,8 @@ export class ScrumMaster extends Abject {
       request(this.id, this.goalManagerId, 'getGoal', { goalId }),
     );
     if (!goal) return { error: 'Goal not found' };
+    this.notePrivacy(goalId, goal);
+    const isPrivate = this.isPrivateGoal(goalId);
 
     const allTasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
       request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId }),
@@ -1770,9 +1918,10 @@ export class ScrumMaster extends Abject {
     // never read "only inside registered projects", so they skipped the poll
     // that would have found the right agent. `poll_team` remains the deep,
     // live capability probe for anything the descriptions leave unclear.
-    const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string; canExecute?: boolean }>>(
+    // A private goal's roster is the built-in agents alone.
+    const team = await this.rosterFor(goalId, await this.request<Array<{ agentId: AbjectId; name: string; description: string; canExecute?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
-    );
+    ));
     const eligible = team.filter(a => a.canExecute !== false && a.name !== 'Chat' && a.name !== 'ScrumMaster');
     const teamRoster = eligible.map(a => ({ name: a.name, description: a.description ?? '' }));
 
@@ -1810,7 +1959,7 @@ export class ScrumMaster extends Abject {
     const evolvingContext = `${goal.description}\n${safeStringify(observations, 6000)}\n${safeStringify(planHistory.slice(-2), 4000)}`;
     const knowledgeScope = await this.knowledgeScopeForGoal(goalId);
     const [recalled, applicablePatterns] = await Promise.all([
-      this.recallKnowledge(goal.description, 5, knowledgeScope),
+      this.recallKnowledge(goal.description, 5, knowledgeScope, goalId),
       this.weavePatterns(evolvingContext, 3, knowledgeScope, planPatternIds(planHistory.at(-1)?.plan), goalId),
     ]);
     const relevantKnowledge = withEvidenceNotes(recalled.filter(e => e.type !== 'pattern'));
@@ -1852,6 +2001,7 @@ export class ScrumMaster extends Abject {
           currentScrumNumber: goal.currentScrumNumber,
           status: goal.status,
         },
+        ...(isPrivate ? { privateGoal: PRIVATE_PLANNING_NOTE } : {}),
         ...(userInterjections.length > 0 ? { userInterjections } : {}),
         // The question this goal was paused to ask. A reply arrives as an
         // ordinary interjection, so this is what makes a short one legible:
@@ -1938,12 +2088,14 @@ export class ScrumMaster extends Abject {
     query: string,
     limit = 5,
     scope?: string,
+    goalId?: string,
   ): Promise<Array<{ id: string; title: string; type: string; tags?: string[]; content: string; evidence?: EntryEvidence | string }>> {
     const kbId = await this.getKnowledgeBaseId();
     if (!kbId) return [];
     try {
+      // A private goal reads knowledge without leaving a trace (no counters, no logged query).
       const entries = await this.request<Array<{ id: string; title: string; type: string; tags?: string[]; content: string; evidence?: EntryEvidence | string }>>(
-        request(this.id, kbId, 'recall', { query, limit, scope }),
+        request(this.id, kbId, 'recall', { query, limit, scope, ...(this.isPrivateGoal(goalId) ? { track: false } : {}) }),
         5000,
       );
       return Array.isArray(entries) ? entries : [];
@@ -1970,11 +2122,12 @@ export class ScrumMaster extends Abject {
     try {
       const woven = await this.request<{ patterns?: Array<{ id: string; title: string; content: string; via?: string; patternRef?: string;
         linkedFrom?: string[]; counterexamples?: Array<{ verdict: string; evidence: string }> }> } | null>(
-        request(this.id, kbId, 'weave', { query, limit, scope, ...(from.length ? { from } : {}) }),
+        request(this.id, kbId, 'weave', { query, limit, scope, ...(from.length ? { from } : {}), ...(this.isPrivateGoal(goalId) ? { track: false } : {}) }),
         5000,
       );
       if (!woven || !Array.isArray(woven.patterns)) return [];
-      if (goalId) this.rememberPatternReceipts(goalId, woven.patterns);
+      // Receipts serve the pattern applications a private goal never records.
+      if (goalId && !this.isPrivateGoal(goalId)) this.rememberPatternReceipts(goalId, woven.patterns);
       return woven.patterns.map(p => ({
         id: p.id,
         title: p.title,
@@ -2042,9 +2195,12 @@ export class ScrumMaster extends Abject {
     const context = this.goalManagerId ? await this.request<unknown>(request(this.id, this.goalManagerId, 'getGoal', { goalId })) : null;
     const question = `Goal ${goalId} and current planning context:\n${safeStringify(context, 12000)}\n\n` + ((action.question as string | undefined) ?? this.defaultPollQuestion());
 
-    const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string; joinsPlanning?: boolean }>>(
+    // A private goal polls built-in agents only, each joining the goal's
+    // crew before its question goes out, and keeps no reply cached.
+    const isPrivate = this.isPrivateGoal(goalId);
+    const team = await this.rosterFor(goalId, await this.request<Array<{ agentId: AbjectId; name: string; description: string; joinsPlanning?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
-    );
+    ));
     const eligible = team.filter(a => a.name !== 'Chat' && a.name !== 'ScrumMaster' && a.joinsPlanning !== false);
     const targets = requestedMembers && requestedMembers.length > 0
       ? eligible.filter(a => requestedMembers.includes(a.name))
@@ -2062,18 +2218,21 @@ export class ScrumMaster extends Abject {
         // agent's capabilities change, so an unchanged description with the
         // same question is the same answer.
         const cacheKey = `${member.agentId}|${member.description ?? ''}|${question}`;
-        const cached = this.pollReplyCache.get(cacheKey);
+        const cached = isPrivate ? undefined : this.pollReplyCache.get(cacheKey);
         if (cached && now - cached.at < ScrumMaster.POLL_CACHE_TTL_MS) {
           return cached.text ? { agentName: member.name, text: cached.text } : null;
         }
         try {
+          if (isPrivate && this.goalManagerId) {
+            await this.request(request(this.id, this.goalManagerId, 'addCrew', { goalId, agentId: member.agentId }), 10000);
+          }
           const response = await this.request<string>(
-            request(this.id, member.agentId, 'ask', { question }),
+            request(this.id, member.agentId, 'ask', { question, ...(isPrivate ? { private: true } : {}) }),
             45000,
           );
           const text = (typeof response === 'string' ? response : String(response)).trim();
           const pass = !text || /^PASS\b/i.test(text);
-          if (!isTemporaryAskResponse(text)) this.pollReplyCache.set(cacheKey, { text: pass ? '' : text, at: now });
+          if (!isPrivate && !isTemporaryAskResponse(text)) this.pollReplyCache.set(cacheKey, { text: pass ? '' : text, at: now });
           if (pass) return null;
           return { agentName: member.name, text };
         } catch (err) {
@@ -2136,12 +2295,16 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     }
 
     // Resolve agent at stage time so the LLM gets immediate feedback on bad names.
-    const team = await this.request<Array<{ agentId: AbjectId; name: string; canExecute?: boolean }>>(
+    const listed = await this.request<Array<{ agentId: AbjectId; name: string; canExecute?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
     );
+    const team = await this.rosterFor(goalId, listed);
     const agent = team.find(a => a.name === assignedAgentName && a.canExecute !== false && a.name !== 'ScrumMaster' && a.name !== 'Chat');
     if (!agent) {
       const validNames = team.filter(a => a.name !== 'ScrumMaster' && a.name !== 'Chat').map(a => a.name).join(', ');
+      if (team !== listed && listed.some(a => a.name === assignedAgentName)) {
+        return { success: false, error: `This goal is private, so it runs only on built-in agents. Assign the task to one of: ${validNames}` };
+      }
       return { success: false, error: `Unknown agent "${assignedAgentName}". Valid: ${validNames}` };
     }
 
@@ -2252,7 +2415,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     inflight.staged.push(candidate);
 
     const targetNote = target ? ` →${target}` : '';
-    log.info(`add_task (staged${check ? ', read-only check' : ''}): "${description.slice(0, 60)}" → ${assignedAgentName}${targetNote} (deps: ${resolvedDeps.length === 0 ? 'none' : resolvedDeps.join(',')}); ${inflight.staged.length} staged total`);
+    log.info(`add_task (staged${check ? ', read-only check' : ''}): "${shown(description.slice(0, 60), this.isPrivateGoal(goalId))}" → ${assignedAgentName}${targetNote} (deps: ${resolvedDeps.length === 0 ? 'none' : resolvedDeps.join(',')}); ${inflight.staged.length} staged total`);
     return {
       success: true,
       data: {
@@ -2300,7 +2463,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       // figure has to match a recorded run.
       const goal = await this.fetchGoalForSynthesis(goalId);
       synthesis = goal && this.llmId
-        ? await this.groundSynthesis(inlineSynthesis, verificationRecordOf(goal.scratchpad ?? {}))
+        ? await this.groundSynthesis(inlineSynthesis, verificationRecordOf(goal.scratchpad ?? {}), goalId)
         : inlineSynthesis;
     } else {
       synthesis = await this.synthesizeCompletionText(goalId, hint).catch((err) => {
@@ -2314,10 +2477,10 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     const assumed = await this.closeAssumptions(goalId).catch(() => '');
     if (assumed) synthesis = `${synthesis}\n\n${assumed}`;
 
-    log.info(`complete_goal: ${goalId.slice(0, 8)} → DONE (${synthesis.slice(0, 80)})`);
+    log.info(`complete_goal: ${goalId.slice(0, 8)} → DONE (${shown(synthesis.slice(0, 80), this.isPrivateGoal(goalId))})`);
     await this.recordCompletionPlan(goalId, synthesis);
     await this.request(request(this.id, this.goalManagerId, 'completeGoal', { goalId, result: synthesis }));
-    this.changed('sprintCompleted', { goalId });
+    if (!this.isPrivateGoal(goalId)) this.changed('sprintCompleted', { goalId });
   }
 
   /**
@@ -2328,7 +2491,8 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
    * ScrumMaster only records, the reviewer decides what it means.
    */
   private async recordCompletionPlan(goalId: string, synthesis: string): Promise<void> {
-    if (!this.goalManagerId) return;
+    // The record feeds the post-goal review, which a private goal never has.
+    if (!this.goalManagerId || this.isPrivateGoal(goalId)) return;
 
     const goal = await this.request<{
       title: string; description: string; scratchpad?: Record<string, unknown>;
@@ -2496,9 +2660,9 @@ ${record.length > 0
 - Output the answer directly — no preamble like "Here is the result:".`;
 
     try {
-      const text = await this.fastComplete(prompt);
+      const text = await this.fastComplete(prompt, goalId);
       if (!text) return hint && hint.length > 0 ? hint : ScrumMaster.SYNTHESIS_FALLBACK;
-      return await this.groundSynthesis(text, record);
+      return await this.groundSynthesis(text, record, goalId);
     } catch (err) {
       log.warn(`synthesizeCompletionText LLM call failed: ${err instanceof Error ? err.message : String(err)}`);
       return hint && hint.length > 0 ? hint : ScrumMaster.SYNTHESIS_FALLBACK;
@@ -2520,7 +2684,7 @@ ${record.length > 0
     ).catch(() => null);
   }
 
-  private async fastComplete(prompt: string): Promise<string> {
+  private async fastComplete(prompt: string, goalId?: string): Promise<string> {
     if (!this.llmId) return '';
     const result = await this.request<{ content: string }>(
       request(this.id, this.llmId, 'complete', {
@@ -2531,6 +2695,8 @@ ${record.length > 0
         // mid-list. Haiku is tight — it won't pad to fill the budget — so
         // raising the cap costs nothing on typical short syntheses.
         options: { tier: 'fast', maxTokens: 16384 },
+        // A private goal's synthesis leaves no text in the LLM ledger.
+        ...this.privateFlag(goalId),
       }),
       120000,
     );
@@ -2546,10 +2712,11 @@ ${record.length > 0
    * used as is: the record sits in the scratchpad for anyone who looks, and
    * this object does not edit a model's prose behind its back.
    */
-  private async groundSynthesis(text: string, record: VerificationRecordEntry[]): Promise<string> {
+  private async groundSynthesis(text: string, record: VerificationRecordEntry[], goalId?: string): Promise<string> {
     const mismatch = findVerificationMismatch(text, record);
     if (!mismatch) return text;
-    log.warn(`synthesis quotes a test figure the verification record does not support (${mismatch}); asking once for a correction`);
+    const isPrivate = this.isPrivateGoal(goalId);
+    log.warn(`synthesis quotes a test figure the verification record does not support (${shown(mismatch, isPrivate)}); asking once for a correction`);
     try {
       const corrected = await this.fastComplete(
         `The final answer below quotes a verification figure that the verification record does not support.\n\n` +
@@ -2557,10 +2724,11 @@ ${record.length > 0
         `Verification record (newest run first):\n${renderVerificationRecord(record)}\n\n` +
         `Rewrite the answer with the figures taken from the newest run in the record. Change nothing else: keep every other sentence, list, and heading as written. Output the corrected answer only.\n\n` +
         `Answer:\n${text}`,
+        goalId,
       );
       if (!corrected) return text;
       const still = findVerificationMismatch(corrected, record);
-      if (still) log.warn(`synthesis still disagrees with the verification record after one correction (${still}); using the corrected draft as returned`);
+      if (still) log.warn(`synthesis still disagrees with the verification record after one correction (${shown(still, isPrivate)}); using the corrected draft as returned`);
       return corrected;
     } catch (err) {
       log.warn(`synthesis correction failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -2578,7 +2746,7 @@ ${record.length > 0
     const reason = (lastAction.reason as string | undefined) ?? 'Sprint declared unreachable';
 
     await this.recordCompletionPlan(goalId, `Failed: ${reason}`);
-    log.info(`fail_goal: ${goalId.slice(0, 8)} → FAILED (${reason.slice(0, 80)})`);
+    log.info(`fail_goal: ${goalId.slice(0, 8)} → FAILED (${shown(reason.slice(0, 80), this.isPrivateGoal(goalId))})`);
     await this.request(
       request(this.id, this.goalManagerId, 'failGoal', { goalId, error: reason }),
     ).catch(() => { /* best effort */ });
@@ -2625,6 +2793,7 @@ ${record.length > 0
   private async actLookupKnowledge(
     action: Record<string, unknown>,
     scope?: string,
+    isPrivate = false,
   ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const kbId = await this.getKnowledgeBaseId();
     if (!kbId) return { success: false, error: 'KnowledgeBase not registered in this workspace' };
@@ -2634,10 +2803,10 @@ ${record.length > 0
     const limit = (action.limit as number | undefined) ?? 5;
     if (!query) return { success: false, error: 'lookup_knowledge requires a query string' };
     const entries = await this.request<Array<{ id: string; title: string; type: string; tags?: string[]; content: string; evidence?: EntryEvidence | string }>>(
-      request(this.id, kbId, 'recall', { query, type, tags, limit, scope }),
+      request(this.id, kbId, 'recall', { query, type, tags, limit, scope, ...(isPrivate ? { track: false } : {}) }),
       5000,
     ).catch(() => []);
-    log.info(`lookup_knowledge: "${query.slice(0, 60)}" → ${entries.length} entries`);
+    log.info(`lookup_knowledge: "${shown(query.slice(0, 60), isPrivate)}" → ${entries.length} entries`);
     return { success: true, data: { entries: withEvidenceNotes(entries) } };
   }
 
@@ -2716,9 +2885,9 @@ ${record.length > 0
       return;
     }
 
-    const team = await this.request<Array<{ agentId: AbjectId; name: string; canExecute?: boolean }>>(
+    const team = await this.rosterFor(goalId, await this.request<Array<{ agentId: AbjectId; name: string; canExecute?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
-    );
+    ));
     const agent = team.find(a => a.name === agentName && a.canExecute !== false && a.name !== 'ScrumMaster' && a.name !== 'Chat');
     if (!agent) {
       log.warn(`quick_dispatch to unknown agent "${agentName}" for goal ${goalId.slice(0, 8)} — falling back to full scrum`);
@@ -2738,7 +2907,7 @@ ${record.length > 0
     this.oneShotGoals.set(goalId, { taskId, agentId: agent.agentId });
     const targetNote = target ? ` →${target}` : '';
     log.info(`quick_dispatch: goal ${goalId.slice(0, 8)} → single task to ${agentName}${targetNote} (no planning scrum)`);
-    this.changed('scrumPlanned', { goalId, scrumNumber, tasksPlanned: 1 });
+    if (!this.isPrivateGoal(goalId)) this.changed('scrumPlanned', { goalId, scrumNumber, tasksPlanned: 1 });
   }
 
   /**
@@ -2768,6 +2937,7 @@ ${record.length > 0
         goalId,
         dispatchTupleId: addResult.taskId,
         data: target ? { target } : undefined,
+        ...this.privateFlag(goalId),
       }),
     );
     return addResult.taskId;
@@ -2849,7 +3019,7 @@ ${record.length > 0
     const outcome = await this.askDecision('scrum.quick-dispatch', {
       goal: { title: goal.title, description: goal.description.slice(0, 3000) },
       ...(snap.data.conversationContext ? { conversation: safeStringify(snap.data.conversationContext, 2000) } : {}),
-    }, questions, { goalId, onBehalfOf: 'ScrumMaster' });
+    }, questions, { goalId, onBehalfOf: 'ScrumMaster', ...this.privateFlag(goalId) });
     const pick = choiceOf(outcome, 'dispatch');
     if (!outcome || !pick) return undefined;
     const agents = Object.entries(pick.probabilities).filter(([k]) => !reserved.has(k)).sort((a, b) => b[1] - a[1]);
@@ -2899,7 +3069,7 @@ ${record.length > 0
       completed,
       verification: renderVerificationRecord(verificationRecordOf(scratchpad)).slice(0, 3000),
       expected: safeStringify((data.recentPlans as Array<{ expectedObservations?: unknown }> | undefined)?.at(-1)?.expectedObservations ?? null, 1000),
-    }, roundOutcomeQuestions(), { goalId, onBehalfOf: 'ScrumMaster' });
+    }, roundOutcomeQuestions(), { goalId, onBehalfOf: 'ScrumMaster', ...this.privateFlag(goalId) });
     const round = choiceOf(outcome, 'round_outcome');
     if (!outcome || !round) return undefined;
     const p = round.probabilities[round.choice] ?? 0;
@@ -2928,7 +3098,7 @@ ${record.length > 0
       request: goal ? `${goal.title}\n${(goal.description ?? '').slice(0, 1500)}` : '',
       text: text.slice(0, 4000),
       receipts: safeStringify(scratchpad[`verification/${taskId}`] ?? null, 1500),
-    }, resultKindQuestions(), { goalId, onBehalfOf: 'ScrumMaster' });
+    }, resultKindQuestions(), { goalId, onBehalfOf: 'ScrumMaster', ...this.privateFlag(goalId) });
     const kind = choiceOf(outcome, 'result_kind');
     if (!outcome || !kind) return shaped;
     const p = kind.probabilities[kind.choice] ?? 0;
@@ -2991,7 +3161,7 @@ ${record.length > 0
       in_flight: inFlight.slice(0, 12),
       agents,
       latest_plan: safeStringify(((goal.scratchpad?.['learning/plans'] as unknown[]) ?? []).at(-1) ?? null, 1000),
-    }, interjectionQuestions(!!goal.pendingQuestion), { goalId, onBehalfOf: 'ScrumMaster' });
+    }, interjectionQuestions(!!goal.pendingQuestion), { goalId, onBehalfOf: 'ScrumMaster', ...this.privateFlag(goalId) });
     const intent = choiceOf(outcome, 'intent');
     if (!outcome || !intent) return undefined;
     const p = intent.probabilities[intent.choice] ?? 0;
@@ -3018,7 +3188,8 @@ ${record.length > 0
    * `redirect` reaction on the goal. Each note is recorded at most once.
    */
   private async recordRedirect(goalId: string, notes: Array<{ note: string; at: number }>): Promise<void> {
-    if (!this.goalManagerId) return;
+    // The person's reactions in a private goal teach nothing.
+    if (!this.goalManagerId || this.isPrivateGoal(goalId)) return;
     const fresh = notes.filter(n => !this.reactedNotes.has(`${goalId}:${n.at}`));
     if (fresh.length === 0) return;
     for (const n of fresh) this.reactedNotes.add(`${goalId}:${n.at}`);
@@ -3047,7 +3218,7 @@ ${record.length > 0
         notFor: 'Rounds that fail differently each time, or that each get further before failing; that is progress.',
         examples: ['Yes: three rounds each "fix the import" and each fail with the same missing-module error.'],
       }) },
-    }, { goalId, onBehalfOf: 'ScrumMaster' });
+    }, { goalId, onBehalfOf: 'ScrumMaster', ...this.privateFlag(goalId) });
     const p = noulOf(outcome, 'repeating_failure');
     if (!outcome || p === undefined) return undefined;
     log.info(`[decision:${outcome.mode}] scrum.loop ${goalId.slice(0, 8)}: repeating_failure=${p.toFixed(2)} after ${rounds} rounds`);
@@ -3084,7 +3255,7 @@ ${record.length > 0
           'Hard diagnosis: repeated or unexplained failures',
         ],
       },
-    }, { goalId, onBehalfOf: 'ScrumMaster' });
+    }, { goalId, onBehalfOf: 'ScrumMaster', ...this.privateFlag(goalId) });
     const difficulty = scoreOf(outcome, 'difficulty');
     if (!outcome || !difficulty) return heuristic;
     const level = topLevel(difficulty);
@@ -3129,11 +3300,11 @@ ${record.length > 0
         ? 'The task\'s result holds the answer but may be written for a coordinator. Reply to the user directly: lead with the answer to their question, keep the data that supports it, and leave out how it was fetched.'
         : undefined);
       if (synthesis !== ScrumMaster.SYNTHESIS_FALLBACK) {
-        log.info(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was ${report ? 'not a direct reply' : `"${text.slice(0, 40)}"`}; synthesized the reply from the goal's data (${synthesis.length} chars)`);
+        log.info(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was ${report ? 'not a direct reply' : `"${shown(text.slice(0, 40), this.isPrivateGoal(goalId))}"`}; synthesized the reply from the goal's data (${synthesis.length} chars)`);
         result = synthesis;
         resultText = synthesis;
       } else if (bareAck) {
-        log.warn(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was "${text.slice(0, 40)}" and synthesis was unavailable`);
+        log.warn(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was "${shown(text.slice(0, 40), this.isPrivateGoal(goalId))}" and synthesis was unavailable`);
         return false;
       }
       // A report still answers the question: without a synthesis it ships as written.
@@ -3218,7 +3389,7 @@ ${record.length > 0
     const problems = validateDataFlow(inflight.staged, existingKeys);
     if (problems.length > 0) {
       const detail = problems.map(p => `- ${p.message}`).join('\n');
-      log.warn(`dispatch_scrum: ${problems.length} data-flow problem(s) in goal ${goalId.slice(0, 8)}:\n${detail}`);
+      log.warn(`dispatch_scrum: ${problems.length} data-flow problem(s) in goal ${goalId.slice(0, 8)}:\n${shown(detail, this.isPrivateGoal(goalId))}`);
       // The round is refused rather than run: the next scrum sees this on the
       // goal and can restage. Failing the goal outright would throw away work
       // over what is usually a typo in a key name.
@@ -3239,7 +3410,10 @@ ${record.length > 0
 
     const goalState = await this.request<{ scratchpad?: Record<string, unknown> }>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
     const plans = (goalState?.scratchpad?.['learning/plans'] as Array<{ revision: number; operationId: string }>) ?? [];
-    const replay = plans.find(p => p.operationId === otaTaskId);
+    // A private goal keeps no plan history at GoalManager; the plans it
+    // dispatched are remembered here instead.
+    const kept = this.privateGoals.get(goalId);
+    const replay = plans.some(p => p.operationId === otaTaskId) || !!kept?.planned.has(otaTaskId);
     // Revision numbers belong to the runtime snapshot, never to model output.
     const expectedRevision = inflight.planRevision ?? 0;
     const currentRevision = plans.at(-1)?.revision ?? 0;
@@ -3254,17 +3428,24 @@ ${record.length > 0
       if (!stopped.safe) throw new Error(`Replacement work awaits reconciliation: ${JSON.stringify(stopped)}`);
     }
 
-    const recorded = await this.request<{ success: boolean; conflict?: boolean; revision?: number; error?: string }>(request(this.id, this.goalManagerId, 'recordPlan', {
-      goalId, operationId: otaTaskId, expectedRevision,
-      plan: { reason: decision.reasoning ?? decision.reason, assumptions: decision.assumptions,
-        patterns: decision.patterns, expectedObservations: decision.expectedObservations,
-        change: decision.change, tasks: inflight.staged },
-    }));
+    let recorded: { success: boolean; conflict?: boolean; revision?: number; error?: string };
+    if (kept) {
+      kept.planned.add(otaTaskId);
+      recorded = { success: true, revision: expectedRevision + 1 };
+    } else {
+      recorded = await this.request<{ success: boolean; conflict?: boolean; revision?: number; error?: string }>(request(this.id, this.goalManagerId, 'recordPlan', {
+        goalId, operationId: otaTaskId, expectedRevision,
+        plan: { reason: decision.reasoning ?? decision.reason, assumptions: decision.assumptions,
+          patterns: decision.patterns, expectedObservations: decision.expectedObservations,
+          change: decision.change, tasks: inflight.staged },
+      }));
+    }
     if (!recorded.success) {
       if (recorded.conflict) throw new ScrumPlanConflict(`Plan changed during planning (observed ${expectedRevision}, current ${recorded.revision}); refresh the Scrum observation and restage the work`);
       throw new Error(recorded.error ?? 'Plan could not be recorded');
     }
-    await this.capturePlanApplications(goalId, recorded.revision ?? expectedRevision + 1, declaredPatterns(decision.patterns), inflight.staged);
+    // Pattern applications are learning records, which a private goal leaves none of.
+    if (!kept) await this.capturePlanApplications(goalId, recorded.revision ?? expectedRevision + 1, declaredPatterns(decision.patterns), inflight.staged);
 
     const { scrumNumber } = await this.request<{ scrumNumber: number }>(
       request(this.id, this.goalManagerId, 'startNextScrum', { goalId, operationId: otaTaskId, preserveTaskIds: decision.keepTaskIds ?? [] }),
@@ -3301,7 +3482,7 @@ ${record.length > 0
         // and a round committed with a hole in it never completes. Undo what
         // landed and plan again with the error in view.
         const why = addResult.error ?? 'unknown';
-        log.warn(`addTask failed for staged task "${s.description.slice(0, 60)}": ${why} — aborting the round`);
+        log.warn(`addTask failed for staged task "${shown(s.description.slice(0, 60), !!kept)}": ${why} — aborting the round`);
         await this.request<{ cancelled: number }>(
           request(this.id, this.goalManagerId, 'cancelOutstandingTasks', { goalId, preserveTaskIds: preserveDuringDispatch }), 15000,
         ).catch(() => ({ cancelled: 0 }));
@@ -3347,6 +3528,7 @@ ${record.length > 0
             dispatchTupleId: taskIds[i],
             priority: weights.get(String(i)) ?? 0,
             data: taskData(staged.target, staged.patterns, staged.maxSteps, staged.check),
+            ...this.privateFlag(goalId),
           }),
         );
       }
@@ -3356,7 +3538,7 @@ ${record.length > 0
       `dispatch_scrum: round ${scrumNumber} of goal ${goalId.slice(0, 8)} → ${taskIds.length} task(s) committed` +
       (inferred > 0 ? `, ${inferred} edge(s) inferred from data contracts` : ''),
     );
-    this.changed('scrumPlanned', { goalId, scrumNumber, tasksPlanned: taskIds.length });
+    if (!kept) this.changed('scrumPlanned', { goalId, scrumNumber, tasksPlanned: taskIds.length });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -3373,7 +3555,11 @@ ${record.length > 0
       const sessionsById = new Map(sessions.map(s => [s.id, s]));
       const agents = await this.request<Array<{ agentId: AbjectId; name: string }>>(request(this.id, this.agentAbjectId, 'listAgents', {}));
       for (const goal of goals) {
+        if (this.forgottenGoals.has(goal.id)) continue;
+        this.notePrivacy(goal.id, goal);
         if (await this.isRemoteGoal(goal.id)) continue;
+        // A private goal's work goes to built-in agents only.
+        const goalAgents = await this.rosterFor(goal.id, agents);
         const tuples = await this.request<Array<{ id: string; fields: Record<string, any> }>>(request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId: goal.id }));
         const byId = new Map(tuples.map(t => [t.id, t]));
         for (const tuple of tuples) {
@@ -3394,8 +3580,8 @@ ${record.length > 0
           }
           if (tuple.fields.status !== 'pending') continue;
           const data = tuple.fields.data ?? {};
-          if (data.planOperationId && !goal.scratchpad?.[`learning/commit/${data.planOperationId}`]) continue;
-          const agent = agents.find(a => a.name === data.assignedAgentName) ?? agents.find(a => a.agentId === tuple.fields.assignedAgentId);
+          if (data.planOperationId && !this.commitReceipt(goal.id, goal.scratchpad, data.planOperationId)) continue;
+          const agent = goalAgents.find(a => a.name === data.assignedAgentName) ?? goalAgents.find(a => a.agentId === tuple.fields.assignedAgentId);
           if (!agent || agent.name === 'ScrumMaster') continue;
           const blockers = (tuple.fields.dependsOn ?? []) as string[];
           if (blockers.some(id => ['failed', 'permanently_failed', 'superseded', 'cancelled'].includes(byId.get(id)?.fields.status))) {
@@ -3407,7 +3593,7 @@ ${record.length > 0
             this.pendingDeps.set(tuple.id, { goalId: goal.id, agentId: agent.agentId, description: tuple.fields.description, blockers: new Set(waiting), priority: data.priority ?? 0, target: data.target, patterns: declaredPatterns(data.patterns), maxSteps: data.maxSteps, ...(data.check === true ? { check: true } : {}) });
             continue;
           }
-          await this.request(request(this.id, this.agentAbjectId, 'enqueueTask', { agentId: agent.agentId, taskId: tuple.id, dispatchTupleId: tuple.id, goalId: goal.id, task: tuple.fields.description, priority: data.priority ?? 0, data: taskData(data.target, declaredPatterns(data.patterns), data.maxSteps, data.check === true) }));
+          await this.request(request(this.id, this.agentAbjectId, 'enqueueTask', { agentId: agent.agentId, taskId: tuple.id, dispatchTupleId: tuple.id, goalId: goal.id, task: tuple.fields.description, priority: data.priority ?? 0, data: taskData(data.target, declaredPatterns(data.patterns), data.maxSteps, data.check === true), ...this.privateFlag(goal.id) }));
           this.recoveredEnqueues.add(tuple.id);
           this.pendingDeps.delete(tuple.id);
         }
@@ -3437,6 +3623,7 @@ ${record.length > 0
           dispatchTupleId: t.taskId,
           priority: t.priority,
           data: taskData(t.target, t.patterns, t.maxSteps, t.check),
+          ...this.privateFlag(t.goalId),
         }),
       ).catch(err => log.warn(`enqueueTask(${t.taskId.slice(0, 8)}) failed: ${err instanceof Error ? err.message : String(err)}`));
     }
@@ -3728,6 +3915,8 @@ Lessons record what WORKED — agent/task mappings, payload shapes, scratchpad c
 - The file-count rule applies only to tasks that were asked to change something; a research or question goal has nothing to report about files.
 - A receipt showing 0 files modified for a task that was asked to change something means the change was already on disk or nothing was changed by this run; the synthesis says which, rather than presenting it as work done now.
 - All action fields go on the TOP LEVEL of the JSON object. Do NOT wrap them in a \`params\`, \`arguments\`, or \`input\` envelope. Correct: \`{ "action": "add_task", "description": "...", "assignedAgentName": "..." }\`. Wrong: \`{ "action": "add_task", "params": { "description": "..." } }\`.
+
+${PRIVATE_REFUSAL_GUIDANCE}
 
 ## Research-first goals: research one round, build the next
 

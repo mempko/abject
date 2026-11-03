@@ -43,6 +43,7 @@ import { WireEncoder, WireDecoder, isWireFrame } from '../src/network/wire-codec
 import { Log } from '../src/core/timed-log.js';
 import { createHash } from 'node:crypto';
 import { GLTF_MAX_BYTES, isGlb } from '../src/ui/gl/gltf.js';
+import { PRIVATE_TITLE } from '../src/core/privacy.js';
 
 const log = new Log('BackendUI');
 const UI_INTERFACE = 'abjects:ui';
@@ -175,7 +176,22 @@ export interface SurfaceState {
   modal?: boolean;
   workspaceId?: string;
   title?: string;
+  /**
+   * A private conversation's window: its pixels go only to the person's own
+   * clients and to `privateOwnerId` (the object whose window it is); its
+   * title reads as PRIVATE_TITLE to everyone else, and synthetic input
+   * reaches it only from the window and its owner.
+   */
+  private?: boolean;
+  privateOwnerId?: AbjectId;
 }
+
+/** What captureDesktop answers while a private window is on the desktop. */
+const PRIVATE_DESKTOP_REFUSAL =
+  'The desktop shows a private window, so it cannot be captured now. captureWindow works for any other window.';
+
+/** What captureScreenshot answers for a private window. */
+const PRIVATE_WINDOW_REFUSAL = 'That window is private, so it cannot be captured.';
 
 export interface InputEvent {
   type: 'mousedown' | 'mouseup' | 'mousemove' | 'mouseenter' | 'mouseleave' | 'keydown' | 'keyup' | 'wheel' | 'paste';
@@ -418,6 +434,18 @@ export class BackendUI extends Abject {
                     name: 'inputMonitor',
                     type: { kind: 'primitive', primitive: 'boolean' },
                     description: 'If true, surface receives a copy of all mouse/wheel events (in surface-local coordinates) before normal hit-test routing. Use with inputPassthrough for cursor-following overlays.',
+                    optional: true,
+                  },
+                  {
+                    name: 'private',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'If true, a private window: captures and listings show it only to the surface and ownerId, and synthetic input reaches it only from the surface and ownerId',
+                    optional: true,
+                  },
+                  {
+                    name: 'ownerId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'With private: the object whose window this is (may capture it)',
                     optional: true,
                   },
                   {
@@ -690,7 +718,7 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'injectInput',
-                description: 'Inject a synthetic input event into a surface (click, keypress, etc.)',
+                description: 'Inject a synthetic input event into a surface (click, keypress, etc.). A private window takes synthetic input only from its own window and owner.',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -768,12 +796,18 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'captureScreenshot',
-                description: 'Capture a screenshot of an object\'s window as base64-encoded PNG',
+                description: 'Capture a screenshot of an object\'s window as base64-encoded PNG. A private window answers { error, private: true } to everyone but the object whose window it is.',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'AbjectId of the object whose window to capture',
+                  },
+                  {
+                    name: 'onBehalfOf',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'From Screenshot only: the object the capture is for',
+                    optional: true,
                   },
                 ],
                 returns: {
@@ -787,8 +821,15 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'captureDesktop',
-                description: 'Capture a screenshot of the entire desktop as base64-encoded PNG',
-                parameters: [],
+                description: 'Capture a screenshot of the entire desktop as base64-encoded PNG. While a private window is on the desktop the capture is refused (empty image and an error).',
+                parameters: [
+                  {
+                    name: 'onBehalfOf',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'From Screenshot only: the object the capture is for',
+                    optional: true,
+                  },
+                ],
                 returns: {
                   kind: 'object',
                   properties: {
@@ -800,8 +841,15 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'listWindows',
-                description: 'List all visible windows with their objectId, title, and position',
-                parameters: [],
+                description: 'List all visible windows with their objectId, title, and position. A private window is listed with a placeholder title and private: true',
+                parameters: [
+                  {
+                    name: 'onBehalfOf',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'From Screenshot only: the object the listing is for',
+                    optional: true,
+                  },
+                ],
                 returns: {
                   kind: 'array',
                   elementType: { kind: 'reference', reference: 'WindowInfo' },
@@ -1015,7 +1063,7 @@ export class BackendUI extends Abject {
 
   private setupHandlers(): void {
     this.on('createSurface', async (msg: AbjectMessage) => {
-      const { rect, zIndex, inputPassthrough, inputMonitor, transparent, closable, chromeless, screenAnchor } = msg.payload as {
+      const { rect, zIndex, inputPassthrough, inputMonitor, transparent, closable, chromeless, screenAnchor, ownerId } = msg.payload as {
         rect: { x: number; y: number; width: number; height: number };
         zIndex?: number;
         inputPassthrough?: boolean;
@@ -1024,11 +1072,16 @@ export class BackendUI extends Abject {
         closable?: boolean;
         chromeless?: boolean;
         screenAnchor?: unknown;
+        ownerId?: AbjectId;
       };
+      // The private flag only takes access away, so any window may set it;
+      // the owner it names can at most capture a window made by the caller.
+      const isPrivate = (msg.payload as { private?: unknown }).private === true;
       contractRequire(screenAnchor === undefined || screenAnchor === null || isScreenAnchor(screenAnchor),
         `createSurface: screenAnchor must be one of ${SCREEN_ANCHORS.map((a) => `"${a}"`).join(', ')} (got ${JSON.stringify(screenAnchor)})`);
       return this.handleCreateSurface(msg.routing.from, rect, zIndex, inputPassthrough, inputMonitor, transparent, closable,
-        { chromeless: chromeless === true, screenAnchor: isScreenAnchor(screenAnchor) ? screenAnchor : undefined });
+        { chromeless: chromeless === true, screenAnchor: isScreenAnchor(screenAnchor) ? screenAnchor : undefined,
+          ...(isPrivate ? { private: true, privateOwnerId: typeof ownerId === 'string' ? ownerId : undefined } : {}) });
     });
 
     this.on('destroySurface', async (msg: AbjectMessage) => {
@@ -1535,6 +1588,7 @@ export class BackendUI extends Abject {
       };
       const state = this.surfaces.get(surfaceId);
       if (!state) return false;
+      this.requireInputAdmitted(msg, state, 'injectInput');
       await this.sendInputEvent(state.objectId, {
         type,
         surfaceId,
@@ -1554,6 +1608,7 @@ export class BackendUI extends Abject {
       };
       const state = this.surfaces.get(surfaceId);
       if (!state) return false;
+      this.requireInputAdmitted(msg, state, 'click');
       const btn = button ?? 0;
       await this.sendInputEvent(state.objectId, { type: 'mousedown', surfaceId, x, y, button: btn });
       await this.sendInputEvent(state.objectId, { type: 'mouseup', surfaceId, x, y, button: btn });
@@ -1564,6 +1619,7 @@ export class BackendUI extends Abject {
       const { surfaceId, text } = msg.payload as { surfaceId: string; text: string };
       const state = this.surfaces.get(surfaceId);
       if (!state) return false;
+      this.requireInputAdmitted(msg, state, 'type');
       for (const char of text) {
         await this.sendInputEvent(state.objectId, {
           type: 'keydown', surfaceId, key: char, code: `Key${char.toUpperCase()}`,
@@ -1582,6 +1638,7 @@ export class BackendUI extends Abject {
       };
       const state = this.surfaces.get(surfaceId);
       if (!state) return false;
+      this.requireInputAdmitted(msg, state, 'keyPress');
       await this.sendInputEvent(state.objectId, {
         type: 'keydown', surfaceId, key, code: code ?? key, modifiers,
       });
@@ -1593,15 +1650,15 @@ export class BackendUI extends Abject {
 
     this.on('captureScreenshot', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: AbjectId };
-      return this.handleCaptureScreenshot(objectId);
+      return this.handleCaptureScreenshot(objectId, await this.requesterOf(msg));
     });
 
-    this.on('captureDesktop', async () => {
-      return this.handleCaptureDesktop();
+    this.on('captureDesktop', async (msg: AbjectMessage) => {
+      return this.handleCaptureDesktop(await this.requesterOf(msg));
     });
 
-    this.on('listWindows', async () => {
-      return this.handleListWindows();
+    this.on('listWindows', async (msg: AbjectMessage) => {
+      return this.handleListWindows(await this.requesterOf(msg));
     });
 
     this.on('listFrontendClients', async () => {
@@ -2507,7 +2564,7 @@ IMPORTANT:
     inputMonitor?: boolean,
     transparent?: boolean,
     closable?: boolean,
-    opts: { chromeless?: boolean; screenAnchor?: ScreenAnchor } = {},
+    opts: { chromeless?: boolean; screenAnchor?: ScreenAnchor; private?: boolean; privateOwnerId?: AbjectId } = {},
   ): string {
     const surfaceId = `surface-${objectId}-${this.surfaceCounter++}`;
     const z = zIndex ?? 0;
@@ -2523,6 +2580,7 @@ IMPORTANT:
       closable: closable ?? true,
       chromeless: opts.chromeless ?? false,
       screenAnchor: opts.screenAnchor,
+      ...(opts.private ? { private: true, privateOwnerId: opts.privateOwnerId } : {}),
       drawLogs: new Map(),
       sceneNodes: new Map(),
       sceneAnims: new Map(),
@@ -3550,14 +3608,19 @@ IMPORTANT:
   }
 
   private async handleCaptureScreenshot(
-    objectId: AbjectId
-  ): Promise<{ imageBase64: string; width: number; height: number } | null> {
+    objectId: AbjectId,
+    requester: AbjectId,
+  ): Promise<{ imageBase64: string; width: number; height: number } | { error: string; private: true } | null> {
     // The topmost non-degenerate surface is the one the user actually sees;
     // insertion order would happily pick a stale or zero-size sibling.
     const objectSurfaces = Array.from(this.surfaces.values())
       .filter(s => s.objectId === objectId && s.rect.width > 0 && s.rect.height > 0)
       .sort((a, b) => b.zIndex - a.zIndex);
     if (objectSurfaces.length === 0) return null;
+    // A private window's pixels go only to the object whose window it is.
+    if (objectSurfaces.some(s => s.private && !this.ownsPrivateSurface(s, requester))) {
+      return { error: PRIVATE_WINDOW_REFUSAL, private: true };
+    }
     if (!this.hasReadyClient) return null;
 
     for (const surface of objectSurfaces) {
@@ -3577,7 +3640,15 @@ IMPORTANT:
     return null;
   }
 
-  private async handleCaptureDesktop(): Promise<{ imageBase64: string; width: number; height: number }> {
+  private async handleCaptureDesktop(requester: AbjectId): Promise<{ imageBase64: string; width: number; height: number; error?: string }> {
+    // The desktop is composited on the client, so a private window cannot be
+    // cut out of the picture here: while one is on the desktop the capture
+    // is refused instead.
+    const onDesktop = (s: SurfaceState) => s.rect.width > 0 && s.rect.height > 0
+      && (!s.workspaceId || !this.activeWorkspaceId || s.workspaceId === this.activeWorkspaceId);
+    if ([...this.surfaces.values()].some(s => s.private && onDesktop(s) && !this.ownsPrivateSurface(s, requester))) {
+      return { imageBase64: '', width: 0, height: 0, error: PRIVATE_DESKTOP_REFUSAL };
+    }
     if (!this.hasReadyClient) {
       return { imageBase64: '', width: 0, height: 0 };
     }
@@ -3591,19 +3662,31 @@ IMPORTANT:
     }
   }
 
-  private handleListWindows(): Array<{
+  private handleListWindows(requester: AbjectId): Array<{
     objectId: AbjectId;
     title: string;
     surfaceId: string;
     rect: { x: number; y: number; width: number; height: number };
+    private?: true;
   }> {
     const windows: Array<{
       objectId: AbjectId;
       title: string;
       surfaceId: string;
       rect: { x: number; y: number; width: number; height: number };
+      private?: true;
     }> = [];
     for (const state of this.surfaces.values()) {
+      if (state.private && !this.ownsPrivateSurface(state, requester)) {
+        windows.push({
+          objectId: state.objectId as AbjectId,
+          title: PRIVATE_TITLE,
+          surfaceId: state.surfaceId,
+          rect: { ...state.rect },
+          private: true,
+        });
+        continue;
+      }
       windows.push({
         objectId: state.objectId as AbjectId,
         title: state.title ?? '',
@@ -3612,6 +3695,40 @@ IMPORTANT:
       });
     }
     return windows;
+  }
+
+  // ── Private windows ─────────────────────────────────────────────────
+
+  /**
+   * Who a capture or listing is for: the caller, or, when built-in
+   * Screenshot asks, the object it asks for (`onBehalfOf`), so the private
+   * checks below see the real requester behind the capability.
+   */
+  private async requesterOf(msg: AbjectMessage): Promise<AbjectId> {
+    const onBehalfOf = (msg.payload as { onBehalfOf?: unknown } | undefined)?.onBehalfOf;
+    if (typeof onBehalfOf === 'string' && onBehalfOf.length > 0
+      && await this.isBuiltInCaller(msg.routing.from, ['Screenshot'])) {
+      return onBehalfOf as AbjectId;
+    }
+    return msg.routing.from;
+  }
+
+  /** Whether `requester` may see a private surface: its window, or the object whose window it is. */
+  private ownsPrivateSurface(state: SurfaceState, requester: AbjectId): boolean {
+    return requester === state.objectId
+      || (state.privateOwnerId !== undefined && requester === state.privateOwnerId);
+  }
+
+  /**
+   * Synthetic input into a private window comes only from its own window
+   * or its owner: no other object, built-in or generated, can type into it
+   * or click its buttons. The person's own input reaches it through the
+   * client as usual. Other surfaces take input from anyone, as before.
+   */
+  private requireInputAdmitted(msg: AbjectMessage, state: SurfaceState, what: string): void {
+    if (!state.private) return;
+    contractRequire(this.ownsPrivateSurface(state, msg.routing.from),
+      `${what}: that window is private; only its owner may send it input`);
   }
 
   // ── Request/reply with frontend ─────────────────────────────────────

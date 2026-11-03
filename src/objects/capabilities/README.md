@@ -118,7 +118,13 @@ instance.
   `undo: 'Label'` are journaled per writer for the session; that writer's
   `undo` / `redo` put the keys back only while they still hold what the step
   left, and the reply's `restored` (`{ key: value | null }`) is what the
-  writer reloads its state from.
+  writer reloads its state from. Keys under `private:` (`src/core/privacy.ts`)
+  are read and written only by built-in ChatManager and Chat; anyone else
+  gets null or false, or a refused write. Private keys are left out of
+  `keys`, `getByPrefix` and others' `clear`, and keep no undo journal or
+  previous copy. NodeStorage zeroes deleted rows (`secure_delete`) and resets
+  the write-ahead log when a private key is deleted, so a deleted private
+  conversation leaves nothing readable on disk.
 - **`filesystem.ts`**: `FileSystem` (`FILESYSTEM_ID`). A per-workspace virtual
   filesystem: `readFile`, `writeFile`, `readFileBytes`, `writeFileBytes`,
   `deleteFile`, `mkdir`, `rmdir`, `remove`, `rename`, `readdir`, `stat`,
@@ -147,7 +153,9 @@ instance.
   `getSyncScope`. Syncing follows the workspace access mode set by
   WorkspaceManager (`setAccessMode`): `local` never syncs, `shared` syncs only
   with the same workspace on its members' peers, `public` also with other
-  public workspaces.
+  public workspaces. `create { private: true }` makes an owner-only
+  namespace: memory only, never synced, persisted or listed, and its changes
+  go to the owner alone (private goals and their task queues).
 - **`file-transfer.ts`**: `FileTransfer` (`FILE_TRANSFER_ID`). Peer-to-peer
   file transfer over PeerRegistry's DataChannels in 64 KB chunks: `sendFile`,
   `acceptTransfer`, `rejectTransfer`, `cancelTransfer`, `getTransferStatus`,
@@ -175,6 +183,9 @@ instance.
 ### Web
 
 - **`web-browser.ts`**: `WebBrowser` (`WEB_BROWSER_ID`). Playwright automation.
+  It never opens this instance's own desktop (`isOwnDesktopUrl` in
+  `src/network/origin-policy.ts`): `navigateTo` refuses it, and every page
+  aborts any request to it, from links, redirects, frames or script.
   One-shot `getRenderedHtml`, `screenshot`, `extractFromPage`; a stateful page
   API (`openPage`, `navigateTo`, `click`, `fill`, `type`, `select`, `hover`,
   `press`, `check`, `waitForSelector`, `getContent`, `getAriaSnapshot`,
@@ -220,7 +231,10 @@ These send to UIServer, which forwards to the connected browser client.
   clipboard; it cannot read the OS clipboard (a real paste reaches a focused
   widget as input).
 - **`screenshot.ts`**: `Screenshot` (`SCREENSHOT_ID`). `captureWindow`,
-  `captureDesktop`, `listWindows`, captured by the client's compositor.
+  `captureDesktop`, `listWindows`, captured by the client's compositor. It
+  forwards the real requester (`onBehalfOf`) so UIServer can refuse private
+  windows: a private window answers `{ error }` to anyone but its owner, and
+  `captureDesktop` is refused while one is on the active desktop.
 - **`audio-output.ts`**: `AudioOutput` (`AUDIO_OUTPUT_ID`). `play` (URL, data
   URI or `abject://` file), `playTone`, `playGraph` (synthesized Web Audio
   voices), `pause`, `resume`, `stop`, `stopAll`, `listPlaybacks`. Re-emits the

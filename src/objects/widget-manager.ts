@@ -41,6 +41,7 @@ import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 import { isUndoable, type UndoAction, type UndoResult } from '../core/undo.js';
+import { PRIVATE_TITLE, shown, isPrivatePayload } from '../core/privacy.js';
 
 const log = new Log('WidgetManager');
 import { ModalDialog } from './modal-dialog.js';
@@ -106,6 +107,12 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
  * the dialog, not a limit on how long the person takes.
  */
 const MODAL_STALL_MS = 10 * 60 * 1000;
+
+/**
+ * The person's built-in views of private conversations: they read a private
+ * window's real title (every other object reads PRIVATE_TITLE).
+ */
+const PRIVATE_WINDOW_VIEWS = ['ChatManager', 'Chat', 'ChatWindow', 'ChatBrowser', 'CliServer', 'CommandPalette'] as const;
 
 /** Canonical `create({specs})` widget types, kept in sync with the dispatch in createWidgetFromSpec. */
 const VALID_WIDGET_TYPES = [
@@ -210,6 +217,8 @@ export class WidgetManager extends Abject {
   private widgetToWindow: Map<AbjectId, AbjectId> = new Map();
   /** Objects a window's owner let change that window (grantWindowAccess). */
   private windowGrants: Map<AbjectId, Set<AbjectId>> = new Map();
+  /** Windows made with `private: true` (a private conversation's). */
+  private privateWindows: Set<AbjectId> = new Set();
 
   // ── Tooltip service state ──
   // One shared tooltip at a time: a tiny chromeless window created after a
@@ -252,6 +261,7 @@ export class WidgetManager extends Abject {
                   { name: 'closable', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If false, the mobile card overview cannot close this window (default true). Keep the default for any window the user opened', optional: true },
                   { name: 'focusOnCreate', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If false, the new window does not take keyboard focus (default true). Use for docks and chrome that rebuild in the background.', optional: true },
                   { name: 'screenAnchor', type: { kind: 'primitive', primitive: 'string' }, description: 'Pin the window to a spot of the SCREEN on a zoomable camera (the phone): "top-left" | "top" | "top-right" | "left" | "center" | "right" | "bottom-left" | "bottom" | "bottom-right". There it stays on screen at a readable scale while the camera pans and zooms (toasts, HUDs, status bars); windows sharing an anchor keep their layout relative to each other. The desktop at zoom 1 shows the window at its rect as usual.', optional: true },
+                  { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, a private window (a private conversation\'s): its title reads as a placeholder to other objects, captures refuse it and synthetic input reaches it only from its owner. The person sees it as usual', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -292,7 +302,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'listWindows',
-                description: 'List every live window: [{ windowId, ownerId, title, rect }]. Use this to find an EXISTING window (match by title or owner) — e.g. to decorate it with 3D scene nodes via this.call(windowId, "scene", { ops }) without owning or rebuilding it.',
+                description: 'List every live window: [{ windowId, ownerId, title, rect }] (a private window carries private: true and a placeholder title). Use this to find an EXISTING window (match by title or owner) — e.g. to decorate it with 3D scene nodes via this.call(windowId, "scene", { ops }) without owning or rebuilding it.',
                 parameters: [],
                 returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
               },
@@ -645,6 +655,7 @@ export class WidgetManager extends Abject {
                 parameters: [
                   { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Window title' },
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: 'Window position and size' },
+                  { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, a private window (see createWindowAbject)', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -781,7 +792,9 @@ export class WidgetManager extends Abject {
         chromeless?: boolean;
         resizable?: boolean;
       };
-      return this.createWindow(msg.routing.from, title, rect, { chromeless, resizable, zIndex });
+      return this.createWindow(msg.routing.from, title, rect, {
+        chromeless, resizable, zIndex, ...(isPrivatePayload(msg.payload) ? { private: true } : {}),
+      });
     });
 
     this.on('destroyWindow', async (msg: AbjectMessage) => {
@@ -808,6 +821,8 @@ export class WidgetManager extends Abject {
       return this.createWindowDirect(msg.routing.from, title, this.normalizeWindowRect(rect), {
         chromeless, transparent, resizable, draggable, zIndex, closable, focusOnCreate,
         screenAnchor: isScreenAnchor(screenAnchor) ? screenAnchor : undefined,
+        // The flag only takes access away, so any creator may set it.
+        ...(isPrivatePayload(msg.payload) ? { private: true } : {}),
       });
     });
 
@@ -823,9 +838,12 @@ export class WidgetManager extends Abject {
     // objects, and objects its owner granted access; windows and widgets ask
     // here about any other sender.
     this.on('admitsToWindow', async (msg: AbjectMessage) => {
-      const { windowId, objectId } = msg.payload as { windowId: AbjectId; objectId: AbjectId };
+      const { windowId, objectId, asDependent } = msg.payload as { windowId: AbjectId; objectId: AbjectId; asDependent?: boolean };
       require(typeof windowId === 'string' && windowId.length > 0, 'admitsToWindow: windowId is required');
       require(typeof objectId === 'string' && objectId.length > 0, 'admitsToWindow: objectId is required');
+      // A private window hears its events only to its owner, its widgets
+      // and objects the owner granted access (the window asks with asDependent).
+      if (asDependent === true && this.privateWindows.has(windowId)) return this.mayWatchPrivateWindow(objectId, windowId);
       return this.mayTouchWindow(objectId, windowId);
     });
 
@@ -860,8 +878,8 @@ export class WidgetManager extends Abject {
 
     // any abject find an existing window (e.g. to decorate it with scene
     // nodes) instead of rebuilding the app behind it.
-    this.on('listWindows', async () => {
-      const out: Array<{ windowId: AbjectId; ownerId: AbjectId; title: string; rect: Rect }> = [];
+    this.on('listWindows', async (msg: AbjectMessage) => {
+      const out: Array<{ windowId: AbjectId; ownerId: AbjectId; title: string; rect: Rect; private?: true }> = [];
       const entries = [...this.windowOwners.entries()];
       await Promise.all(entries.map(async ([windowId, ownerId]) => {
         try {
@@ -869,6 +887,11 @@ export class WidgetManager extends Abject {
             this.request<string>(request(this.id, windowId, 'getTitle', {}), 3000),
             this.request<Rect>(request(this.id, windowId, 'getRect', {}), 3000),
           ]);
+          if (this.privateWindows.has(windowId)) {
+            const real = await this.seesPrivateTitle(msg.routing.from, windowId);
+            out.push({ windowId, ownerId, title: real ? title : PRIVATE_TITLE, rect, private: true });
+            return;
+          }
           out.push({ windowId, ownerId, title, rect });
         } catch {
           // window mid-teardown — skip it
@@ -898,7 +921,9 @@ export class WidgetManager extends Abject {
         if (windowId && win !== windowId) continue;
         if (ownerId && winOwner !== ownerId) continue;
         let title: string | undefined;
-        if (win) {
+        if (win && this.privateWindows.has(win) && !(await this.seesPrivateTitle(msg.routing.from, win))) {
+          title = PRIVATE_TITLE;
+        } else if (win) {
           try { title = await this.request<string>(request(this.id, win, 'getTitle', {}), 3000); } catch { /* mid-teardown */ }
         }
         out.push({ windowId: win, ownerId: winOwner, title, layoutId, overflow: entry.overflow });
@@ -3425,7 +3450,7 @@ async timerFired(msg) {
     owner: AbjectId,
     title: string,
     rect: { x: number; y: number; width: number; height: number },
-    options?: { chromeless?: boolean; resizable?: boolean; zIndex?: number }
+    options?: { chromeless?: boolean; resizable?: boolean; zIndex?: number; private?: boolean }
   ): Promise<string> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
@@ -3441,10 +3466,12 @@ async timerFired(msg) {
       zIndex: options?.zIndex ?? 100,
       theme: ownerTheme,
       focusDecoration: this.focusDecoration,
+      ...(options?.private ? { private: true } : {}),
     });
 
     await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
+    if (options?.private) this.privateWindows.add(win.id);
 
     // Tag the surface with the OWNER's workspace. Objects with no workspace
     // (global objects such as prompts and browsers) stay untagged so the
@@ -3468,7 +3495,7 @@ async timerFired(msg) {
             surfaceId: win.surface, windowId: win.id, zIndex: options?.zIndex ?? 100,
             rect, chromeless: options?.chromeless ?? false,
             draggable: false,
-            title,
+            title: options?.private ? PRIVATE_TITLE : title,
             titleBarHeight: ownerTheme.titleBarHeight,
             titleButtonSize: ownerTheme.titleButtonSize,
             titleButtonMargin: ownerTheme.titleButtonMargin,
@@ -3516,7 +3543,7 @@ async timerFired(msg) {
     owner: AbjectId,
     title: string,
     rect: { x: number; y: number; width: number; height: number },
-    options?: { chromeless?: boolean; transparent?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number; closable?: boolean; focusOnCreate?: boolean; screenAnchor?: ScreenAnchor }
+    options?: { chromeless?: boolean; transparent?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number; closable?: boolean; focusOnCreate?: boolean; screenAnchor?: ScreenAnchor; private?: boolean }
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
@@ -3546,13 +3573,15 @@ async timerFired(msg) {
       zIndex: options?.zIndex ?? 100,
       theme: ownerTheme,
       focusDecoration: this.focusDecoration,
+      ...(options?.private ? { private: true } : {}),
     });
 
     await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
+    if (options?.private) this.privateWindows.add(win.id);
     this.windowOwners.set(win.id, owner);
     if (win.surface) this.windowSurfaces.set(win.id, win.surface);
-    this.log('debug', 'createWindowAbject', { windowId: win.id, title });
+    this.log('debug', 'createWindowAbject', { windowId: win.id, title: shown(title, options?.private) });
 
     // Tag the surface with the OWNER's workspace. Objects with no workspace
     // (global objects such as prompts and browsers) stay untagged so the
@@ -3576,7 +3605,7 @@ async timerFired(msg) {
             surfaceId: win.surface, windowId: win.id, zIndex: options?.zIndex ?? 100,
             rect, chromeless: options?.chromeless ?? false,
             draggable: options?.draggable ?? false,
-            title,
+            title: options?.private ? PRIVATE_TITLE : title,
             titleBarHeight: ownerTheme.titleBarHeight,
             titleButtonSize: ownerTheme.titleButtonSize,
             titleButtonMargin: ownerTheme.titleButtonMargin,
@@ -3590,7 +3619,9 @@ async timerFired(msg) {
     }
 
     // Announce to dependents — decorators watch these to find new hosts.
-    this.changed('windowCreated', { windowId: win.id, ownerId: owner, title, rect: { ...rect } });
+    this.changed('windowCreated', options?.private
+      ? { windowId: win.id, ownerId: owner, title: PRIVATE_TITLE, rect: { ...rect }, private: true }
+      : { windowId: win.id, ownerId: owner, title, rect: { ...rect } });
 
     return win.id;
   }
@@ -3732,6 +3763,7 @@ async timerFired(msg) {
     }
 
     this.spawnedWindows.delete(windowId);
+    this.privateWindows.delete(windowId);
     this.windowSurfaces.delete(windowId);
 
     // Clean up child widget shim entries for this window
@@ -3806,6 +3838,30 @@ async timerFired(msg) {
     if (this.windowGrants.get(windowId)?.has(callerId)) return true;
     if (this.windowOf(callerId) === windowId) return true;
     return this.isBuiltInCaller(callerId);
+  }
+
+  /**
+   * Who may become a dependent of a private window (its events carry keys
+   * and uploaded files): its owner, the window and its widgets, and objects
+   * the owner granted access. Being built-in is not enough here.
+   */
+  private mayWatchPrivateWindow(callerId: AbjectId, windowId: AbjectId): boolean {
+    if (!this.spawnedWindows.has(windowId)) return false;
+    if (callerId === this.id || callerId === windowId) return true;
+    if (this.windowOwners.get(windowId) === callerId) return true;
+    if (this.windowGrants.get(windowId)?.has(callerId)) return true;
+    return this.windowOf(callerId) === windowId;
+  }
+
+  /**
+   * Who reads a private window's real title: its owner, WidgetManager, and
+   * the person's built-in views of private conversations. Everyone else
+   * reads PRIVATE_TITLE.
+   */
+  private async seesPrivateTitle(callerId: AbjectId, windowId: AbjectId): Promise<boolean> {
+    if (callerId === this.id || callerId === windowId) return true;
+    if (this.windowOwners.get(windowId) === callerId) return true;
+    return this.isBuiltInCaller(callerId, PRIVATE_WINDOW_VIEWS);
   }
 
   /** Refuse a change to a window from a caller it does not admit. */

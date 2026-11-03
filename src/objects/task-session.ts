@@ -3,6 +3,7 @@ import { request } from '../core/message.js';
 import type { AbjectId } from '../core/types.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
 import { Log } from '../core/timed-log.js';
+import { isPrivatePayload } from '../core/privacy.js';
 
 const log = new Log('TaskSession');
 
@@ -101,7 +102,14 @@ function trim(rec: SessionRecord): SessionRecord {
   return { ...rest, outbox: rec.outbox.map(o => o.delivered ? { ...o, payload: { stored: true } } : o) };
 }
 
-/** Workspace-owned durable task records. All mutation and recovery is through messages. */
+/** Why a private task's checkpoint or payload is refused: it lives in memory and ends with its goal. */
+const PRIVATE_SESSION_REFUSAL = 'A private task keeps no durable session';
+
+/**
+ * Workspace-owned durable task records. All mutation and recovery is through
+ * messages. A private conversation's tasks are never written here (AgentAbject
+ * does not checkpoint them); a write marked `private: true` is refused.
+ */
 export class TaskSession extends Abject {
   private storageId?: AbjectId;
   private sessions = new Map<string, SessionRecord>();
@@ -113,7 +121,7 @@ export class TaskSession extends Abject {
       id: 'abjects:task-session', name: 'TaskSession', description: 'Task continuity', methods: [
         { name: 'get', description: 'Get a session by id, including revision and unresolved operation', parameters: [{ name: 'id', description: 'Session id', type: { kind: 'primitive', primitive: 'string' } }], returns: { kind: 'object', properties: {} } },
         { name: 'list', description: 'List sessions and their progress', parameters: [], returns: { kind: 'array', elementType: { kind: 'object', properties: {} } } },
-        { name: 'checkpoint', description: 'Runtime checkpoint: id, expectedRevision, agentName, intent, snapshot, outstandingOperation, status. Revision conflict changes nothing.', parameters: [], returns: { kind: 'object', properties: {} } },
+        { name: 'checkpoint', description: 'Runtime checkpoint: id, expectedRevision, agentName, intent, snapshot, outstandingOperation, status. Revision conflict changes nothing. Refused for private: true (private tasks are never stored).', parameters: [], returns: { kind: 'object', properties: {} } },
         { name: 'resume', description: 'Prepare a new attempt by id and expectedRevision. Unknown operation effects must be reconciled first. AgentAbject.resumeTask performs execution.', parameters: [], returns: { kind: 'object', properties: {} } },
         { name: 'fork', description: 'Fork dialogue and evidence using id and newId. Does not undo external changes or inherit accepted completion.', parameters: [], returns: { kind: 'object', properties: {} } },
         { name: 'reconcile', description: 'Record an evidence-backed outcome for an outstanding operation before resuming: id, expectedRevision, evidence, outcome.', parameters: [], returns: { kind: 'object', properties: {} } },
@@ -127,6 +135,7 @@ export class TaskSession extends Abject {
     // Bulk evidence lives with the session owner, not in a specialist's context.
     this.on('retainPayload', async msg => {
       await this.runtimeOnly(msg.routing.from);
+      if (isPrivatePayload(msg.payload)) throw new Error(PRIVATE_SESSION_REFUSAL);
       const { sessionId, payload } = msg.payload as { sessionId: string; payload: { id: string; text: string; kind: string; storedAt: number } };
       if (!sessionId || !payload?.id || typeof payload.text !== 'string') throw new Error('Session and payload required');
       if (!this.storageId) throw new Error('Storage unavailable');
@@ -142,6 +151,7 @@ export class TaskSession extends Abject {
     this.on('list', () => [...this.sessions.values()].map(r => { const { snapshot: _snapshot, ...rest } = expand(r); return structuredClone(rest); }));
     this.on('checkpoint', async msg => {
       await this.runtimeOnly(msg.routing.from);
+      if (isPrivatePayload(msg.payload)) throw new Error(PRIVATE_SESSION_REFUSAL);
       const p = msg.payload as Partial<SessionRecord> & { id: string; expectedRevision?: number };
       return this.mutate(p.id, p.expectedRevision, old => {
         if (!old && (!p.agentName || !p.intent)) throw new Error('New sessions require agentName and intent');

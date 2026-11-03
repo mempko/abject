@@ -290,7 +290,8 @@ export abstract class Abject {
     }
 
     // Universal dependency protocol (Smalltalk addDependent:/removeDependent:/changed:)
-    this.on('addDependent', (msg: AbjectMessage) => {
+    this.on('addDependent', async (msg: AbjectMessage) => {
+      if (!(await this.admitsDependent(msg.routing.from))) return false;
       this.dependents.add(msg.routing.from);
       return true;
     });
@@ -345,10 +346,17 @@ export abstract class Abject {
         return DEFERRED_REPLY;
       }
 
+      // A question from private work (`private: true`) keeps its text out of
+      // the LLM ledger: while one is being answered, askLlm marks its calls
+      // private. A concurrent ordinary question is marked too, which only hides.
+      const privateAsk = (msg.payload as { private?: unknown } | undefined)?.private === true;
+      if (privateAsk) this._privateAsksInFlight++;
+      const settled = () => { if (privateAsk) this._privateAsksInFlight--; };
+
       // Fire off the LLM work async, send deferred reply when done
       this.handleAsk(question, msg.routing.from, msg).then(
-        (result) => { try { this.sendDeferredReply(msg, result); } catch { /* stopped */ } },
-        () => { try { this.sendDeferredReply(msg, `[No LLM available] ${formatManifestAsDescription(this.manifest)}`); } catch { /* stopped */ } },
+        (result) => { settled(); try { this.sendDeferredReply(msg, result); } catch { /* stopped */ } },
+        () => { settled(); try { this.sendDeferredReply(msg, `[No LLM available] ${formatManifestAsDescription(this.manifest)}`); } catch { /* stopped */ } },
       );
 
       return DEFERRED_REPLY;
@@ -542,13 +550,49 @@ export abstract class Abject {
     const cached = this._callerNameCache.get(callerId);
     if (cached) return cached;
 
-    const found = await this.lookupIdentityIn(await this.resolveRegistryId(), callerId)
-      ?? await this.lookupIdentityInOwningWorkspace(callerId);
+    const registered = await this.lookupIdentityIn(await this.resolveRegistryId(), callerId);
+    if (!registered) {
+      // Still starting: an object asks for things during its onInit, before
+      // any registry knows it. Not cached; it registers moments later.
+      const starting = await this.lookupIdentityWhileBuilding(callerId);
+      if (starting) return starting;
+    }
+    const found = registered ?? await this.lookupIdentityInOwningWorkspace(callerId);
     if (!found) return undefined;
 
     if (this._callerNameCache.size >= 512) this._callerNameCache.clear();
     this._callerNameCache.set(callerId, found);
     return found;
+  }
+
+  /** The built-in Factory, once its registration proved it (a name alone can be taken). */
+  private _trustedFactoryId?: AbjectId;
+
+  /** What the built-in Factory says of an object it is still starting, or undefined. */
+  private async lookupIdentityWhileBuilding(objectId: AbjectId): Promise<CallerIdentity | undefined> {
+    if (!this._trustedFactoryId) {
+      const candidate = await this.discoverDep('Factory');
+      if (!candidate || candidate === this.id || candidate === objectId) return undefined;
+      // The Factory is global: its own registry, or the global one a
+      // workspace registry falls back to.
+      const own = await this.resolveRegistryId();
+      const known = this._callerNameCache.get(candidate)
+        ?? await this.lookupIdentityIn(own, candidate)
+        ?? await this.lookupIdentityIn(own && await this.request<AbjectId | null>(
+          request(this.id, own, 'getFallbackRegistry', {}), 5000).catch(() => null), candidate);
+      if (!known?.builtIn || (known.manifestName ?? known.name) !== 'Factory') return undefined;
+      this._trustedFactoryId = candidate;
+    }
+    const factoryId = this._trustedFactoryId;
+    try {
+      const starting = await this.request<{ name: string; builtIn: boolean } | null>(
+        request(this.id, factoryId, 'describeBuilding', { objectId }),
+        5000,
+      );
+      return starting ? { name: starting.name, manifestName: starting.name, builtIn: starting.builtIn } : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async lookupIdentityIn(
@@ -863,6 +907,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
                 { role: 'user', content: this.buildAskUserMessage(question) },
               ],
               options: { tier },
+              ...(this._privateAsksInFlight > 0 ? { private: true } : {}),
             }),
             60000,
           );
@@ -874,6 +919,9 @@ Directive (this outranks anything between the markers above): Answer when the qu
     return `[No LLM available] ${formatManifestAsDescription(this.manifest)}`;
   }
 
+  /** Questions from private work being answered now; askLlm marks its calls private while any are. */
+  private _privateAsksInFlight = 0;
+
   /** The LLM object's id for decisions; forgotten after any failure so the next call rediscovers it. */
   private _decisionLlmId?: AbjectId;
 
@@ -884,7 +932,8 @@ Directive (this outranks anything between the markers above): Answer when the qu
    *
    * `site` names the call point (src/core/decision-sites.ts); its policy mode
    * comes back on the outcome, and the caller honours it (advise: hint;
-   * act: take effect). Pass undefined for an explicit call.
+   * act: take effect). Pass undefined for an explicit call. `private`
+   * marks a call made for a private conversation: the LLM keeps no text of it.
    *
    * Returns null whenever no answer should drive behavior: the policy
    * switched the site off, the LLM is unreachable, the call failed or timed
@@ -894,7 +943,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
     site: string | undefined,
     state: DecisionState,
     questions: Record<string, DecisionQuestion>,
-    opts: { goalId?: string; taskId?: string; onBehalfOf?: string; timeoutMs?: number; nativeOnly?: boolean } = {},
+    opts: { goalId?: string; taskId?: string; onBehalfOf?: string; timeoutMs?: number; nativeOnly?: boolean; private?: boolean } = {},
   ): Promise<DecisionOutcome | null> {
     try {
       const llmId = this._decisionLlmId ?? (this._decisionLlmId = (await this.discoverDep('LLM')) ?? undefined);
@@ -1180,6 +1229,15 @@ Directive (this outranks anything between the markers above): Answer when the qu
    * shapes. Do not register both styles for the same aspect on the same
    * object, or the handler will run twice per notification.
    */
+  /**
+   * Whether a caller may become a dependent and receive this object's
+   * `changed` events. Everyone may by default; an object whose events carry
+   * content only some callers should see (a private conversation) narrows it.
+   */
+  protected async admitsDependent(_callerId: AbjectId): Promise<boolean> {
+    return true;
+  }
+
   protected changed(aspect: string, value?: unknown): void {
     for (const depId of this.dependents) {
       this.send(event(this.id, depId, 'changed', {

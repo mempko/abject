@@ -47,6 +47,7 @@ import { choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
 import { askScopeQuestions, criterion, instruction } from '../core/decision-questions.js';
 import { runtimeFault } from '../core/runtime-fault.js';
 import { plannedStepBudget } from '../core/step-budget.js';
+import { isPrivatePayload, shown } from '../core/privacy.js';
 
 const log = new Log('ExternalCreator');
 
@@ -280,6 +281,12 @@ interface TaskExtra {
   projectNote?: string;
   /** The runtime ran verification itself once for this task (external.auto-verify). */
   autoVerified?: boolean;
+  /**
+   * Work for a private conversation (executeTask `private: true`, or the
+   * runtime's startTask reply). Its decisions carry `private: true`, its
+   * audit lines and logs show PRIVATE_TEXT, and a worktree is named by task id.
+   */
+  private?: boolean;
 }
 
 export class ExternalCreator extends Abject {
@@ -318,6 +325,7 @@ export class ExternalCreator extends Abject {
               parameters: [
                 { name: 'task', type: { kind: 'primitive', primitive: 'string' }, description: 'What to do' },
                 { name: 'project', type: { kind: 'primitive', primitive: 'string' }, description: 'Project handle or a path inside it', optional: true },
+                { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Work for a private conversation: nothing of it is learned or logged', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 success: { kind: 'primitive', primitive: 'boolean' },
@@ -409,9 +417,10 @@ clean result I did not observe.`;
    * path that sounds like a directory, which is how loose files in a download
    * folder ended up dispatched here.
    */
-  protected override async handleAsk(question: string, _callerId?: AbjectId): Promise<string> {
+  protected override async handleAsk(question: string, _callerId?: AbjectId, msg?: AbjectMessage): Promise<string> {
     const availability = await this.askAvailabilityContext();
-    const scope = await this.askScopeJudgment(question, availability);
+    // A question from private work (`private: true` on the ask) keeps its scope judgment private.
+    const scope = await this.askScopeJudgment(question, availability, isPrivatePayload(msg?.payload));
     if (scope.pass) return scope.pass;
     return this.askLlm(this.askPrompt(question) + availability + (scope.hint ?? ''), question, this.askTier());
   }
@@ -422,12 +431,12 @@ clean result I did not observe.`;
    * without the answering call; advising, the answering model sees the
    * judgment as a hint. Null or unsure leaves the answer to the model.
    */
-  private async askScopeJudgment(question: string, availability: string): Promise<{ pass?: string; hint?: string }> {
+  private async askScopeJudgment(question: string, availability: string, isPrivate = false): Promise<{ pass?: string; hint?: string }> {
     if (await this.decisionSiteMode('agent.ask-scope') === 'off') return {};
     const outcome = await this.askDecision('agent.ask-scope', {
       agent: { name: this.manifest.name, description: `${AGENT_DESCRIPTION}${availability}` },
       question: clip(question, 3000),
-    }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 15_000 });
+    }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 15_000, ...(isPrivate ? { private: true } : {}) });
     const p = noulOf(outcome, 'in_scope');
     if (!outcome || p === undefined) return {};
     const pass = outcome.mode === 'act' && p < 0.1;
@@ -636,7 +645,7 @@ clean result I did not observe.`;
         }),
         criteria,
       },
-    }, { goalId: extra?.goalId, taskId: extra?.taskId, onBehalfOf: this.manifest.name, timeoutMs: 30_000 });
+    }, { goalId: extra?.goalId, taskId: extra?.taskId, onBehalfOf: this.manifest.name, timeoutMs: 30_000, ...(extra?.private ? { private: true } : {}) });
     const pick = choiceOf(outcome, 'project');
     if (!outcome || !pick) return undefined;
     const p = pick.probabilities[pick.choice] ?? 0;
@@ -795,7 +804,7 @@ clean result I did not observe.`;
     extra.audit.push(`${new Date().toISOString()} ${line}`);
     // The audit trail is for the report and the object log, never for the
     // conversation: it is exactly the kind of bulk that crowds out reasoning.
-    this.logInfo(`[${extra.taskId.slice(0, 8)}] ${line}`);
+    this.logInfo(`[${extra.taskId.slice(0, 8)}] ${shown(line, extra.private)}`);
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -960,7 +969,7 @@ clean result I did not observe.`;
       outcome.failureCount = ExternalCreator.failureCountOf(text);
       outcome.testSummary ??= ExternalCreator.testSummaryOf(ExternalCreator.stripAnsi(text));
     } catch (err) {
-      log.info(`Full output of "${outcome.command}" could not be read back for its failure count: ${err instanceof Error ? err.message : String(err)}`);
+      log.info(`Full output of "${shown(outcome.command, this.taskExtras.get(outcome.taskId ?? '')?.private)}" could not be read back for its failure count: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -1147,15 +1156,15 @@ clean result I did not observe.`;
     const pick = choiceOf(outcome, 'attribution');
     if (!outcome || !pick) return;
     const p = pick.probabilities[pick.choice] ?? 0;
-    log.info(`[decision:${outcome.mode}] ExternalCreator external.attribution: ${pick.choice}@${p.toFixed(2)} for \`${verdict.outcome.command.slice(0, 80)}\``);
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.attribution: ${pick.choice}@${p.toFixed(2)} for \`${shown(verdict.outcome.command.slice(0, 80), extra.private)}\``);
     const advice = ExternalCreator.ATTRIBUTION_ADVICE[pick.choice];
     if (!advice || p < 0.5) return;
     verdict.advisory = `Advisory (runtime judgment, p=${p.toFixed(2)}; not part of the verdict): these failures look ${advice}`;
     this.audit(extra, `attribution advisory: ${pick.choice}@${p.toFixed(2)}`);
   }
 
-  private decisionScope(extra: TaskExtra): { goalId?: string; taskId: string; onBehalfOf: string } {
-    return { goalId: extra.goalId, taskId: extra.taskId, onBehalfOf: this.manifest.name };
+  private decisionScope(extra: TaskExtra): { goalId?: string; taskId: string; onBehalfOf: string; private?: boolean } {
+    return { goalId: extra.goalId, taskId: extra.taskId, onBehalfOf: this.manifest.name, ...(extra.private ? { private: true } : {}) };
   }
 
   // ─── Baseline ───────────────────────────────────────────────────
@@ -1280,7 +1289,8 @@ clean result I did not observe.`;
       return;
     }
 
-    const slug = ExternalCreator.slug(extra.goalId ?? extra.taskText);
+    // A private task's words stay off the disk: its branch is named by its id.
+    const slug = ExternalCreator.slug(extra.goalId ?? (extra.private ? extra.taskId : extra.taskText));
     const branch = `abjects/${slug}`;
     const dir = path.join(path.dirname(project.root), '.abjects-worktrees', `${project.name}-${slug}`);
 
@@ -1658,7 +1668,7 @@ clean result I did not observe.`;
     if (!outcome || !pick) return { rollback: true };
     const unparseable = pick.probabilities.unparseable ?? 1;
     const parses = unparseable < 0.5;
-    log.info(`[decision:${outcome.mode}] ExternalCreator external.syntax: ${rel} ${pick.choice}@${(pick.probabilities[pick.choice] ?? 0).toFixed(2)}${parses ? (outcome.mode === 'act' ? ' -> edit kept' : ' -> rollback stands, noted') : ' -> rollback'}`);
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.syntax: ${shown(rel, extra.private)} ${pick.choice}@${(pick.probabilities[pick.choice] ?? 0).toFixed(2)}${parses ? (outcome.mode === 'act' ? ' -> edit kept' : ' -> rollback stands, noted') : ' -> rollback'}`);
     if (!parses) return { rollback: true };
     if (outcome.mode === 'act') {
       this.audit(extra, `syntax-looking failure in ${rel} judged parseable (unparseable p=${unparseable.toFixed(2)}); edit kept`);
@@ -2324,7 +2334,7 @@ clean result I did not observe.`;
     // Held at advise, the site has nothing to add: the refusal already tells
     // the agent to run the command.
     const run = outcome.mode === 'act' && runP > 0.5;
-    log.info(`[decision:${outcome.mode}] ExternalCreator external.auto-verify: ${pick.choice}@${(pick.probabilities[pick.choice] ?? 0).toFixed(2)} -> ${run ? `running \`${command}\`` : 'left to the agent'}`);
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.auto-verify: ${pick.choice}@${(pick.probabilities[pick.choice] ?? 0).toFixed(2)} -> ${run ? `running \`${shown(command, extra.private)}\`` : 'left to the agent'}`);
     if (!run) return undefined;
 
     extra.autoVerified = true;
@@ -2542,7 +2552,8 @@ clean result I did not observe.`;
         };
 
       const taskId = explicitTaskId ?? tupleId ?? `ext-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      return this.operationTask.run(taskId, () => this.runLoop({ taskId, taskText: description, goalId, data, tupleId, approach, failureHistory }));
+      return this.operationTask.run(taskId, () => this.runLoop({ taskId, taskText: description, goalId, data, tupleId, approach, failureHistory,
+        ...(isPrivatePayload(msg.payload) ? { private: true } : {}) }));
     });
 
     this.onTaskMessage('runTask', async (msg: AbjectMessage) => {
@@ -2550,6 +2561,7 @@ clean result I did not observe.`;
       const taskId = `ext-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       return this.operationTask.run(taskId, () => this.runLoop({
         taskId, taskText: task, data: project ? { project } : undefined,
+        ...(isPrivatePayload(msg.payload) ? { private: true } : {}),
       }));
     });
 
@@ -2678,8 +2690,10 @@ clean result I did not observe.`;
     tupleId?: string;
     approach?: string;
     failureHistory?: Array<{ agent: string; error: string }>;
+    private?: boolean;
   }): Promise<{ success: boolean; result?: unknown; error?: string }> {
     const extra: TaskExtra = {
+      ...(args.private ? { private: true } : {}),
       taskId: args.taskId,
       taskText: args.taskText,
       goalId: args.goalId,
@@ -2716,7 +2730,7 @@ clean result I did not observe.`;
           const why = err instanceof Error ? err.message : String(err);
           const { name, root } = extra.project;
           this.audit(extra, `project ${name} at ${root} could not be prepared (${why.slice(0, 200)}); starting without a project`);
-          log.warn(`task ${args.taskId}: project ${name} could not be prepared: ${why}`);
+          log.warn(`task ${args.taskId}: project ${name} could not be prepared: ${shown(why, extra.private)}`);
           try { await this.teardownIsolation(extra); } catch { /* best effort */ }
           projectSetupNote =
             `The project "${name}" at ${root} could not be prepared: ${why}\n` +
@@ -2750,8 +2764,9 @@ clean result I did not observe.`;
       // in the system prompt, ahead of the cache breakpoint, and is read once
       // per project per cache window rather than once per task.
       const projectBlock = await this.buildProjectBlock(extra);
-      const { ticketId } = await this.request<{ ticketId: string }>(
+      const started = await this.request<{ ticketId: string; private?: boolean }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
+          ...(extra.private ? { private: true } : {}),
           taskId: args.taskId,
           task: args.taskText,
           systemPrompt: projectBlock ? `${this.buildSystemPrompt()}\n\n${projectBlock}` : this.buildSystemPrompt(),
@@ -2767,6 +2782,9 @@ clean result I did not observe.`;
         }),
       );
 
+      const ticketId = started.ticketId;
+      // The runtime may find the task private (asked from private work) where this agent was not told.
+      if (started.private) extra.private = true;
       const loop = await this.waitForTaskResult(ticketId, 900_000);
       return await this.finalize(extra, loop);
     } catch (err) {
@@ -2829,7 +2847,7 @@ clean result I did not observe.`;
     }
 
     if (!gate.ok) {
-      log.info(`[${extra.taskId.slice(0, 8)}] gate refused a done claim: ${gate.reason}`);
+      log.info(`[${extra.taskId.slice(0, 8)}] gate refused a done claim: ${shown(gate.reason, extra.private)}`);
       // On a dispatched task the runtime has already marked the tuple done by
       // the time this runs — it finishes a task the instant it parses a
       // terminal action. So the downgraded result is not the only place this

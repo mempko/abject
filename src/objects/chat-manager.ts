@@ -13,6 +13,13 @@
  * active-goal marker are kept on disk for the session and three days, and
  * its cards folder is set aside by AbjectStore. `undo` (from whoever deleted
  * it) puts all of it back; the Chat itself respawns when next opened.
+ *
+ * A conversation made private when it is created (`private: true`) keeps its
+ * roster row, transcript and goal marker under `private:` Storage keys, which
+ * only ChatManager and Chat may read. It is listed and readable only for the
+ * person's own views of it (CONVERSATION_VIEWS); everyone else reads it as
+ * absent, and roster events show PRIVATE_TITLE for it. A deleted private
+ * conversation is kept in memory only, for undo until restart.
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -22,8 +29,12 @@ import { request, event } from '../core/message.js';
 import { captureConversation, forkConversationEntries, type ContextMessage } from '../core/conversation-context.js';
 import { describeMessages, protocolText } from '../core/protocol-description.js';
 import { Log } from '../core/timed-log.js';
-import { invariant, require as precondition } from '../core/contracts.js';
+import { ensure, invariant, require as precondition } from '../core/contracts.js';
 import { UndoHistories, UndoRefused, UNDO_EVENTS, undoMethods, type UndoAction, type UndoHistoryJSON, type UndoState, type UndoStep } from '../core/undo.js';
+import {
+  PRIVATE_KEY_PREFIX, PRIVATE_TITLE, PRIVATE_CONVERSATION_UNAVAILABLE, PRIVATE_OUTCOME_ACK_MS,
+  privateHistoryKey, isPrivatePayload, type PrivateGoalOutcome,
+} from '../core/privacy.js';
 
 const log = new Log('ChatManager');
 
@@ -40,6 +51,16 @@ const TRASH_INDEX_KEY = 'chats:trash-index';
 const trashKey = (id: string) => `chats:trash:${id}`;
 /** Each caller's deletions, kept on disk with the trash they point into. */
 const UNDO_KEY = 'chats:undo';
+/** Private conversations' roster rows, readable only by ChatManager and Chat. */
+const PRIVATE_ROSTER_KEY = `${PRIVATE_KEY_PREFIX}chats:roster`;
+const privateActiveGoalKey = (conversationId: string) => `${PRIVATE_KEY_PREFIX}chats:activegoal:${conversationId}`;
+/** Where a private conversation's attachments are kept (Chat writes them). */
+const privateUploadPrefix = (conversationId: string) => `${PRIVATE_KEY_PREFIX}chats:upload:${conversationId}:`;
+/**
+ * The person's own views of the roster (built-in only): they list private
+ * conversations and read them. Everyone else reads a private one as absent.
+ */
+const CONVERSATION_VIEWS = ['ChatBrowser', 'CliServer', 'ChatWindow', 'Chat', 'CommandPalette'] as const;
 
 interface Rect { x: number; y: number; width: number; height: number }
 
@@ -50,6 +71,8 @@ export interface PersistedConversation {
   rect?: Rect;
   createdAt: number;
   lastActiveAt: number;
+  /** Made private when created: listed only for views, stored under `private:` keys. */
+  private?: boolean;
 }
 
 interface ConversationRuntime extends PersistedConversation {
@@ -63,6 +86,8 @@ interface ChatTrashItem {
   title: string;
   removedAt: number;
   bytes: number;
+  /** A private conversation's: kept in memory only, never in the trash index on disk. */
+  private?: boolean;
 }
 
 /** What a deleted conversation leaves behind, kept whole for undo. */
@@ -72,6 +97,8 @@ interface ChatTrashRecord {
   activeGoal?: string;
   /** AbjectStore trash ids of its cards, set aside with the folder. */
   cards?: string[];
+  /** A private conversation's attachments, by Storage key. */
+  uploads?: Record<string, unknown>;
 }
 
 /**
@@ -106,6 +133,12 @@ export class ChatManager extends Abject {
 
   /** Deleted conversations kept for undo, by trash id. */
   private trash: Map<string, ChatTrashItem> = new Map();
+  /** Deleted private conversations' records, by trash id: memory only, gone at restart. */
+  private privateTrash: Map<string, ChatTrashRecord> = new Map();
+  /** Whether PRIVATE_ROSTER_KEY holds rows, so emptying it is written too. */
+  private privateRosterSaved = false;
+  /** Whether PRIVATE_ROSTER_KEY was read; until then it is never written, so a failed read cannot erase it. */
+  private privateRosterLoaded = false;
   /** Each caller's undoable roster changes (by its durable typeId). */
   private undo = new UndoHistories<ChatStep>({ mergeMs: 0, maxSteps: 50 });
   private undoPersistTimer?: ReturnType<typeof setTimeout>;
@@ -139,7 +172,7 @@ export class ChatManager extends Abject {
             },
             {
               name: 'listConversations',
-              description: 'Return the current conversation roster, sorted by lastActiveAt descending.',
+              description: 'Return the current conversation roster, sorted by lastActiveAt descending. Private conversations are listed (with private: true) only for the person\'s own views.',
               parameters: [],
               returns: { kind: 'array', elementType: { kind: 'reference', reference: 'PersistedConversation' } },
             },
@@ -149,6 +182,7 @@ export class ChatManager extends Abject {
               parameters: [
                 { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Optional starting title', optional: true },
                 { name: 'show', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Open its window (default true; ignored without a display)', optional: true },
+                { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Make it private: nothing in it is learned, its goals are deleted when they finish, and only the person\'s own views can read it', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 conversationId: { kind: 'primitive', primitive: 'string' },
@@ -162,6 +196,7 @@ export class ChatManager extends Abject {
                 { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'The conversation to copy from' },
                 { name: 'throughMessageId', type: { kind: 'primitive', primitive: 'string' }, description: 'The message the fork ends at (included)' },
                 { name: 'show', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Open the new conversation window (default true; ignored without a display)', optional: true },
+                { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Make the copy private (a fork of a private conversation is always private)', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 conversationId: { kind: 'primitive', primitive: 'string' },
@@ -230,12 +265,23 @@ export class ChatManager extends Abject {
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
             ...undoMethods('your last deletion or rename of a conversation'),
+            {
+              name: 'deliverPrivateOutcome',
+              description: 'GoalManager only: hand a private goal\'s outcome to the private conversation that started it, starting its Chat if it is dormant. Returns whether the Chat took it.',
+              parameters: [
+                { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'The private conversation' },
+                { name: 'outcome', type: { kind: 'reference', reference: 'PrivateGoalOutcome' }, description: 'How the goal ended' },
+              ],
+              returns: { kind: 'object', properties: {
+                accepted: { kind: 'primitive', primitive: 'boolean' },
+              } },
+            },
           ],
           events: [
             ...UNDO_EVENTS,
             {
               name: 'conversationCreated',
-              description: 'Fires when a new conversation is added to the roster.',
+              description: 'Fires when a new conversation is added to the roster. A private one carries private: true and a placeholder title.',
               payload: { kind: 'object', properties: {
                 conversationId: { kind: 'primitive', primitive: 'string' },
                 title: { kind: 'primitive', primitive: 'string' },
@@ -259,7 +305,7 @@ export class ChatManager extends Abject {
             },
             {
               name: 'conversationRenamed',
-              description: 'Fires when a conversation title changes.',
+              description: 'Fires when a conversation title changes. A private one carries private: true and a placeholder title.',
               payload: { kind: 'object', properties: {
                 conversationId: { kind: 'primitive', primitive: 'string' },
                 title: { kind: 'primitive', primitive: 'string' },
@@ -307,6 +353,9 @@ export class ChatManager extends Abject {
     for (const t of this.trash.values()) {
       invariant(!this.conversations.has(t.conversationId), 'ChatManager: a conversation both on the roster and in the trash');
     }
+    for (const id of this.privateTrash.keys()) {
+      invariant(this.trash.get(id)?.private === true, 'ChatManager: a private trash record without its private trash entry');
+    }
   }
 
   protected override async onStop(): Promise<void> {
@@ -324,19 +373,23 @@ export class ChatManager extends Abject {
     describeMessages(this.manifest, [{ name: 'getConversationContext', description: 'Read a saved conversation through a specific message, including source goal references. Does not open its window.', parameters: { conversationId: protocolText, throughMessageId: protocolText } }]);
     this.on('getConversationContext', async msg => {
       const { conversationId, throughMessageId } = msg.payload as { conversationId: string; throughMessageId: string };
-      if (!this.storageId || !this.conversations.has(conversationId)) throw new Error('Conversation unavailable');
+      const c = await this.visibleConversation(conversationId, msg.routing.from);
+      if (!this.storageId || !c) throw new Error(PRIVATE_CONVERSATION_UNAVAILABLE);
       if (!throughMessageId) throw new Error('A conversation boundary is required');
-      const entries = await this.request<ContextMessage[] | null>(request(this.id, this.storageId, 'get', { key: `chats:history:${conversationId}` }));
+      const entries = await this.request<ContextMessage[] | null>(request(this.id, this.storageId, 'get', { key: this.historyKeyOf(c) }));
       if (!Array.isArray(entries)) throw new Error('Conversation history unavailable');
       return captureConversation(conversationId, entries, throughMessageId);
     });
-    this.on('getState', async () => ({
-      conversationCount: this.conversations.size,
-      latestConversationId: this.latestConversation()?.conversationId ?? '',
-    }));
+    this.on('getState', async (msg: AbjectMessage) => {
+      const roster = await this.rosterFor(msg.routing.from);
+      return {
+        conversationCount: roster.length,
+        latestConversationId: this.latestConversation(roster)?.conversationId ?? '',
+      };
+    });
 
-    this.on('listConversations', async () => {
-      return Array.from(this.conversations.values())
+    this.on('listConversations', async (msg: AbjectMessage) => {
+      return (await this.rosterFor(msg.routing.from))
         .sort((a, b) => b.lastActiveAt - a.lastActiveAt)
         .map(c => ({
           conversationId: c.conversationId,
@@ -348,26 +401,31 @@ export class ChatManager extends Abject {
           // Runtime id of the spawned Chat (absent while the conversation is
           // dormant) so gateways can attach to live chats without re-showing.
           chatId: c.chatId,
+          // Only views get private rows at all (rosterFor).
+          ...(c.private ? { private: true } : {}),
         }));
     });
 
     this.on('newConversation', async (msg: AbjectMessage) => {
-      const payload = (msg.payload ?? {}) as { title?: string; show?: boolean };
-      return this.createConversation(payload.title, payload.show !== false);
+      const payload = (msg.payload ?? {}) as { title?: string; show?: boolean; private?: boolean };
+      return this.createConversation(payload.title, payload.show !== false, undefined, isPrivatePayload(payload));
     });
 
     this.on('forkConversation', async (msg: AbjectMessage) => {
-      const payload = (msg.payload ?? {}) as { conversationId?: string; throughMessageId?: string; show?: boolean };
+      const payload = (msg.payload ?? {}) as { conversationId?: string; throughMessageId?: string; show?: boolean; private?: boolean };
       precondition(typeof payload.conversationId === 'string' && payload.conversationId.length > 0,
         'forkConversation: a conversation id is required');
       precondition(typeof payload.throughMessageId === 'string' && payload.throughMessageId.length > 0,
         'forkConversation: the message the fork ends at is required');
-      return this.forkConversation(payload.conversationId, payload.throughMessageId, payload.show !== false);
+      if (!(await this.visibleConversation(payload.conversationId, msg.routing.from))) {
+        throw new Error(PRIVATE_CONVERSATION_UNAVAILABLE);
+      }
+      return this.forkConversation(payload.conversationId, payload.throughMessageId, payload.show !== false, isPrivatePayload(payload));
     });
 
     this.on('openConversation', async (msg: AbjectMessage) => {
       const { conversationId } = msg.payload as { conversationId: string };
-      const c = this.conversations.get(conversationId);
+      const c = await this.visibleConversation(conversationId, msg.routing.from);
       if (!c) return false;
       const chatId = c.chatId ?? await this.spawnChatFor(c);
       if (!chatId) return false;
@@ -376,6 +434,7 @@ export class ChatManager extends Abject {
 
     this.on('showConversation', async (msg: AbjectMessage) => {
       const { conversationId } = msg.payload as { conversationId: string };
+      if (!(await this.visibleConversation(conversationId, msg.routing.from))) return false;
       const opened = await this.openChatWindow(conversationId);
       if (!opened) return false;
       const c = this.conversations.get(conversationId);
@@ -384,10 +443,11 @@ export class ChatManager extends Abject {
 
     this.on('getHistory', async (msg: AbjectMessage) => {
       const { conversationId } = msg.payload as { conversationId: string };
-      if (!this.storageId || !this.conversations.has(conversationId)) return [];
+      const c = await this.visibleConversation(conversationId, msg.routing.from);
+      if (!this.storageId || !c) return [];
       try {
         const entries = await this.request<unknown[] | null>(
-          request(this.id, this.storageId, 'get', { key: `chats:history:${conversationId}` })
+          request(this.id, this.storageId, 'get', { key: this.historyKeyOf(c) })
         );
         return Array.isArray(entries) ? entries : [];
       } catch (err) {
@@ -398,10 +458,11 @@ export class ChatManager extends Abject {
 
     this.on('getActiveGoal', async (msg: AbjectMessage) => {
       const { conversationId } = msg.payload as { conversationId: string };
-      if (!this.storageId || !this.conversations.has(conversationId)) return null;
+      const c = await this.visibleConversation(conversationId, msg.routing.from);
+      if (!this.storageId || !c) return null;
       try {
         const goalId = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: `chats:activegoal:${conversationId}` })
+          request(this.id, this.storageId, 'get', { key: this.activeGoalKeyOf(c) })
         );
         return typeof goalId === 'string' && goalId ? goalId : null;
       } catch {
@@ -409,17 +470,18 @@ export class ChatManager extends Abject {
       }
     });
 
-    this.on('showLatest', async () => {
-      const latest = this.latestConversation();
+    this.on('showLatest', async (msg: AbjectMessage) => {
+      const latest = this.latestConversation(await this.rosterFor(msg.routing.from));
       if (!latest) return false;
       return this.openChatWindow(latest.conversationId);
     });
 
     this.on('deleteConversation', async (msg: AbjectMessage) => {
       const { conversationId } = msg.payload as { conversationId: string };
-      const c = this.conversations.get(conversationId);
+      const c = await this.visibleConversation(conversationId, msg.routing.from);
       if (!c) return false;
-      const title = c.title;
+      // The step's label is kept on disk with the deletion: a private title stays out of it.
+      const title = c.private ? PRIVATE_TITLE : c.title;
       const trashId = await this.removeConversation(conversationId);
       await this.recordStep(msg.routing.from, `Delete chat ${title}`, { kind: 'delete', conversationId, trashId });
       return true;
@@ -427,6 +489,7 @@ export class ChatManager extends Abject {
 
     this.on('renameConversation', async (msg: AbjectMessage) => {
       const { conversationId, title } = msg.payload as { conversationId: string; title: string };
+      if (!(await this.visibleConversation(conversationId, msg.routing.from))) return false;
       const before = this.conversations.get(conversationId)?.title;
       const renamed = await this.applyRename(conversationId, title, /* fromChat */ false);
       const after = this.conversations.get(conversationId)?.title;
@@ -434,6 +497,16 @@ export class ChatManager extends Abject {
         await this.recordStep(msg.routing.from, 'Rename chat', { kind: 'rename', conversationId, before, after });
       }
       return renamed;
+    });
+
+    // A private goal's outcome, when the Chat that started it was not there
+    // to take it from GoalManager directly.
+    this.on('deliverPrivateOutcome', async (msg: AbjectMessage) => {
+      if (!(await this.isBuiltInCaller(msg.routing.from, ['GoalManager']))) return { accepted: false };
+      const { conversationId, outcome } = (msg.payload ?? {}) as { conversationId?: string; outcome?: PrivateGoalOutcome };
+      precondition(typeof outcome?.goalId === 'string' && outcome.goalId.length > 0,
+        'deliverPrivateOutcome: an outcome with a goal id is required');
+      return this.deliverPrivateOutcome(conversationId ?? '', outcome!);
     });
 
     this.on('undo', async (msg: AbjectMessage) => this.undoFor(msg.routing.from, 'undo'));
@@ -444,13 +517,14 @@ export class ChatManager extends Abject {
     this.on('titleChanged', async (msg: AbjectMessage) => {
       const { conversationId, title } = msg.payload as { conversationId: string; title: string };
       if (!conversationId || typeof title !== 'string') return;
+      if (!this.fromOwnChat(conversationId, msg.routing.from)) return;
       await this.applyRename(conversationId, title, /* fromChat */ true);
     });
 
     this.on('rectChanged', async (msg: AbjectMessage) => {
       const { conversationId, rect } = msg.payload as { conversationId: string; rect: Rect };
       const c = this.conversations.get(conversationId);
-      if (!c || !rect) return;
+      if (!c || !rect || !this.fromOwnChat(conversationId, msg.routing.from)) return;
       // Where a chat window sits is kept so it reopens there, and that is all.
       // It is not roster news: no row in the overview shows it, and moving a
       // window is not talking in it. Announcing it rebuilt the overview list
@@ -519,6 +593,80 @@ export class ChatManager extends Abject {
     return `${this.peerId}/${this.workspaceId}/chat/${conversationId}` as TypeId;
   }
 
+  // ─── Private conversations ─────────────────────────────────────────
+
+  /** Whether a caller is one of the person's own views of the roster. */
+  private async isView(callerId: AbjectId): Promise<boolean> {
+    return this.isBuiltInCaller(callerId, CONVERSATION_VIEWS);
+  }
+
+  /**
+   * Whether a caller may see a private conversation: a view, except that a
+   * Chat sees only its own conversation (a Chat is one conversation, never a
+   * reader of the others).
+   */
+  private async seesPrivate(c: ConversationRuntime, callerId: AbjectId): Promise<boolean> {
+    if (c.chatId === callerId) return true;
+    if (!(await this.isView(callerId))) return false;
+    return !(await this.isBuiltInCaller(callerId, ['Chat']));
+  }
+
+  /** A conversation as a caller may see it: a private one only for views. */
+  private async visibleConversation(conversationId: string, callerId: AbjectId): Promise<ConversationRuntime | undefined> {
+    const c = this.conversations.get(conversationId);
+    if (!c) return undefined;
+    if (c.private && !(await this.seesPrivate(c, callerId))) return undefined;
+    return c;
+  }
+
+  /** The roster a caller may see: private rows only for views. */
+  private async rosterFor(callerId: AbjectId): Promise<ConversationRuntime[]> {
+    const all = Array.from(this.conversations.values());
+    if (!all.some(c => c.private)) return all;
+    if (await this.isView(callerId) && !(await this.isBuiltInCaller(callerId, ['Chat']))) return all;
+    return all.filter(c => !c.private || c.chatId === callerId);
+  }
+
+  /** A private conversation takes title and window moves only from its own Chat. */
+  private fromOwnChat(conversationId: string, callerId: AbjectId): boolean {
+    const c = this.conversations.get(conversationId);
+    return !c?.private || c.chatId === callerId;
+  }
+
+  private historyKeyOf(c: PersistedConversation): string {
+    return c.private ? privateHistoryKey(c.conversationId) : historyKey(c.conversationId);
+  }
+
+  private activeGoalKeyOf(c: PersistedConversation): string {
+    return c.private ? privateActiveGoalKey(c.conversationId) : activeGoalKey(c.conversationId);
+  }
+
+  /** The title fields of a roster event: a private conversation's real title stays out. */
+  private titleFields(c: PersistedConversation, title = c.title): { title: string; private?: true } {
+    return c.private ? { title: PRIVATE_TITLE, private: true } : { title };
+  }
+
+  /**
+   * Hand a private goal's outcome to its conversation's Chat, spawning the
+   * Chat when the conversation is dormant. The Chat's reply says whether it
+   * took it; an unknown or non-private conversation takes nothing.
+   */
+  private async deliverPrivateOutcome(conversationId: string, outcome: PrivateGoalOutcome): Promise<{ accepted: boolean }> {
+    const c = this.conversations.get(conversationId);
+    if (!c?.private) return { accepted: false };
+    const chatId = c.chatId ?? await this.spawnChatFor(c);
+    if (!chatId) return { accepted: false };
+    try {
+      // Within GoalManager's own wait for this reply.
+      const reply = await this.request<{ accepted?: boolean } | null>(
+        request(this.id, chatId, 'privateGoalOutcome', outcome), PRIVATE_OUTCOME_ACK_MS / 2);
+      return { accepted: reply?.accepted === true };
+    } catch (err) {
+      log.warn(`A private goal outcome did not reach its chat: ${String(err)}`);
+      return { accepted: false };
+    }
+  }
+
   // ─── Roster persistence ─────────────────────────────────────────────
 
   private async loadRoster(): Promise<void> {
@@ -536,6 +684,36 @@ export class ChatManager extends Abject {
     } catch (err) {
       log.warn(`Failed to load roster: ${String(err)}`);
     }
+    await this.loadPrivateRoster();
+  }
+
+  /**
+   * Private rows live apart, where only ChatManager and Chat can read them.
+   * A read that fails is tried again shortly, and the rows it finds join
+   * any private conversation started in the meantime.
+   */
+  private async loadPrivateRoster(attempt = 1): Promise<void> {
+    if (!this.storageId || this.privateRosterLoaded) return;
+    let stored: unknown;
+    try {
+      stored = await this.request<unknown>(request(this.id, this.storageId, 'get', { key: PRIVATE_ROSTER_KEY }));
+    } catch (err) {
+      log.warn(`Could not read the private roster (attempt ${attempt}): ${String(err)}`);
+      if (attempt < 5) setTimeout(() => { void this.loadPrivateRoster(attempt + 1); }, 2000 * attempt);
+      return;
+    }
+    this.privateRosterLoaded = true;
+    if (!Array.isArray(stored) || stored.length === 0) return;
+    for (const c of stored as PersistedConversation[]) {
+      if (c?.conversationId && !this.conversations.has(c.conversationId)) {
+        this.conversations.set(c.conversationId, { ...c, private: true });
+      }
+    }
+    this.privateRosterSaved = true;
+    if (attempt > 1) {
+      await this.persistRoster();
+      this.changed('rosterChanged', {});
+    }
   }
 
   private schedulePersist(): void {
@@ -549,13 +727,25 @@ export class ChatManager extends Abject {
 
   private async persistRoster(): Promise<void> {
     if (!this.storageId) return;
-    const rows: PersistedConversation[] = Array.from(this.conversations.values()).map(c => this.persisted(c));
+    const all = Array.from(this.conversations.values());
+    const rows: PersistedConversation[] = all.filter(c => !c.private).map(c => this.persisted(c));
     try {
       await this.request(request(this.id, this.storageId, 'set', {
         key: ROSTER_KEY, value: rows,
       }));
     } catch (err) {
       log.warn(`Failed to persist roster: ${String(err)}`);
+    }
+    if (!this.privateRosterLoaded) return;
+    const privateRows = all.filter(c => c.private).map(c => this.persisted(c));
+    if (privateRows.length === 0 && !this.privateRosterSaved) return;
+    try {
+      await this.request(request(this.id, this.storageId, 'set', {
+        key: PRIVATE_ROSTER_KEY, value: privateRows,
+      }));
+      this.privateRosterSaved = privateRows.length > 0;
+    } catch (err) {
+      log.warn(`Failed to persist the private roster: ${String(err)}`);
     }
   }
 
@@ -577,6 +767,8 @@ export class ChatManager extends Abject {
           manifest: {
             name: 'Chat', description: '', version: '1.0.0',
             tags: ['system', 'agent'],
+            // A private Chat never enters a peer catalog.
+            ...(c.private ? { sharing: 'user-local' } : {}),
           },
           registryHint: this.registryId,
           typeId,
@@ -584,6 +776,7 @@ export class ChatManager extends Abject {
             conversationId: c.conversationId,
             title: c.title,
             rect: c.rect,
+            ...(c.private ? { private: true } : {}),
           },
         })
       );
@@ -609,56 +802,106 @@ export class ChatManager extends Abject {
    * Copy a conversation through one message into a new conversation. The
    * original keeps its transcript and roster row untouched; the copy starts
    * life with the same prefix as its own history, so the agent resumes there.
+   * A fork of a private conversation is private; `makePrivate` makes a fork
+   * of a regular one private too.
    */
   private async forkConversation(
-    sourceId: string, throughMessageId: string, show: boolean,
+    sourceId: string, throughMessageId: string, show: boolean, makePrivate = false,
   ): Promise<{ conversationId: string; chatId: AbjectId }> {
     const source = this.conversations.get(sourceId);
-    if (!source) throw new Error('Conversation unavailable');
-    const entries = await this.storageGet(historyKey(sourceId));
+    if (!source) throw new Error(PRIVATE_CONVERSATION_UNAVAILABLE);
+    const entries = await this.storageGet(this.historyKeyOf(source));
     if (!Array.isArray(entries)) throw new Error('Conversation history unavailable');
     const seed = forkConversationEntries(sourceId, entries as ContextMessage[], throughMessageId);
-    return this.createConversation(`${source.title} (fork)`, show, seed);
+    const isPrivate = source.private === true || makePrivate;
+    if (!isPrivate) return this.createConversation(`${source.title} (fork)`, show, seed);
+    // A private fork reads its attachments from its own upload keys, so it
+    // keeps them when the original is deleted.
+    const conversationId = uuidv4();
+    const { entries: own, keys } = await this.copyPrivateUploads(seed, conversationId);
+    try {
+      // A normal chat's title came from its words; a private copy starts neutral.
+      const title = source.private === true ? `${source.title} (fork)` : PRIVATE_TITLE;
+      return await this.createConversation(title, show, own, true, conversationId);
+    } catch (err) {
+      for (const key of keys) await this.storageDelete(key);
+      throw err;
+    }
+  }
+
+  /**
+   * Copy each private upload the entries reference (attachment.path, a
+   * `private:chats:upload:` key) under the new conversation's own upload
+   * prefix, and point the copied entries at the copies. Returns the entries
+   * and the keys written.
+   */
+  private async copyPrivateUploads(
+    entries: ContextMessage[], conversationId: string,
+  ): Promise<{ entries: ContextMessage[]; keys: string[] }> {
+    const uploadPrefix = `${PRIVATE_KEY_PREFIX}chats:upload:`;
+    const copies = new Map<string, string>();
+    const keys: string[] = [];
+    const out: ContextMessage[] = [];
+    for (const entry of entries) {
+      const path = entry.attachment?.path;
+      if (!entry.attachment || typeof path !== 'string' || !path.startsWith(uploadPrefix)) {
+        out.push(entry);
+        continue;
+      }
+      let copy = copies.get(path);
+      if (!copy) {
+        const value = await this.storageGet(path);
+        if (value === null || value === undefined) { out.push(entry); continue; }
+        copy = `${privateUploadPrefix(conversationId)}${uuidv4()}`;
+        await this.storageSet(copy, value);
+        copies.set(path, copy);
+        keys.push(copy);
+      }
+      out.push({ ...entry, attachment: { ...entry.attachment, path: copy } });
+    }
+    ensure(out.length === entries.length, 'copyPrivateUploads: every entry is kept');
+    return { entries: out, keys };
   }
 
   private async createConversation(
-    title: string | undefined, show: boolean, seed?: ContextMessage[],
+    title: string | undefined, show: boolean, seed?: ContextMessage[], isPrivate = false,
+    conversationId: string = uuidv4(),
   ): Promise<{ conversationId: string; chatId: AbjectId }> {
     await this.ensurePeerId();
     await this.ensureWorkspaceId();
-    const conversationId = uuidv4();
     const now = Date.now();
     const c: ConversationRuntime = {
       conversationId,
       typeId: this.computeTypeId(conversationId),
-      title: (title?.trim() || DEFAULT_TITLE),
+      title: (title?.trim() || (isPrivate ? PRIVATE_TITLE : DEFAULT_TITLE)),
       rect: this.stagger(),
       createdAt: now,
       lastActiveAt: now,
+      ...(isPrivate ? { private: true } : {}),
     };
 
     // A fork's copied transcript must be on disk before its Chat starts: Chat
     // reads its history once, in onInit, and never looks again.
-    if (seed && seed.length > 0) await this.storageSet(historyKey(conversationId), seed);
+    if (seed && seed.length > 0) await this.storageSet(this.historyKeyOf(c), seed);
 
     // A conversation joins the roster only once its Chat is running: a failed
     // spawn used to leave a "New chat" row behind that nothing could open.
     const chatId = await this.spawnChatFor(c);
     if (!chatId) {
-      if (seed && seed.length > 0) await this.storageDelete(historyKey(conversationId));
+      if (seed && seed.length > 0) await this.storageDelete(this.historyKeyOf(c));
       throw new Error('Failed to create conversation: its Chat could not start');
     }
     this.conversations.set(conversationId, c);
     await this.persistRoster();
 
-    this.changed('conversationCreated', { conversationId, title: c.title });
+    this.changed('conversationCreated', { conversationId, ...this.titleFields(c) });
     this.changed('rosterChanged', {});
 
     // A window only where there is a display: show reports false otherwise.
     if (show) {
       try {
         const shown = await this.request<boolean>(request(this.id, chatId, 'show', {}), 20000);
-        if (shown) this.changed('conversationOpened', { conversationId, title: c.title, chatId });
+        if (shown) this.changed('conversationOpened', { conversationId, ...this.titleFields(c), chatId });
       } catch { /* best effort */ }
     }
 
@@ -677,7 +920,7 @@ export class ChatManager extends Abject {
     this.changed('rosterChanged', {});
     try {
       const shown = await this.request<boolean>(request(this.id, chatId, 'show', {}), 20000);
-      if (shown) this.changed('conversationOpened', { conversationId, title: c.title, chatId });
+      if (shown) this.changed('conversationOpened', { conversationId, ...this.titleFields(c), chatId });
       return shown === true;
     } catch {
       return false;
@@ -696,10 +939,14 @@ export class ChatManager extends Abject {
    * Delete a conversation: its Chat stops, and its transcript, active-goal
    * marker, roster row and cards are set aside. Returns the trash id that
    * undo brings it back from. A goal it started is left running.
+   *
+   * A private conversation is set aside in memory only, and its goals and
+   * `private:` keys go now (removePrivateConversation).
    */
   private async removeConversation(conversationId: string): Promise<string> {
     const c = this.conversations.get(conversationId);
     precondition(c !== undefined, `removeConversation: no conversation '${conversationId}'`);
+    if (c!.private) return this.removePrivateConversation(c!);
 
     // Hide the Chat window, then kill the Abject
     if (c!.chatId) {
@@ -743,6 +990,68 @@ export class ChatManager extends Abject {
     this.changed('conversationDeleted', { conversationId });
     this.changed('rosterChanged', {});
     return trashId;
+  }
+
+  /**
+   * Delete a private conversation: its Chat stops, GoalManager stops and
+   * forgets every goal it started, and its transcript and attachments leave
+   * Storage. What undo needs is kept in memory only, until restart; nothing
+   * of it reaches the trash on disk.
+   */
+  private async removePrivateConversation(c: ConversationRuntime): Promise<string> {
+    precondition(c.private === true, 'removePrivateConversation: the conversation is not private');
+    const conversationId = c.conversationId;
+    if (c.chatId) {
+      try { await this.request(request(this.id, c.chatId, 'hide', {}), 3000); } catch { /* best effort */ }
+      if (this.factoryId) {
+        try { await this.request(request(this.id, this.factoryId, 'kill', { objectId: c.chatId }), 3000); } catch { /* best effort */ }
+      }
+    }
+
+    // Its goals are deleted with it, not delivered.
+    const goalManagerId = await this.discoverDep('GoalManager');
+    if (goalManagerId) {
+      try {
+        await this.request(request(this.id, goalManagerId, 'purgeConversationGoals', { conversationId }), 10_000);
+      } catch (err) {
+        log.warn(`Could not purge a private conversation's goals: ${String(err)}`);
+      }
+    }
+
+    const history = await this.storageGet(privateHistoryKey(conversationId));
+    const uploads = await this.privateUploads(conversationId);
+    const trashId = this.setAsidePrivate({
+      conversation: this.persisted(c),
+      ...(Array.isArray(history) ? { history } : {}),
+      ...(Object.keys(uploads).length > 0 ? { uploads } : {}),
+    });
+
+    await this.storageDelete(privateHistoryKey(conversationId));
+    await this.storageDelete(privateActiveGoalKey(conversationId));
+    for (const key of Object.keys(uploads)) await this.storageDelete(key);
+
+    if (c.chatId) {
+      this.busyChats.delete(c.chatId);
+      this.emitGoalActivity();
+    }
+    this.conversations.delete(conversationId);
+    await this.persistRoster();
+    this.changed('conversationDeleted', { conversationId });
+    this.changed('rosterChanged', {});
+    await this.purgeTrash();
+    return trashId;
+  }
+
+  /** A private conversation's attachments in Storage, by key. */
+  private async privateUploads(conversationId: string): Promise<Record<string, unknown>> {
+    if (!this.storageId) return {};
+    try {
+      const found = await this.request<Record<string, unknown> | null>(
+        request(this.id, this.storageId, 'getByPrefix', { prefix: privateUploadPrefix(conversationId) }));
+      return found && typeof found === 'object' ? found : {};
+    } catch {
+      return {};
+    }
   }
 
   /** Remove a conversation's cards folder; the AbjectStore trash ids of what it set aside. */
@@ -803,6 +1112,7 @@ export class ChatManager extends Abject {
     if (this.conversations.has(conversationId)) throw new UndoRefused('That chat is back already');
     const item = this.trash.get(trashId);
     if (!item) throw new UndoRefused('The deleted chat is no longer kept');
+    if (item.private) return this.restorePrivateConversation(trashId, conversationId);
     const record = await this.storageGet(trashKey(trashId)) as ChatTrashRecord | null;
     if (!record?.conversation?.conversationId) {
       this.trash.delete(trashId);
@@ -824,6 +1134,30 @@ export class ChatManager extends Abject {
     this.checkInvariants();
   }
 
+  /**
+   * Put a deleted private conversation back from memory: transcript and
+   * attachments under its `private:` keys, roster row. Its goals were
+   * deleted with it, so no goal marker comes back.
+   */
+  private async restorePrivateConversation(trashId: string, conversationId: string): Promise<void> {
+    const record = this.privateTrash.get(trashId);
+    if (!record) {
+      this.trash.delete(trashId);
+      throw new UndoRefused('The deleted private chat is gone (Abjects restarted)');
+    }
+    if (record.history) await this.storageSet(privateHistoryKey(conversationId), record.history);
+    for (const [key, value] of Object.entries(record.uploads ?? {})) await this.storageSet(key, value);
+
+    const c: ConversationRuntime = { ...record.conversation, private: true };
+    this.conversations.set(conversationId, c);
+    await this.persistRoster();
+    this.trash.delete(trashId);
+    this.privateTrash.delete(trashId);
+    this.changed('conversationCreated', { conversationId, ...this.titleFields(c) });
+    this.changed('rosterChanged', {});
+    this.checkInvariants();
+  }
+
   private persisted(c: ConversationRuntime): PersistedConversation {
     return {
       conversationId: c.conversationId,
@@ -832,6 +1166,7 @@ export class ChatManager extends Abject {
       rect: c.rect,
       createdAt: c.createdAt,
       lastActiveAt: c.lastActiveAt,
+      ...(c.private ? { private: true } : {}),
     };
   }
 
@@ -849,7 +1184,7 @@ export class ChatManager extends Abject {
         await this.request(request(this.id, c.chatId, 'setTitle', { title: trimmed }), 3000);
       } catch { /* best effort */ }
     }
-    this.changed('conversationRenamed', { conversationId, title: trimmed });
+    this.changed('conversationRenamed', { conversationId, ...this.titleFields(c, trimmed) });
     this.changed('rosterChanged', {});
     return true;
   }
@@ -876,6 +1211,24 @@ export class ChatManager extends Abject {
     return id;
   }
 
+  /**
+   * Keep a deleted private conversation's record in memory under a new trash
+   * id: undo finds it until restart, and nothing of it is written to disk.
+   */
+  private setAsidePrivate(record: ChatTrashRecord): string {
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    this.privateTrash.set(id, record);
+    this.trash.set(id, {
+      id,
+      conversationId: record.conversation.conversationId,
+      title: PRIVATE_TITLE,
+      removedAt: Date.now(),
+      bytes: JSON.stringify(record).length,
+      private: true,
+    });
+    return id;
+  }
+
   private async loadTrash(): Promise<void> {
     if (!this.storageId) return;
     const index = await this.storageGet(TRASH_INDEX_KEY);
@@ -890,7 +1243,7 @@ export class ChatManager extends Abject {
   }
 
   private async persistTrashIndex(): Promise<void> {
-    await this.storageSet(TRASH_INDEX_KEY, [...this.trash.values()]);
+    await this.storageSet(TRASH_INDEX_KEY, [...this.trash.values()].filter(t => !t.private));
   }
 
   /**
@@ -915,8 +1268,10 @@ export class ChatManager extends Abject {
     }
     if (expired.size > 0) {
       for (const id of expired) {
+        const wasPrivate = this.trash.get(id)?.private === true;
         this.trash.delete(id);
-        await this.storageDelete(trashKey(id));
+        if (wasPrivate) this.privateTrash.delete(id);
+        else await this.storageDelete(trashKey(id));
       }
       await this.persistTrashIndex();
       log.info(`Forgot ${expired.size} deleted conversation(s) past keeping`);
@@ -1015,9 +1370,9 @@ export class ChatManager extends Abject {
     } catch { /* best effort */ }
   }
 
-  private latestConversation(): ConversationRuntime | undefined {
+  private latestConversation(among: Iterable<ConversationRuntime> = this.conversations.values()): ConversationRuntime | undefined {
     let best: ConversationRuntime | undefined;
-    for (const c of this.conversations.values()) {
+    for (const c of among) {
       if (!best || c.lastActiveAt > best.lastActiveAt) best = c;
     }
     return best;

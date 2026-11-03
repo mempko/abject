@@ -123,6 +123,10 @@ static bool bool_or(const json& p, const char* key, bool dflt) {
   }
   return dflt;
 }
+
+// Whether a read leaves a trace: `track: false` (a private conversation's
+// read) bumps no access counter and keeps its query and titles out of the log.
+static bool tracked(const json& p) { return bool_or(p, "track", true); }
 static int64_t int_or(const json& p, const char* key, int64_t dflt) {
   return (p.contains(key) && p[key].is_number()) ? p[key].get<int64_t>() : dflt;
 }
@@ -745,6 +749,7 @@ class KnowledgeBase final : public Object {
                "'uncertain' (with or without a query): entries relied on most and tested least first, by (1 + accessCount + 2 * usefulCount) * evidence.uncertainty", true)
         .param("includeLearning", "boolean", "Include each entry's whole learning history (receipts); by default only its summary", true)
         .param("minGoals", "number", "Only entries met in at least this many goals (distinct goals behind their learning receipts)", true)
+        .param("track", "boolean", "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)", true)
         .returns("array");
     m.method("weave",
              "Select pattern entries (type 'pattern') whose contexts match "
@@ -762,6 +767,7 @@ class KnowledgeBase final : public Object {
         .param("limit", "number", "Max directly matched patterns (default 5)", true)
         .param("scope", "string", "Explicit applicability scope", true)
         .param("hops", "number", "Link-expansion depth (default 1, max 2)", true)
+        .param("track", "boolean", "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)", true)
         .returns("object");
     m.method("match",
              "Exact lookup over titles, content, and tags. Use for "
@@ -770,10 +776,12 @@ class KnowledgeBase final : public Object {
         .param("pattern", "string", "Literal substring or 'A|B' alternation")
         .param("scope", "string", "Explicit applicability scope", true)
         .param("limit", "number", "Max results (default 10)", true)
+        .param("track", "boolean", "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)", true)
         .returns("array");
     m.method("get", "Fetch one full knowledge entry by id")
         .param("id", "string", "Entry ID")
         .param("includeLearning", "boolean", "Include the entry's whole learning history (receipts); by default only its summary", true)
+        .param("track", "boolean", "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)", true)
         .returns("object");
     m.method("evidenceHashes",
              "The evidence hashes the learning receipts cite, so the evidence "
@@ -799,12 +807,14 @@ class KnowledgeBase final : public Object {
         .param("limit", "number", "Max results (default 50)", true)
         .param("includeArchived", "boolean", "Include archived entries (default false)", true)
         .param("includeLearning", "boolean", "Include each entry's whole learning history (receipts); by default only its summary", true)
+        .param("track", "boolean", "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)", true)
         .returns("array");
     m.method("listTags",
              "List tags in use across active (non-archived) entries with "
              "usage counts, most-used first. Lets agents discover the tag "
              "vocabulary instead of guessing.")
         .param("limit", "number", "Max tags (default 50)", true)
+        .param("track", "boolean", "false for a read that leaves no trace: no access count bumped, query and titles left out of the log (default true)", true)
         .returns("array");
     m.method("markUseful",
              "Record that entries genuinely helped a task (reviewer "
@@ -1501,7 +1511,7 @@ class KnowledgeBase final : public Object {
       const std::string id = str_or(req.payload(), "id", "");
       auto it = entries_.find(id);
       if (it == entries_.end()) { req.reply(nullptr); return; }
-      touch(it->second);
+      if (tracked(req.payload())) touch(it->second);
       req.reply(presented_json(it->second, bool_or(req.payload(), "includeLearning", false)));
     });
 
@@ -1826,7 +1836,8 @@ class KnowledgeBase final : public Object {
 
     // Count the read. Counters live in one small key (see ACCESS_KEY); the
     // entries themselves are not rewritten by a read.
-    for (auto& row : rows) touch(entries_[row.entry->id]);
+    const bool track = tracked(p);
+    if (track) for (auto& row : rows) touch(entries_[row.entry->id]);
     const bool include_learning = bool_or(p, "includeLearning", false);
 
     json out = json::array();
@@ -1848,8 +1859,9 @@ class KnowledgeBase final : public Object {
         out.push_back(std::move(full));
       }
     }
-    log(LogLevel::Info, "Recall \"" + (query.empty() ? "*" : query) + "\" => " +
-                            std::to_string(out.size()) + " entries");
+    if (track) log(LogLevel::Info, "Recall \"" + (query.empty() ? "*" : query) + "\" => " +
+                                       std::to_string(out.size()) + " entries");
+    else log(LogLevel::Info, "Recall (untracked) => " + std::to_string(out.size()) + " entries");
     req.reply(std::move(out));
   }
 
@@ -2010,10 +2022,11 @@ class KnowledgeBase final : public Object {
 
     // Bump access counts so patterns participate in staleness signals.
     const int64_t now = static_cast<int64_t>(now_ms());
+    const bool track = tracked(p);
     json patterns = json::array();
     for (const auto& w : selected) {
       if (w.seed) continue;
-      touch(*w.entry);
+      if (track) touch(*w.entry);
       json full = presented_json(*w.entry, false);
       if (w.scored) {
         full["snippet"] = w.snippet;
@@ -2030,7 +2043,7 @@ class KnowledgeBase final : public Object {
     for (const auto& name : dangling) dangling_out.push_back(name);
     json broken_out = json::array();
     for (const auto& [name, id] : broken) broken_out.push_back({{"name", name}, {"archivedId", id}});
-    log(LogLevel::Info, "Weave \"" + clip_utf8(query.empty() ? std::string("(from plan)") : query, 60) + "\" => " +
+    log(LogLevel::Info, (track ? "Weave \"" + clip_utf8(query.empty() ? std::string("(from plan)") : query, 60) + "\" => " : std::string("Weave (untracked) => ")) +
                             std::to_string(patterns.size()) + " patterns (" +
                             std::to_string(dangling_out.size()) + " dangling, " +
                             std::to_string(broken_out.size()) + " broken links)");
@@ -2079,15 +2092,17 @@ class KnowledgeBase final : public Object {
     }
 
     const int64_t now = static_cast<int64_t>(now_ms());
+    const bool track = tracked(p);
     json out = json::array();
     for (const Entry* e : results) {
       Entry& live = entries_[e->id];
-      touch(live);
+      if (track) touch(live);
       out.push_back(presented_json(live, false));
     }
     flush_sync(now);
 
-    log(LogLevel::Info, "Match \"" + pattern + "\" => " + std::to_string(out.size()) + " entries");
+    if (track) log(LogLevel::Info, "Match \"" + pattern + "\" => " + std::to_string(out.size()) + " entries");
+    else log(LogLevel::Info, "Match (untracked) => " + std::to_string(out.size()) + " entries");
     req.reply(std::move(out));
   }
 

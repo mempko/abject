@@ -12,6 +12,12 @@
  * DialogBroker, which registers this object as a responder at boot: every
  * terminal is told of each question, can list the open ones, and can answer.
  *
+ * The terminal is one of the person's own views of their conversations, so
+ * it lists private ones (marked `private: true`), reads their history and
+ * starts them (`newChat { private: true }`). ChatManager's roster events show
+ * a placeholder title for a private conversation; this gateway looks the
+ * real one up before passing the event on to terminals.
+ *
  * Wire protocol (JSON text frames):
  *   client -> server  { id, op, ...params }
  *   server -> client  { id, ok: true, result } | { id, ok: false, error }
@@ -27,6 +33,7 @@ import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { refuseAllOrigins } from '../src/network/origin-policy.js';
 import { authenticateConnection, AuthConfig, SessionStore } from './auth.js';
 import { Log } from '../src/core/timed-log.js';
+import { PRIVATE_GOAL_UNAVAILABLE } from '../src/core/privacy.js';
 
 const log = new Log('CliServer');
 
@@ -200,14 +207,17 @@ export class CliServer extends Abject {
 
     // Roster events from per-workspace ChatManagers we subscribed to.
     for (const aspect of ['conversationCreated', 'conversationDeleted', 'conversationRenamed', 'conversationOpened'] as const) {
-      this.on(aspect, (msg: AbjectMessage) => {
+      this.on(aspect, async (msg: AbjectMessage) => {
         const workspaceId = this.chatManagerToWorkspace.get(msg.routing.from);
         if (!workspaceId) return;
         if (aspect === 'conversationDeleted') {
           const { conversationId } = msg.payload as { conversationId: string };
           this.dropSubscription(this.watchKey(workspaceId, conversationId), /* chatGone */ true);
         }
-        this.broadcast({ event: aspect, workspaceId, data: msg.payload });
+        const data = (msg.payload as { private?: boolean } | undefined)?.private === true
+          ? await this.withRealTitle(workspaceId, msg.payload as { conversationId: string; title?: string })
+          : msg.payload;
+        this.broadcast({ event: aspect, workspaceId, data });
       });
     }
 
@@ -398,7 +408,7 @@ export class CliServer extends Abject {
       }
       case 'listChats': return this.opListChats(this.str(params, 'workspaceId'));
       case 'newChat': return this.opOpenOrCreate(session, this.str(params, 'workspaceId'), undefined,
-        typeof params.title === 'string' ? params.title : undefined);
+        typeof params.title === 'string' ? params.title : undefined, params.private === true);
       case 'openChat': return this.opOpenOrCreate(session, this.str(params, 'workspaceId'),
         this.str(params, 'conversationId'));
       case 'closeChat': {
@@ -659,9 +669,35 @@ export class CliServer extends Abject {
 
   /** Roster row as returned by ChatManager.listConversations. */
   private async fetchRoster(workspaceId: string): Promise<Array<{
-    conversationId: string; title: string; createdAt: number; lastActiveAt: number; chatId?: AbjectId;
+    conversationId: string; title: string; createdAt: number; lastActiveAt: number; chatId?: AbjectId; private?: boolean;
   }>> {
     return this.chatManagerRequest(workspaceId, 'listConversations', {});
+  }
+
+  /**
+   * A private conversation's roster event with its real title, which
+   * ChatManager gives only in listings to views like this one. Keeps the
+   * placeholder when the roster cannot be read.
+   */
+  private async withRealTitle(
+    workspaceId: string, payload: { conversationId: string; title?: string },
+  ): Promise<unknown> {
+    try {
+      const row = (await this.fetchRoster(workspaceId)).find(r => r.conversationId === payload.conversationId);
+      return row ? { ...payload, title: row.title } : payload;
+    } catch {
+      return payload;
+    }
+  }
+
+  /** Whether a conversation is private, from the roster as this view sees it. */
+  private async isPrivateConversation(workspaceId: string, conversationId: string): Promise<boolean> {
+    try {
+      const row = (await this.fetchRoster(workspaceId)).find(r => r.conversationId === conversationId);
+      return row?.private === true;
+    } catch {
+      return false;
+    }
   }
 
   /** Is this spawned Chat currently showing a window? */
@@ -688,18 +724,20 @@ export class CliServer extends Abject {
       createdAt: row.createdAt,
       lastActiveAt: row.lastActiveAt,
       open: row.chatId ? await this.chatVisible(row.chatId) : false,
+      ...(row.private ? { private: true } : {}),
     })));
   }
 
   /**
-   * Open an existing conversation (or create a new one) in a workspace,
-   * subscribe this session to its events, and return its ids.
+   * Open an existing conversation (or create a new one, private when asked)
+   * in a workspace, subscribe this session to its events, and return its ids.
    */
   private async opOpenOrCreate(
     session: CliSession,
     workspaceId: string,
     conversationId?: string,
     title?: string,
+    isPrivate = false,
   ): Promise<{ conversationId: string; chatId: string }> {
     // A terminal talks to the conversation; it opens no window on any
     // desktop that happens to be attached to the same instance.
@@ -711,7 +749,7 @@ export class CliServer extends Abject {
       opened = result;
     } else {
       opened = await this.chatManagerRequest<{ conversationId: string; chatId: string }>(
-        workspaceId, 'newConversation', { title, show: false }, 20000);
+        workspaceId, 'newConversation', isPrivate ? { title, show: false, private: true } : { title, show: false }, 20000);
       if (!opened.chatId) throw new Error('Failed to create conversation');
     }
 
@@ -748,6 +786,14 @@ export class CliServer extends Abject {
     // goal (paused, stopping) stays true for every view of it.
     const sub = this.chatSubs.get(this.watchKey(workspaceId, conversationId));
     if (sub) return this.request<boolean>(request(this.id, sub.chatId, op, {}), 15000);
+    // A private goal answers only its own circle, so it is controlled through
+    // its conversation, loaded for the purpose.
+    if (await this.isPrivateConversation(workspaceId, conversationId)) {
+      const opened = await this.chatManagerRequest<{ chatId: string } | false>(
+        workspaceId, 'openConversation', { conversationId }, 20000);
+      if (!opened || !opened.chatId) throw new Error('No active goal for this conversation');
+      return this.request<boolean>(request(this.id, opened.chatId as AbjectId, op, {}), 15000);
+    }
     const goalId = await this.chatManagerRequest<string | null>(
       workspaceId, 'getActiveGoal', { conversationId });
     if (!goalId) throw new Error('No active goal for this conversation');
@@ -759,14 +805,19 @@ export class CliServer extends Abject {
 
   /**
    * A goal's live detail — title/status plus its task list — so terminals
-   * can render the same goal tree the desktop chat shows.
+   * can render the same goal tree the desktop chat shows. A goal that reads
+   * as absent (finished and forgotten, or a private goal, which answers only
+   * its own circle) is null.
    */
   private async opGoalStatus(workspaceId: string, goalId: string): Promise<unknown> {
     const deps = await this.resolveWorkspaceDeps(workspaceId);
     if (!deps.goalManagerId) throw new Error('GoalManager not available in this workspace');
     const [goal, tuples] = await Promise.all([
       this.request<{ id: string; title: string; description?: string; status: string; error?: string } | null>(
-        request(this.id, deps.goalManagerId, 'getGoal', { goalId })),
+        request(this.id, deps.goalManagerId, 'getGoal', { goalId })).catch((err: unknown) => {
+        if (String(err).includes(PRIVATE_GOAL_UNAVAILABLE)) return null;
+        throw err;
+      }),
       this.request<Array<{ id: string; fields?: Record<string, unknown> }>>(
         request(this.id, deps.goalManagerId, 'getTasksForGoal', { goalId })).catch(() => []),
     ]);

@@ -150,6 +150,9 @@ conversationId?, data }`. The server side is documented in
 - Chats: `listChats`, `newChat`, `openChat`, `closeChat`, `renameChat`,
   `deleteChat`, `send`, `history`. Opening or creating a chat subscribes this
   connection to its events; a terminal never opens a window on a desktop.
+  `newChat { private: true }` starts a private chat, and `listChats` marks
+  private rows `private: true` (the terminal is one of the person's own views,
+  so it lists them and reads their history).
 - Goals: `stopGoal`, `pauseGoal`, `resumeGoal` (by conversation), `goalStatus`.
 - Questions: `listDialogs`, `respondDialog`.
 - The instance: `instanceInfo`, `isConfigured`, `shutdown`.
@@ -189,14 +192,17 @@ work with Alt.
 Up, Down, PageUp and PageDown scroll. Ctrl+C twice quits (once while the link
 is down).
 
-**Slash commands (TUI).** `/new [title]`, `/open`, `/tabs`,
+**Slash commands (TUI).** `/new [title]`, `/private [title]` (a private chat:
+nothing in it is learned, its goals are deleted when they finish), `/open`
+(its chat picker takes `n` for a new chat and `p` for a private one), `/tabs`,
 `/tab N|next|prev`, `/close`, `/rename <title>`, `/delete`, `/history`,
 `/stop`, `/pause`, `/resume`, `/ws` (list), `/ws <n|name>` (set the active
 workspace, which is what a desktop shows), `/ws new <name>`, `/questions`,
 `/answer N <choice>`, `/mode [ask|allow|deny]`, `/projects`,
 `/trust <project> [ask|read|edit|full]` and `/trust <project> off`,
 `/settings`, the settings commands below, `/help`, `/quit` (or `/exit`).
-Anything else is sent to the tab's chat.
+Anything else is sent to the tab's chat. Private chats show `[private]` in
+listings and `[p]` in the tab bar.
 
 **Questions.** Each open dialog takes over the keys in turn: a confirmation
 takes `y`/Enter or `n`, an options dialog a digit, a prompt the input line
@@ -207,14 +213,16 @@ another terminal); the rest see `dialogClosed`.
 its tasks in dependency order with what each waits on (the same
 `src/core/task-graph.ts` helpers the desktop uses), and the latest activity.
 Goal events mark it stale and a `goalStatus` call refreshes it, at most once a
-second. Milestones (started, completed, failed) go into the transcript.
+second. Milestones (started, completed, failed) go into the transcript. A
+private chat's goals send no goal events and read as absent to `goalStatus`,
+so it shows no panel; their progress and outcome arrive as chat messages.
 
 **Toasts** from the workspace's notifications show in the top bar, five
 seconds each. **Reconnect**: when the link drops the TUI retries until it is
 back, then re-queues the waiting questions.
 
 **Plain REPL** (`--plain`, pipes, dumb terminals): `/chats`, `/open N`,
-`/new [title]`, `/ws [n|name]`, `/use N` (point the REPL at another workspace
+`/new [title]`, `/private [title]`, `/ws [n|name]`, `/use N` (point the REPL at another workspace
 without changing the active one), `/stop`, `/yes`, `/no`,
 `/answer <text|number>` (for the latest question), `/help`, `/quit`, and the
 settings commands except `/settings`.

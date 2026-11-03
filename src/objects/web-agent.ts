@@ -638,13 +638,18 @@ Set keepPageOpen: false to explicitly close the page when done.
 
     this.on('getTaskStatus', async (msg: AbjectMessage) => {
       const { taskId } = msg.payload as { taskId: string };
-      // Forward to AgentAbject
-      return this.request(request(this.id, this.agentAbjectId!, 'getTaskStatus', { taskId }));
+      // Forward to AgentAbject. It answers this agent in full; a private
+      // task's error text stays with the agent, not whoever asked here.
+      const status = await this.request<Record<string, unknown> | null>(request(this.id, this.agentAbjectId!, 'getTaskStatus', { taskId }));
+      if (status?.private === true) { const { error: _error, ...rest } = status; return rest; }
+      return status;
     });
 
     this.on('listTasks', async () => {
-      // Forward to AgentAbject, filtered by our agentId
-      return this.request(request(this.id, this.agentAbjectId!, 'listTasks', { agentId: this.id }));
+      // Forward to AgentAbject, filtered by our agentId. Private tasks are
+      // listed to this agent, never passed on.
+      const tasks = await this.request<unknown>(request(this.id, this.agentAbjectId!, 'listTasks', { agentId: this.id }));
+      return Array.isArray(tasks) ? tasks.filter(t => (t as { private?: unknown } | null)?.private !== true) : tasks;
     });
 
     this.on('executeTask', async (msg: AbjectMessage) => {

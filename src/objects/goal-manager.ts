@@ -28,6 +28,7 @@ import {
   brier, confidenceOf, isNegativeReaction, occurrenceBucket, parseAssumption, reactionKindOf, surpriseBits, weekOf,
   type Assumption, type AssumptionStatus, type AttributionSource, type Confidence, type OccurrenceBucket, type Reaction, type ReactionKind,
 } from '../core/surprise.js';
+import { isPrivatePayload, shown, PRIVATE_GOAL_UNAVAILABLE, PRIVATE_OUTCOME_ACK_MS, type PrivateGoalOutcome } from '../core/privacy.js';
 const log = new Log('GoalManager');
 
 const GOAL_MANAGER_INTERFACE: InterfaceId = 'abjects:goal-manager';
@@ -180,6 +181,18 @@ export interface Goal {
    * current scrum number reaches terminal state. Starts at 0 (no scrum yet).
    */
   currentScrumNumber: number;
+  /**
+   * A goal started from a private conversation (or under one). It lives in
+   * memory only, reads as absent to anyone outside its circle (its owner,
+   * the workspace's planner and runtime, and its crew), and is deleted once
+   * its outcome reaches the owner. Children carry the root's flag, owner and
+   * conversation.
+   */
+  private?: true;
+  /** The object that created the private root goal: its outcome goes here. */
+  ownerId?: AbjectId;
+  /** The private conversation the goal belongs to. */
+  conversationId?: string;
 }
 
 // ─── GoalManager ─────────────────────────────────────────────────────
@@ -311,6 +324,299 @@ export class GoalManager extends Abject {
    *  gets one emission. Cleared per-key when a new task is added at that scrum number. */
   private readyForCompletionEmitted: Set<string> = new Set();
 
+  // ── Private goals ──────────────────────────────────────────────────
+  //
+  // A private goal (core/privacy.ts) lives in memory only: no Storage
+  // write, no catalog entry, a private SharedState namespace and a private
+  // task queue. Its reads answer only its circle, events about it go only to
+  // circle members that subscribed, and once it ends its outcome goes to its
+  // owner and every trace of it is dropped.
+
+  /** The built-ins in every private goal's circle, beside its owner and crew. */
+  // Not JobManager: every job's calls arrive from it, whoever wrote the job.
+  // A job reads a private goal only when it works for that goal's private
+  // task (inCircle asks JobManager's invocation context).
+  private static readonly PRIVATE_CIRCLE = ['ScrumMaster', 'AgentAbject', 'GoalObserver', 'CliServer'] as const;
+  /** The objects told to forget a private goal when it is purged. */
+  private static readonly PRIVATE_FORGETTERS = ['AgentAbject', 'ScrumMaster', 'JobManager', 'GoalObserver'] as const;
+  private static readonly FORGOTTEN_MAX = 2000;
+  private static readonly CIRCLE_REFRESH_MS = 5000;
+  /** Agents working a private goal, by root goal: task assignments and addCrew. */
+  private privateCrew: Map<GoalId, Set<AbjectId>> = new Map();
+  /** Private goals already purged (ids only), so a late event about one is never broadcast. */
+  private forgottenPrivateGoals: Set<GoalId> = new Set();
+  /** Private root goals whose outcome is on its way to the owner. */
+  private finishingPrivateGoals: Set<GoalId> = new Set();
+  /** Callers that subscribed with addDependent, for targeted private events. */
+  private goalDependents: Set<AbjectId> = new Set();
+  /** Private notices go out in order, each after its circle check. */
+  private privateNotices: Promise<void> = Promise.resolve();
+  /** Ids of the PRIVATE_CIRCLE built-ins, looked up again on a miss. */
+  private circleIds: Map<string, AbjectId> = new Map();
+  private circleIdsAt = 0;
+
+  /** The top of a goal's tree (the goal itself when its parent is unknown). */
+  private rootOf(goal: Goal): Goal {
+    let current = goal;
+    const seen = new Set<GoalId>();
+    while (current.parentId && !seen.has(current.id)) {
+      seen.add(current.id);
+      const parent = this.goals.get(current.parentId);
+      if (!parent) break;
+      current = parent;
+    }
+    return current;
+  }
+
+  /** True for a private goal, a goal under one, or a private goal already purged. */
+  private isPrivateGoal(goalId: GoalId | undefined): boolean {
+    if (!goalId) return false;
+    if (this.forgottenPrivateGoals.has(goalId)) return true;
+    const goal = this.goals.get(goalId);
+    return !!goal && (goal.private === true || this.rootOf(goal).private === true);
+  }
+
+  /** Whether a caller is one of this workspace's built-ins in every private goal's circle. */
+  private async isCircleBuiltIn(callerId: AbjectId): Promise<boolean> {
+    const known = () => [...this.circleIds.values()].includes(callerId);
+    if (!known() && Date.now() - this.circleIdsAt >= GoalManager.CIRCLE_REFRESH_MS) {
+      this.circleIdsAt = Date.now();
+      for (const name of GoalManager.PRIVATE_CIRCLE) {
+        const id = await this.discoverDep(name).catch(() => null);
+        if (id) this.circleIds.set(name, id);
+      }
+    }
+    return known() && await this.isBuiltInCaller(callerId, GoalManager.PRIVATE_CIRCLE);
+  }
+
+  /**
+   * Whether a caller may see a private goal: its owner, its crew, or one of
+   * the circle built-ins. Children share the root's circle. True for every
+   * caller of a goal that is not private.
+   */
+  private async inCircle(goal: Goal, callerId: AbjectId | undefined, msg?: AbjectMessage): Promise<boolean> {
+    if (!this.isPrivateGoal(goal.id)) return true;
+    if (!callerId) return false;
+    if (callerId === this.id) return true;
+    const root = this.rootOf(goal);
+    if (callerId === root.ownerId || callerId === goal.ownerId) return true;
+    if (this.privateCrew.get(root.id)?.has(callerId)) return true;
+    if (await this.isCircleBuiltIn(callerId)) return true;
+    return !!msg && this.jobWorksFor(msg, root);
+  }
+
+  /**
+   * Whether a call made by a job comes from work on this private goal: the
+   * job was submitted by AgentAbject for a private task of the goal's tree
+   * (JobManager's invocation context names the task, AgentAbject its goal).
+   */
+  private async jobWorksFor(msg: AbjectMessage, root: Goal): Promise<boolean> {
+    const jobs = await this.discoverDep('JobManager').catch(() => null);
+    if (!jobs || msg.routing.from !== jobs || !this.agentAbjectId) return false;
+    try {
+      const context = await this.request<{ callerId?: AbjectId; taskId?: string } | null>(
+        request(this.id, jobs, 'getInvocationContext', { messageId: msg.header.messageId }), 10_000);
+      if (context?.callerId !== this.agentAbjectId || !context.taskId) return false;
+      const task = await this.request<{ private?: boolean; goalId?: string } | null>(
+        request(this.id, this.agentAbjectId, 'getTaskStatus', { taskId: context.taskId }), 10_000);
+      const taskGoal = task?.private === true && task.goalId ? this.goals.get(task.goalId) : undefined;
+      return !!taskGoal && this.rootOf(taskGoal).id === root.id;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * A goal as a message's sender may see it: the live goal, or undefined
+   * when it is unknown or private and the sender is outside its circle. The
+   * one lookup every handler addressed by goalId goes through.
+   */
+  private async goalFor(msg: AbjectMessage, goalId: GoalId | undefined): Promise<Goal | undefined> {
+    if (!goalId) return undefined;
+    const goal = this.goals.get(goalId);
+    if (!goal) return undefined;
+    return await this.inCircle(goal, msg.routing.from, msg) ? goal : undefined;
+  }
+
+  /** True when a goal id names a private goal the sender may not see (it reads as absent). */
+  private async hiddenFrom(msg: AbjectMessage, goalId: GoalId | undefined): Promise<boolean> {
+    if (!goalId || !this.isPrivateGoal(goalId)) return false;
+    return !(await this.goalFor(msg, goalId));
+  }
+
+  /** The goals a caller may see: every goal that is not private, and the private ones whose circle it is in. */
+  private async visibleTo(callerId: AbjectId, goals: Goal[]): Promise<Goal[]> {
+    if (!goals.some(g => this.isPrivateGoal(g.id))) return goals;
+    let builtIn: boolean | undefined;
+    const out: Goal[] = [];
+    for (const goal of goals) {
+      if (!this.isPrivateGoal(goal.id)) { out.push(goal); continue; }
+      const root = this.rootOf(goal);
+      const member = callerId === this.id || callerId === root.ownerId || !!this.privateCrew.get(root.id)?.has(callerId)
+        || (builtIn ??= await this.isCircleBuiltIn(callerId).catch(() => false));
+      if (member) out.push(goal);
+    }
+    return out;
+  }
+
+  /** Record an agent as crew of a private goal's tree. */
+  private addPrivateCrew(goalId: GoalId, agentId: AbjectId | undefined): void {
+    const goal = this.goals.get(goalId);
+    if (!agentId || !goal || !this.isPrivateGoal(goalId)) return;
+    const root = this.rootOf(goal).id;
+    let crew = this.privateCrew.get(root);
+    if (!crew) { crew = new Set(); this.privateCrew.set(root, crew); }
+    crew.add(agentId);
+  }
+
+  /**
+   * Announce a change about one goal. A goal that is not private goes to
+   * every dependent through changed(), exactly as before. A private one goes,
+   * marked `private: true` and in both shapes changed() uses, only to the
+   * dependents in its circle; a purged one goes nowhere.
+   */
+  private notifyGoal(goalId: GoalId | undefined, aspect: string, value: object): void {
+    if (!this.isPrivateGoal(goalId)) { this.changed(aspect, value); return; }
+    const goal = this.goals.get(goalId!);
+    if (!goal) return;
+    const marked = { ...value, private: true };
+    const targets = [...this.goalDependents];
+    this.privateNotices = this.privateNotices.then(async () => {
+      for (const depId of targets) {
+        if (!(await this.inCircle(goal, depId).catch(() => false))) continue;
+        try {
+          this.send(event(this.id, depId, 'changed', { aspect, value: marked }));
+          this.send(event(this.id, depId, aspect, marked));
+        } catch { /* stopped */ }
+      }
+    }).catch(() => { /* best effort */ });
+  }
+
+  protected override async admitsDependent(callerId: AbjectId): Promise<boolean> {
+    this.goalDependents.add(callerId);
+    return true;
+  }
+
+  /**
+   * Make a new private goal's stores: a private SharedState namespace for
+   * its registers, a private task queue for a root (sub-goals share the
+   * root's), and the LLM told to keep no text of calls made for it. A root
+   * whose queue cannot be made private is refused, so its tasks never land
+   * in a shared queue.
+   */
+  private async preparePrivateGoal(goal: Goal): Promise<void> {
+    if (this.sharedStateId) {
+      await this.request(request(this.id, this.sharedStateId, 'create', { name: this.goalNamespace(goal.id), private: true })).catch(() => undefined);
+    }
+    if (this.tupleSpaceId && !goal.parentId) {
+      try {
+        await this.request(request(this.id, this.tupleSpaceId, 'ensureNamespace', { namespace: goal.id, private: true }));
+      } catch (err) {
+        this.forgetGoalLocally(goal.id);
+        throw new Error(`Private goal storage unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const llmId = await this.discoverDep('LLM').catch(() => null);
+    if (llmId) await this.request(request(this.id, llmId, 'markPrivate', { goalId: goal.id, active: true }), 5000).catch(() => undefined);
+  }
+
+  /**
+   * The end of a private root goal: its outcome goes to the owner (waiting up
+   * to PRIVATE_OUTCOME_ACK_MS for it to be taken), else through ChatManager to
+   * its conversation, and then the goal is purged either way. Runs apart from
+   * the handler that ended the goal, which must not wait on the owner.
+   */
+  private async finishPrivateGoal(rootId: GoalId, status: PrivateGoalOutcome['status']): Promise<void> {
+    const goal = this.goals.get(rootId);
+    if (!goal?.private || goal.parentId || this.finishingPrivateGoals.has(rootId)) return;
+    this.finishingPrivateGoals.add(rootId);
+    try {
+      const outcome: PrivateGoalOutcome = {
+        goalId: rootId, status,
+        ...(goal.conversationId ? { conversationId: goal.conversationId } : {}),
+        ...(goal.result !== undefined ? { result: goal.result } : {}),
+        ...(goal.error ? { error: goal.error } : {}),
+      };
+      let accepted = false;
+      if (goal.ownerId) {
+        const reply = await this.request<{ accepted?: boolean } | null>(
+          request(this.id, goal.ownerId, 'privateGoalOutcome', outcome), PRIVATE_OUTCOME_ACK_MS).catch(() => null);
+        accepted = reply?.accepted === true;
+      }
+      if (!accepted && goal.conversationId) {
+        const chatManagerId = await this.discoverDep('ChatManager').catch(() => null);
+        if (chatManagerId) {
+          const reply = await this.request<{ accepted?: boolean } | null>(
+            request(this.id, chatManagerId, 'deliverPrivateOutcome', { conversationId: goal.conversationId, outcome }), PRIVATE_OUTCOME_ACK_MS).catch(() => null);
+          accepted = reply?.accepted === true;
+        }
+      }
+      if (!accepted) log.warn(`private goal ${rootId.slice(0, 8)}: its outcome was not taken; deleting it anyway`);
+    } finally {
+      this.finishingPrivateGoals.delete(rootId);
+      await this.purgePrivateGoal(rootId).catch(err => log.warn(`private goal ${rootId.slice(0, 8)} purge failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }
+
+  /**
+   * Drop every trace of a private goal tree: the runtime, planner, job runner
+   * and observer forget its tasks, its task queue and SharedState namespaces
+   * are removed, the LLM stops treating it as private, and nothing of it stays
+   * in memory but its id (so a late event about it is never broadcast).
+   * Idempotent.
+   */
+  private async purgePrivateGoal(rootId: GoalId): Promise<void> {
+    const root = this.goals.get(rootId);
+    if (!root?.private) return;
+    const goalIds = this.goalAndDescendants(rootId);
+    const namespaces = goalIds.map(id => this.goalNamespace(id));
+    for (const id of goalIds) {
+      this.forgottenPrivateGoals.add(id);
+      if (this.forgottenPrivateGoals.size > GoalManager.FORGOTTEN_MAX) {
+        this.forgottenPrivateGoals.delete(this.forgottenPrivateGoals.values().next().value as GoalId);
+      }
+    }
+    let taskIds: string[] = [];
+    if (this.tupleSpaceId) {
+      const tuples = await this.request<Array<{ id: string }>>(
+        request(this.id, this.tupleSpaceId, 'scan', { pattern: {}, namespace: rootId })).catch(() => [] as Array<{ id: string }>);
+      taskIds = (tuples ?? []).map(t => t.id);
+    }
+    for (const name of GoalManager.PRIVATE_FORGETTERS) {
+      const id = await this.discoverDep(name).catch(() => null);
+      if (!id) continue;
+      try { this.send(event(this.id, id, 'forgetPrivateGoal', { goalId: rootId, taskIds })); } catch { /* stopped */ }
+    }
+    if (this.tupleSpaceId) {
+      await this.request(request(this.id, this.tupleSpaceId, 'removeNamespace', { namespace: rootId })).catch(() => undefined);
+    }
+    if (this.sharedStateId) {
+      for (const name of namespaces) await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name })).catch(() => undefined);
+    }
+    const llmId = await this.discoverDep('LLM').catch(() => null);
+    for (const goalId of goalIds) {
+      if (llmId) try { this.send(request(this.id, llmId, 'markPrivate', { goalId, active: false })); } catch { /* stopped */ }
+      this.forgetGoalLocally(goalId);
+    }
+    for (const taskId of taskIds) this.emittedTerminalTasks.delete(taskId);
+    this.privateCrew.delete(rootId);
+    log.info(`private goal ${rootId.slice(0, 8)} deleted, with ${goalIds.length - 1} sub-goal(s) and ${taskIds.length} task(s)`);
+  }
+
+  /** Remove one goal from every in-memory map. */
+  private forgetGoalLocally(goalId: GoalId): void {
+    this.goals.delete(goalId);
+    const idx = this.goalOrder.indexOf(goalId);
+    if (idx !== -1) this.goalOrder.splice(idx, 1);
+    this.publishedScratch.delete(goalId);
+    for (const key of [...this.scratchStamps.keys()]) if (key.startsWith(`${goalId}::`)) this.scratchStamps.delete(key);
+    for (const key of [...this.remoteTasks.keys()]) if (key.startsWith(`${goalId}::`)) this.remoteTasks.delete(key);
+    for (const key of [...this.readyForCompletionEmitted]) if (key.startsWith(`${goalId}#`)) this.readyForCompletionEmitted.delete(key);
+    this.collaborators.delete(goalId);
+    this.catalogStamps.delete(goalId);
+    this.remoteGoalIds.delete(goalId);
+  }
+
   /** GoalManager is spawned before the runtime; retry a missing dependency on use. */
   private async taskRuntime(): Promise<AbjectId | undefined> {
     this.agentAbjectId ??= await this.discoverDep('AgentAbject') ?? undefined;
@@ -400,7 +706,7 @@ export class GoalManager extends Abject {
 
     // Clean up per-goal SharedState namespace
     if (this.sharedStateId) {
-      const stateNs = `goal-${goalId}`;
+      const stateNs = this.goalNamespace(goalId);
       try {
         await this.request(request(this.id, this.sharedStateId, 'delete', { name: stateNs, key: 'meta' }));
       } catch { /* best effort */ }
@@ -449,16 +755,21 @@ export class GoalManager extends Abject {
     goal.error = error;
     goal.updatedAt = Date.now();
 
-    goal.scratchpad['learning/review'] = 'pending';
-    this.countFinishedGoal();
+    const isPrivate = this.isPrivateGoal(goalId);
+    if (!isPrivate) {
+      goal.scratchpad['learning/review'] = 'pending';
+      this.countFinishedGoal();
+    }
     await this.persistLearning(goal);
-    log.info(`Goal failed: "${goal.title}" (${goalId}) — ${error ?? 'unknown'}`);
-    this.changed('goalFailed', { goalId, error });
+    log.info(`Goal failed: "${shown(goal.title, isPrivate)}" (${goalId}) — ${shown(error ?? 'unknown', isPrivate)}`);
+    this.notifyGoal(goalId, 'goalFailed', { goalId, error });
     this.syncGoalToSharedState(goal);
+    if (isPrivate && !goal.parentId) void this.finishPrivateGoal(goalId, 'failed');
   }
 
+  /** A goal's SharedState namespace: private (memory only, owned here) for a private goal. */
   private goalNamespace(goalId: GoalId): string {
-    return `goal-${goalId}`;
+    return this.isPrivateGoal(goalId) ? `private-goal-${goalId}` : `goal-${goalId}`;
   }
 
   /**
@@ -478,8 +789,14 @@ export class GoalManager extends Abject {
   /** Fire-and-forget write of one collaborative register. */
   private setRegister(goalId: GoalId, key: string, value: unknown): void {
     if (!this.sharedStateId) return;
+    // A private goal's registers stay in its private namespace, in memory;
+    // a purged one writes nowhere.
+    const isPrivate = this.isPrivateGoal(goalId);
+    if (isPrivate && !this.goals.has(goalId)) return;
     this.request(
-      request(this.id, this.sharedStateId, 'set', {
+      request(this.id, this.sharedStateId, 'set', isPrivate
+        ? { name: this.goalNamespace(goalId), key, value, persist: false, private: true }
+        : {
         name: this.goalNamespace(goalId),
         key,
         value,
@@ -539,7 +856,7 @@ export class GoalManager extends Abject {
         error: error.slice(0, 2000),
         history,
         produces: ((fields.produces as Array<{ key: string }>) ?? []).map(p => p.key),
-      }, failureQuestions(GoalManager.TASK_FAILURE_KINDS), { goalId, taskId, onBehalfOf: 'GoalManager', timeoutMs: GoalManager.FAILURE_CLASSIFY_WAIT_MS });
+      }, failureQuestions(GoalManager.TASK_FAILURE_KINDS), { goalId, taskId, onBehalfOf: 'GoalManager', timeoutMs: GoalManager.FAILURE_CLASSIFY_WAIT_MS, ...(this.isPrivateGoal(goalId) ? { private: true } : {}) });
       const kind = choiceOf(outcome, 'failure_kind');
       if (!outcome || !kind) return;
       const p = kind.probabilities[kind.choice] ?? 0;
@@ -570,10 +887,10 @@ export class GoalManager extends Abject {
     const outputs = produces.slice(0, 16).map(p => ({ key: p.key, description: String(p.description ?? '').slice(0, 300), value: stringify(goal.scratchpad[p.key]).slice(0, 1500) }));
     const outcome = await this.askDecision('goal.produces', {
       task: String(fields.description ?? '').slice(0, 1500), outputs,
-    }, producesQuestions(outputs.map(o => o.key)), { goalId: goal.id, taskId, onBehalfOf: 'GoalManager', timeoutMs: 20000 });
+    }, producesQuestions(outputs.map(o => o.key)), { goalId: goal.id, taskId, onBehalfOf: 'GoalManager', timeoutMs: 20000, ...(this.isPrivateGoal(goal.id) ? { private: true } : {}) });
     if (!outcome) return undefined;
     const failing = outputs.filter((_, i) => (noulOf(outcome, `satisfied_${i}`) ?? 1) <= 0.1);
-    log.info(`[decision:${outcome.mode}] goal.produces ${taskId.slice(0, 8)}: ${failing.length}/${outputs.length} judged unsatisfied${failing.length ? ` (${failing.map(o => o.key).join(', ')})` : ''}`);
+    log.info(`[decision:${outcome.mode}] goal.produces ${taskId.slice(0, 8)}: ${failing.length}/${outputs.length} judged unsatisfied${failing.length ? ` (${shown(failing.map(o => o.key).join(', '), this.isPrivateGoal(goal.id))})` : ''}`);
     if (outcome.mode !== 'act' || failing.length === 0) return undefined;
     return failing.map(o => `Output ${o.key} does not deliver: ${o.description || 'its declared purpose'}`).join('; ');
   }
@@ -686,7 +1003,7 @@ export class GoalManager extends Abject {
       if (reg.value === undefined) delete goal.scratchpad[name];
       else goal.scratchpad[name] = reg.value;
       goal.updatedAt = Date.now();
-      this.changed('goalUpdated', { goalId, message: `scratchpad.${name} updated by ${String(reg.peerId).slice(0, 8)}` });
+      this.notifyGoal(goalId, 'goalUpdated', { goalId, message: `scratchpad.${name} updated by ${String(reg.peerId).slice(0, 8)}` });
       return;
     }
 
@@ -702,7 +1019,7 @@ export class GoalManager extends Abject {
       this.mergeRemoteProgress(goal, peerId, reg.entries);
       // A collaborator's progress reads like our own: its latest line.
       const latest = reg.entries.filter(e => e && typeof e.timestamp === 'number').at(-1);
-      this.changed('goalUpdated', {
+      this.notifyGoal(goalId, 'goalUpdated', {
         goalId, parentId: goal.parentId,
         message: latest?.message ?? 'Collaborator progress',
         ...(latest?.phase ? { phase: latest.phase } : {}),
@@ -720,7 +1037,7 @@ export class GoalManager extends Abject {
       if (!this.registerWins(rec, this.remoteTasks.get(mapKey))) return;
       const merged: RemoteTaskProgress = { ...rec, taskId, goalId };
       this.remoteTasks.set(mapKey, merged);
-      this.changed('taskProgress', merged);
+      this.notifyGoal(goalId, 'taskProgress', merged);
       return;
     }
 
@@ -732,7 +1049,7 @@ export class GoalManager extends Abject {
       const existing = roster.get(rec.peerId);
       if (existing && existing.lastSeenAt >= rec.lastSeenAt) return;
       roster.set(rec.peerId, rec);
-      this.changed('collaboratorsChanged', { goalId, collaborators: Array.from(roster.values()) });
+      this.notifyGoal(goalId, 'collaboratorsChanged', { goalId, collaborators: Array.from(roster.values()) });
     }
   }
 
@@ -793,6 +1110,8 @@ export class GoalManager extends Abject {
     if (!this.sharedStateId) return;
     // Never re-advertise a goal we merely mirror: its owner is the publisher.
     if (this.remoteGoalIds.has(goal.id)) return;
+    // A private goal is never offered to peers.
+    if (this.isPrivateGoal(goal.id)) return;
     const record = {
       goalId: goal.id,
       title: goal.title,
@@ -813,7 +1132,7 @@ export class GoalManager extends Abject {
 
   /** Mark a goal gone in the catalog so peers stop resurrecting it on boot. */
   private publishCatalogTombstone(goalId: GoalId): void {
-    if (!this.sharedStateId) return;
+    if (!this.sharedStateId || this.isPrivateGoal(goalId)) return;
     const stamp = { updatedAt: Date.now(), peerId: this.selfPeerId };
     this.catalogStamps.set(goalId, stamp);
     this.remoteGoalIds.delete(goalId);
@@ -849,7 +1168,7 @@ export class GoalManager extends Abject {
 
     const owner = record.ownerPeerId ?? stamp.peerId;
     if (owner === this.selfPeerId) return;
-    if (this.goals.has(goalId)) return;
+    if (this.goals.has(goalId) || this.isPrivateGoal(goalId)) return;
 
     this.remoteGoalIds.add(goalId);
     await this.joinRemoteGoal(goalId);
@@ -925,6 +1244,8 @@ export class GoalManager extends Abject {
                 { name: 'parentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent goal ID for sub-goals', optional: true },
                 { name: 'operationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-owned handoff identity; retries return the same goal', optional: true },
                 { name: 'context', type: protocolObject, description: 'Conversation snapshot with stable message and source goal references', optional: true },
+                { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'True for a goal from a private conversation: kept in memory only, readable only by its circle (the caller, the planner, the runtime and its crew), never learned from, and deleted once its outcome reaches the caller. A sub-goal of a private goal is private too.', optional: true },
+                { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'The private conversation the goal belongs to, where its outcome goes if the caller is gone', optional: true },
               ],
               returns: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -1349,6 +1670,16 @@ export class GoalManager extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    // Keep goalDependents in step with the base dependency protocol, which
+    // registers its handlers before onInit: targeted private events go only to
+    // callers still subscribed.
+    const removeDependent = this.handlers.get('removeDependent');
+    this.on('removeDependent', async (msg: AbjectMessage) => {
+      this.goalDependents.delete(msg.routing.from);
+      return removeDependent?.(msg);
+    });
+    this.on('recipientGone', async (msg: AbjectMessage) => { this.goalDependents.delete(msg.routing.from); });
+
     this.tupleSpaceId = await this.discoverDep('TupleSpace') ?? undefined;
     this.sharedStateId = await this.discoverDep('SharedState') ?? undefined;
     this.storageId = await this.discoverDep('Storage') ?? undefined;
@@ -1855,6 +2186,8 @@ export class GoalManager extends Abject {
    */
   private coldArchivable(goal: Goal, now: number): boolean {
     if (!['completed', 'failed', 'archived'].includes(goal.status)) return false;
+    // A private goal is deleted when it ends, never archived.
+    if (this.isPrivateGoal(goal.id)) return false;
     // Only goals this peer created. A collaborator's goal in a shared
     // workspace is theirs to archive: archiving it here would either come
     // back through the catalog or, with a tombstone, vanish for everyone.
@@ -2000,7 +2333,8 @@ export class GoalManager extends Abject {
     try {
       await this.request(request(this.id, this.storageId, 'set', {
         key: 'goals:index',
-        value: this.goalOrder,
+        // Private goals are never written down.
+        value: this.goalOrder.filter(id => !this.isPrivateGoal(id)),
       }));
     } catch { /* best effort */ }
   }
@@ -2127,10 +2461,11 @@ hear assumptionResolved and goalReaction.
   protected override async handleAsk(question: string): Promise<string> {
     let prompt = this.askPrompt(question);
 
-    // Include current goal status summary
-    const active = [...this.goals.values()].filter(g => g.status === 'active');
-    const completed = [...this.goals.values()].filter(g => g.status === 'completed');
-    const failed = [...this.goals.values()].filter(g => g.status === 'failed');
+    // Include current goal status summary (private goals are never named)
+    const listed = [...this.goals.values()].filter(g => !this.isPrivateGoal(g.id));
+    const active = listed.filter(g => g.status === 'active');
+    const completed = listed.filter(g => g.status === 'completed');
+    const failed = listed.filter(g => g.status === 'failed');
     prompt += `\n\n### Current State\n`;
     prompt += `${active.length} active, ${completed.length} completed, ${failed.length} failed goals.\n`;
     if (active.length > 0) {
@@ -2163,6 +2498,8 @@ hear assumptionResolved and goalReaction.
 
     for (const [id, goal] of this.goals) {
       if (goal.scratchpad['learning/review'] === 'pending' || this.hasPendingLearning(goal)) continue;
+      // A private goal leaves when its outcome is delivered (finishPrivateGoal).
+      if (this.isPrivateGoal(id)) continue;
       switch (goal.status) {
         case 'active':
           // GoalObserver owns liveness decisions; a read must not abandon running work.
@@ -2285,7 +2622,7 @@ hear assumptionResolved and goalReaction.
     }
     this.readyForCompletionEmitted.add(scrumKey);
     log.info(`Goal ${goalId.slice(0, 8)} scrum ${goal.currentScrumNumber} ready for review (creator=${goal.createdBy.slice(0, 8)}, ${doneTaskIds.length} done, ${failedTaskIds.length} failed)`);
-    this.changed('goalReadyForCompletion', {
+    this.notifyGoal(goalId, 'goalReadyForCompletion', {
       goalId,
       scrumNumber: goal.currentScrumNumber,
       creatorAgentId: goal.createdBy,
@@ -2306,6 +2643,27 @@ hear assumptionResolved and goalReaction.
     } catch { /* best effort — creator may be gone */ }
   }
 
+  /** A task reached a terminal state in TupleSpace (another peer, or a private queue): announce it once. */
+  private onTupleUpdated(tuple: { id: string; fields: Record<string, unknown> }): void {
+    const taskId = tuple.id;
+    const status = tuple.fields?.status as string | undefined;
+    const goalId = tuple.fields?.goalId as string | undefined;
+
+    if (status === 'permanently_failed' && !this.emittedTerminalTasks.has(taskId)) {
+      this.emittedTerminalTasks.add(taskId);
+      const err = (tuple.fields?.error as string) ?? 'Task permanently failed (remote)';
+      const attempts = (tuple.fields?.attempts as number) ?? 0;
+      log.info(`Remote permanently_failed detected for ${taskId.slice(0, 8)}`);
+      this.notifyGoal(goalId, 'taskPermanentlyFailed', { taskId, goalId, error: err, attempts });
+    }
+    if (status === 'done' && !this.emittedTerminalTasks.has(taskId)) {
+      this.emittedTerminalTasks.add(taskId);
+      const result = tuple.fields?.result;
+      log.info(`Remote task completion detected for ${taskId.slice(0, 8)}`);
+      this.notifyGoal(goalId, 'taskCompleted', { taskId, goalId, result });
+    }
+  }
+
   /**
    * Sync goal metadata to its per-goal SharedState namespace.
    * Each goal gets namespace `goal-{uuid}` for selective cross-peer sync.
@@ -2314,6 +2672,10 @@ hear assumptionResolved and goalReaction.
     // A cold-archived goal brought back for a reaction review stays local:
     // its namespace and catalog entry were retired when it was archived.
     if (!this.sharedStateId || this.coldIndex.has(goal.id)) return;
+    // A private goal's meta goes to its private namespace (memory only, never
+    // in the catalog); a purged one goes nowhere.
+    const isPrivate = this.isPrivateGoal(goal.id);
+    if (isPrivate && !this.goals.has(goal.id)) return;
     // Every goal mutation funnels through here, so advertising the goal in the
     // shared catalog at this one point keeps the index complete without
     // touching each of the mutation call sites.
@@ -2321,7 +2683,7 @@ hear assumptionResolved and goalReaction.
     this.publishChangedScratch(goal);
     try {
       await this.request(request(this.id, this.sharedStateId, 'set', {
-        name: `goal-${goal.id}`,
+        name: this.goalNamespace(goal.id),
         key: 'meta',
         value: {
           id: goal.id,
@@ -2340,8 +2702,10 @@ hear assumptionResolved and goalReaction.
           currentScrumNumber: goal.currentScrumNumber,
           interjections: goal.interjections,
           ...(goal.pendingQuestion ? { pendingQuestion: goal.pendingQuestion } : {}),
+          ...(isPrivate ? { private: true, ownerId: goal.ownerId, conversationId: goal.conversationId } : {}),
         },
-        persist: true,
+        persist: !isPrivate,
+        ...(isPrivate ? { private: true } : {}),
       }));
     } catch { /* best effort */ }
   }
@@ -2349,6 +2713,8 @@ hear assumptionResolved and goalReaction.
   /** Snapshot learning records before publication; SharedState distributes the same owner state. */
   private async persistLearning(goal: Goal, required = false): Promise<void> {
     return withKeyedLock(`${this.id}:learning-persist:${goal.id}`, async () => {
+    // A private goal has no journal: it lives in memory and its private namespace.
+    if (this.isPrivateGoal(goal.id)) { await this.syncGoalToSharedState(goal); return; }
     if (required && !this.storageId) throw new Error('Learning journal persistence unavailable');
     if (this.storageId) {
       const saved = await this.request<unknown>(request(this.id, this.storageId, 'set', {
@@ -2383,11 +2749,13 @@ hear assumptionResolved and goalReaction.
     ]);
     this.on('getLearningDecision', async msg => {
       const p = msg.payload as { goalId: string; decisionId: string };
+      if (this.isPrivateGoal(p.goalId)) return null; // a private goal makes no learning decisions
       return withKeyedLock(`${this.id}:decisions:${p.goalId}`, async () => structuredClone(this.goals.get(p.goalId)?.scratchpad[`learning/decision/${p.decisionId}`] ?? null));
     });
     this.on('getLearningEvidence', async msg => {
       const p = msg.payload as { goalId: string; decisionId: string };
       if (!await this.isBuiltInCaller(msg.routing.from, ['TaskReviewer'])) throw new Error('Learning evidence is read by TaskReviewer');
+      if (this.isPrivateGoal(p.goalId)) return null;
       const goal = this.goals.get(p.goalId);
       const decision = goal?.scratchpad[`learning/decision/${p.decisionId}`] as LearningDecision | undefined;
       if (!decision) return null;
@@ -2401,6 +2769,7 @@ hear assumptionResolved and goalReaction.
       const reactionKinds: Record<string, number> = {}, assumptionStatuses: Record<string, number> = {};
       let reactions = 0, awaitingReactionReview = 0, assumptions = 0;
       for (const goal of this.goals.values()) {
+        if (this.isPrivateGoal(goal.id)) continue; // nothing private is learned
         if (goal.scratchpad['learning/reactionReview'] === 'pending') awaitingReactionReview++;
         for (const a of this.assumptionsOf(goal)) { assumptions++; assumptionStatuses[a.status] = (assumptionStatuses[a.status] ?? 0) + 1; }
         for (const [key, value] of Object.entries(goal.scratchpad)) {
@@ -2488,8 +2857,10 @@ hear assumptionResolved and goalReaction.
             if (previous === undefined) delete goal.scratchpad['goal/assumptions']; else goal.scratchpad['goal/assumptions'] = previous;
             throw err;
           }
-          this.statsWeek(now).assumptions += added;
-          this.learningStatsChanged();
+          if (!this.isPrivateGoal(goalId)) {
+            this.statsWeek(now).assumptions += added;
+            this.learningStatsChanged();
+          }
         }
         return { success: true, assumptions: structuredClone(list) };
       });
@@ -2517,8 +2888,8 @@ hear assumptionResolved and goalReaction.
         list[index] = next;
         goal.scratchpad['goal/assumptions'] = list;
         try { await this.persistLearning(goal); } catch (err) { goal.scratchpad['goal/assumptions'] = previous; throw err; }
-        if (before.status !== next.status) this.countAssumptionStatus(next.status);
-        this.changed('assumptionResolved', { goalId, assumption: structuredClone(next) });
+        if (before.status !== next.status && !this.isPrivateGoal(goalId)) this.countAssumptionStatus(next.status);
+        this.notifyGoal(goalId, 'assumptionResolved', { goalId, assumption: structuredClone(next) });
         return { success: true, assumption: structuredClone(next) };
       });
     });
@@ -2526,6 +2897,7 @@ hear assumptionResolved and goalReaction.
     this.on('getAssumptions', async msg => {
       const { goalId } = msg.payload as { goalId: GoalId };
       requireNonEmpty(goalId, 'goalId');
+      if (await this.hiddenFrom(msg, goalId)) return [];
       const goal = this.goals.get(goalId) ?? await this.readRetainedGoal(goalId).catch(() => null);
       return goal ? structuredClone(this.assumptionsOf(goal)) : [];
     });
@@ -2538,6 +2910,8 @@ hear assumptionResolved and goalReaction.
       if (!kind) return { success: false, error: 'kind must be satisfied, correction, redirect, unhappy or neutral' };
       if (typeof p.text !== 'string' || !p.text.trim()) return { success: false, error: 'A reaction needs the person\'s words' };
       if (p.source !== 'chat' && p.source !== 'interjection') return { success: false, error: 'source must be chat or interjection' };
+      // Nothing private is learned: a reaction to a private goal is taken and dropped.
+      if (this.isPrivateGoal(p.goalId)) return { success: true };
       const reaction: Reaction = {
         kind, text: p.text.trim().slice(0, 2000), source: p.source, at: Date.now(),
         ...(typeof p.wanted === 'string' && p.wanted.trim() ? { wanted: p.wanted.trim().slice(0, 1000) } : {}),
@@ -2570,7 +2944,7 @@ hear assumptionResolved and goalReaction.
     });
 
     this.on('pendingReactionReviews', async () => [...this.goals.values()]
-      .filter(g => g.scratchpad['learning/reactionReview'] === 'pending')
+      .filter(g => g.scratchpad['learning/reactionReview'] === 'pending' && !this.isPrivateGoal(g.id))
       .map(g => ({
         goalId: g.id,
         reactions: Object.entries(g.scratchpad).filter(([key, r]) => key.startsWith('learning/reaction/') && isNegativeReaction((r as Reaction).kind)).map(([, r]) => structuredClone(r)),
@@ -2580,7 +2954,7 @@ hear assumptionResolved and goalReaction.
       const p = msg.payload as { goalId: string; decisionId: string; effectId: string; requester: string };
       if (msg.routing.from !== await this.discoverDep('KnowledgeBase') || p.requester !== await this.discoverDep('TaskReviewer')) throw new Error('Learning effects must be delivered by TaskReviewer to KnowledgeBase');
       return withKeyedLock(`${this.id}:decisions:${p.goalId}`, async () => {
-      const decision = this.goals.get(p.goalId)?.scratchpad[`learning/decision/${p.decisionId}`] as LearningDecision | undefined;
+      const decision = (this.isPrivateGoal(p.goalId) ? undefined : this.goals.get(p.goalId)?.scratchpad[`learning/decision/${p.decisionId}`]) as LearningDecision | undefined;
       const effect = decision?.effects.find(e => e.id === p.effectId);
       if (!decision || !effect) return { success: false, error: 'Unknown learning effect' };
       return { success: true, decision: structuredClone(decision), effect: structuredClone(effect), validationError: validateLearningEffect(decision, effect) ?? null };
@@ -2588,7 +2962,7 @@ hear assumptionResolved and goalReaction.
     });
     this.on('getLearningStatus', async () => {
       await this.loadLearningTotals();
-      const decisions = [...this.goals.values()].flatMap(g => Object.entries(g.scratchpad).filter(([k]) => k.startsWith('learning/decision/')).map(([,d]) => d as LearningDecision));
+      const decisions = [...this.goals.values()].filter(g => !this.isPrivateGoal(g.id)).flatMap(g => Object.entries(g.scratchpad).filter(([k]) => k.startsWith('learning/decision/')).map(([,d]) => d as LearningDecision));
       const effects = decisions.flatMap(d => d.effects);
       const count = (state: string) => effects.filter(e => e.state === state).length;
       const open = (e: LearningEffect) => !['applied','abandoned'].includes(e.state);
@@ -2610,13 +2984,14 @@ hear assumptionResolved and goalReaction.
         oldestPendingAgeMs: Math.max(0,...decisions.filter(d => d.effects.some(open)).map(d => Date.now()-d.createdAt)),
         items: decisions.map(d => ({ decisionId:d.id,goalId:d.goalId,effects:d.effects.map(e => ({id:e.id,target:e.input.id,state:e.state,error:e.error,nextAttemptAt:e.nextAttemptAt})) })) };
     });
-    this.on('pendingLearningDecisions', async () => (await Promise.all([...this.goals.values()].map(g => withKeyedLock(`${this.id}:decisions:${g.id}`, async () => Object.entries(g.scratchpad)
+    this.on('pendingLearningDecisions', async () => (await Promise.all([...this.goals.values()].filter(g => !this.isPrivateGoal(g.id)).map(g => withKeyedLock(`${this.id}:decisions:${g.id}`, async () => Object.entries(g.scratchpad)
       .filter(([k,v]) => k.startsWith('learning/decision/') && (v as LearningDecision).effects.some(e => !['applied','abandoned'].includes(e.state)))
       .map(([,v]) => structuredClone(v)))))).flat());
     for (const method of ['recordLearningDecision', 'changeLearningEffect', 'claimLearningRepair', 'resumeLearningDecision']) {
       this.on(method, async msg => {
         const p = msg.payload as Record<string, any>;
-        const goal = this.goals.get(p.goalId);
+        // A private goal makes no learning decisions; it reads as absent.
+        const goal = this.isPrivateGoal(p.goalId) ? undefined : this.goals.get(p.goalId);
         if (!goal) throw new Error('Goal evidence unavailable');
         const reviewer = await this.discoverDep('TaskReviewer');
         if (msg.routing.from !== reviewer && !(method === 'resumeLearningDecision' && msg.routing.from === goal.createdBy)) throw new Error('Learning decisions belong to TaskReviewer');
@@ -2779,6 +3154,8 @@ hear assumptionResolved and goalReaction.
   private async readRetainedGoal(goalId: string): Promise<Goal | null> {
     const live = this.goals.get(goalId);
     if (live) return structuredClone(live);
+    // A purged private goal was never written anywhere.
+    if (this.forgottenPrivateGoals.has(goalId)) return null;
     const cold = await this.readColdGoal(goalId);
     if (cold) return cold;
     if (!this.storageId) return null;
@@ -2788,11 +3165,21 @@ hear assumptionResolved and goalReaction.
     return { ...saved.goalState, progress: [], interjections: [], currentScrumNumber: 0, childIds: [], scratchpad: saved.scratchpad } as Goal;
   }
 
+  /**
+   * A private source goal is readable through a goal's conversation context
+   * only by a private goal of the same conversation.
+   */
+  private sourceShared(goal: Goal, source: Goal): boolean {
+    if (!this.isPrivateGoal(source.id)) return true;
+    return this.isPrivateGoal(goal.id) && !!source.conversationId && this.rootOf(goal).conversationId === source.conversationId;
+  }
+
   private async goalContextBriefing(goal: Goal): Promise<unknown> {
     const context = goal.scratchpad[CONVERSATION_CONTEXT_KEY] as ConversationContext | undefined;
     if (!context) return undefined;
     const sources = await Promise.all(context.sourceGoalIds.map(async sourceGoalId => {
       let source = await this.readRetainedGoal(sourceGoalId).catch(() => null);
+      if (source && !this.sourceShared(goal, source)) source = null;
       const sourceContext = source?.scratchpad[CONVERSATION_CONTEXT_KEY] as ConversationContext | undefined;
       if (source && (sourceContext ? sourceContext.conversationId !== context.conversationId : source.createdBy !== goal.createdBy)) source = null;
       const keys = Object.keys(source?.scratchpad ?? {}).filter(k => !/^(learning|routing|context)\//.test(k));
@@ -2816,10 +3203,45 @@ hear assumptionResolved and goalReaction.
       { name: "pendingReviews", description: "List goal retrospectives awaiting acknowledgement.", parameters: {  } },
       { name: "ackReview", description: "Acknowledge a completed retrospective.", parameters: { "goalId": protocolText } },
       { name: "assessTask", description: "Check required outputs and active task state before completion.", parameters: { "goalId": protocolText, "taskId": protocolText } },
+      { name: 'addCrew', description: 'Add an agent to a private goal\'s crew, so it may read the goal and hear its events while it works on it. Sent by the runtime or the planner (built-in AgentAbject or ScrumMaster) before the agent starts. Returns { success }.', parameters: { goalId: protocolText, agentId: protocolText } },
+      { name: 'purgeConversationGoals', description: 'ChatManager deletes a private conversation: every private goal it started is stopped and deleted without delivering its outcome. Returns { purged }.', parameters: { conversationId: protocolText } },
     ]);
+    this.on('addCrew', async (msg: AbjectMessage) => {
+      const { goalId, agentId } = msg.payload as { goalId: GoalId; agentId: AbjectId };
+      requireNonEmpty(goalId, 'goalId');
+      requireNonEmpty(agentId, 'agentId');
+      if (!await this.isBuiltInCaller(msg.routing.from, ['AgentAbject', 'ScrumMaster'])) throw new Error('Crew is added by the runtime or the planner');
+      if (!this.goals.has(goalId) || !this.isPrivateGoal(goalId)) return { success: false };
+      this.addPrivateCrew(goalId, agentId);
+      return { success: true };
+    });
+
+    this.on('purgeConversationGoals', async (msg: AbjectMessage) => {
+      const { conversationId } = msg.payload as { conversationId: string };
+      requireNonEmpty(conversationId, 'conversationId');
+      if (!await this.isBuiltInCaller(msg.routing.from, ['ChatManager'])) throw new Error('Conversation goals are purged by ChatManager');
+      const roots = [...this.goals.values()].filter(g => g.private && !g.parentId && g.conversationId === conversationId);
+      for (const root of roots) {
+        // Stopped first so no agent keeps working on it, then deleted with no delivery.
+        this.finishingPrivateGoals.add(root.id);
+        if (root.status === 'active' || root.status === 'paused') {
+          await this.cancelTasksForGoalInternal(root.id).catch(() => undefined);
+          root.status = 'failed';
+          root.error = 'Conversation deleted';
+          root.updatedAt = Date.now();
+          this.notifyGoal(root.id, 'goalFailed', { goalId: root.id, error: 'Conversation deleted' });
+        }
+        await this.purgePrivateGoal(root.id);
+        this.finishingPrivateGoals.delete(root.id);
+      }
+      return { purged: roots.length };
+    });
+
     this.on('recordTaskEvidence', async (msg: AbjectMessage) => {
       const { goalId, taskId, record } = msg.payload as { goalId: string; taskId: string; record: unknown };
-      const goal = this.goals.get(goalId);
+      // A private goal keeps its task records in memory for the planner and
+      // drops them with the goal; they are never written down or reviewed.
+      const goal = await this.goalFor(msg, goalId);
       if (!goal) return { success: false };
       requireNonEmpty(taskId, 'taskId');
       goal.scratchpad[`learning/task/${taskId}`] = record;
@@ -2830,6 +3252,8 @@ hear assumptionResolved and goalReaction.
     this.on('recordPredictionAssessment', async (msg: AbjectMessage) => {
       if (msg.routing.from !== await this.discoverDep('TaskReviewer')) throw new Error('Prediction assessments belong to TaskReviewer');
       const { goalId, taskId, step, verdict, explanation } = msg.payload as { goalId: GoalId; taskId: string; step: number; verdict: string; explanation: string };
+      // Nothing private is learned: an assessment of a private goal is taken and dropped.
+      if (this.isPrivateGoal(goalId)) return { success: true };
       const goal = this.goals.get(goalId);
       if (!goal) return { success: false, error: 'Goal evidence unavailable' };
       if (!['supported', 'contradicted', 'unresolved'].includes(verdict) || !explanation?.trim()) return { success: false, error: 'Assessment requires a verdict and explanation grounded in evidence' };
@@ -2886,8 +3310,11 @@ hear assumptionResolved and goalReaction.
 
     this.on('recordObservation', async (msg: AbjectMessage) => {
       const { goalId, operationId, observation } = msg.payload as { goalId: string; operationId: string; observation: unknown };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || goal.status !== 'active') return { success: false };
+      // A private goal keeps its observations in memory for the next scrum:
+      // none goes to the evidence store or counts toward the learning curve.
+      const isPrivate = this.isPrivateGoal(goalId);
       requireNonEmpty(operationId, 'operationId');
       const key = `learning/observation/${operationId}`;
       if (key in goal.scratchpad) { await this.persistLearning(goal); return { success: true, duplicate: true }; }
@@ -2896,7 +3323,7 @@ hear assumptionResolved and goalReaction.
       // The record keeps an excerpt and the hash, and readGoalData returns
       // it whole, so the evidence stays complete while every checkpoint of
       // this goal stops carrying it.
-      if (this.storageId && typeof recorded.actual === 'string' && recorded.actual.length > OBSERVATION_INLINE_CAP) {
+      if (!isPrivate && this.storageId && typeof recorded.actual === 'string' && recorded.actual.length > OBSERVATION_INLINE_CAP) {
         const full = recorded.actual;
         const reference = await this.storeEvidence(full);
         recorded.actual = `${full.slice(0, OBSERVATION_INLINE_CAP / 2)}\n[... ${full.length} chars in all; readGoalData on this key returns the whole result ...]\n${full.slice(-OBSERVATION_INLINE_CAP / 4)}`;
@@ -2914,19 +3341,19 @@ hear assumptionResolved and goalReaction.
         : undefined;
       if (preAction) {
         for (const field of ['confidence', 'contextKey', 'occurrence']) if (recorded[field] === undefined && preAction[field] !== undefined) recorded[field] = preAction[field];
-      } else if (recorded.kind === 'prediction' || (stepped && recorded.kind === undefined && 'expect' in recorded)) {
+      } else if (!isPrivate && (recorded.kind === 'prediction' || (stepped && recorded.kind === undefined && 'expect' in recorded))) {
         this.countPrediction(recorded);
       }
       goal.scratchpad[key] = recorded;
       goal.lastMeaningfulProgressAt=Date.now();
       await this.persistLearning(goal);
-      this.changed('observationRecorded', { goalId, operationId, observation: recorded });
+      this.notifyGoal(goalId, 'observationRecorded', { goalId, operationId, observation: recorded });
       return { success: true };
     });
     this.on('recordScrumCommit', async msg => {
       if (msg.routing.from !== await this.discoverDep('ScrumMaster')) throw new Error('Scrum commits belong to ScrumMaster');
       const { goalId, operationId, outcome, error } = msg.payload as { goalId: string; operationId: string; outcome?: 'replanned'; error?: string };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || !operationId) throw new Error('Unknown goal or missing commit identity');
       goal.scratchpad[`learning/commit/${operationId}`] ??= outcome ? { outcome, error } : true;
       if (outcome === 'replanned') {
@@ -2939,7 +3366,7 @@ hear assumptionResolved and goalReaction.
     this.on('recordPlan', async (msg: AbjectMessage) => {
       const { goalId, operationId, expectedRevision, plan } = msg.payload as { goalId: string; operationId: string; expectedRevision: number; plan: Record<string, unknown> };
       return withKeyedLock(`${this.id}:plan:${goalId}`, async () => {
-        const goal = this.goals.get(goalId);
+        const goal = await this.goalFor(msg, goalId);
         if (!goal || goal.status !== 'active') return { success: false, error: 'Goal is not active' };
         const history = (goal.scratchpad['learning/plans'] as Array<{ revision: number; operationId: string; plan: unknown; at: number }>) ?? [];
         const duplicate = history.find(p => p.operationId === operationId);
@@ -2950,15 +3377,17 @@ hear assumptionResolved and goalReaction.
         goal.scratchpad['learning/plans'] = history;
         goal.lastMeaningfulProgressAt = Date.now();
         await this.persistLearning(goal);
-        this.changed('planRevised', { goalId, revision: current + 1, plan });
+        this.notifyGoal(goalId, 'planRevised', { goalId, revision: current + 1, plan });
         return { success: true, revision: current + 1 };
       });
     });
     this.on('pendingReviews', async () => [...this.goals.values()]
-      .filter(g => g.scratchpad['learning/review'] === 'pending')
+      .filter(g => g.scratchpad['learning/review'] === 'pending' && !this.isPrivateGoal(g.id))
       .map(g => ({ goalId: g.id, outcome: g.error ? 'failed' : 'completed', detail: g.error })));
     this.on('ackReview', async (msg: AbjectMessage) => {
       const { goalId, report, reaction } = msg.payload as { goalId: string; report?: { status?: string }; reaction?: boolean };
+      // A private goal is never reviewed: an acknowledgment is taken and dropped.
+      if (this.isPrivateGoal(goalId)) return { success: true };
       const goal = this.goals.get(goalId);
       if (!goal) return { success: false };
       if (reaction === true) {
@@ -2977,11 +3406,13 @@ hear assumptionResolved and goalReaction.
 
     this.on('getBudget', async msg => {
       const { goalId } = msg.payload as { goalId: string };
+      if (await this.hiddenFrom(msg, goalId)) throw new Error('Unknown goal');
       const goal = this.budgetOwner(goalId);
       return structuredClone(goal.scratchpad['resources'] ?? { usedTokens: 0, usedCostUsd: 0, reservations: {} });
     });
     this.on('configureBudget', async msg => {
       const { goalId, maxTokens, maxCostUsd } = msg.payload as { goalId: string; maxTokens?: number; maxCostUsd?: number };
+      if (await this.hiddenFrom(msg, goalId)) throw new Error('Unknown goal');
       const goal = this.budgetOwner(goalId);
       if (msg.routing.from !== goal.createdBy) throw new Error('Only the goal creator may change its budget');
       for (const value of [maxTokens, maxCostUsd]) if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error('Budget limits must be nonnegative finite numbers');
@@ -3028,23 +3459,33 @@ hear assumptionResolved and goalReaction.
         r.usedTokens = (r.usedTokens ?? 0) + receipt.tokens;
         r.usedCostUsd = (r.usedCostUsd ?? 0) + (receipt.costUsd ?? 0);
         goal.scratchpad['resources'] = r; await this.persistLearning(goal);
-        this.changed('goalBudgetUpdated', { goalId: goal.id, ...r });
+        this.notifyGoal(goal.id, 'goalBudgetUpdated', { goalId: goal.id, ...r });
         return { success: true };
       });
     });
 
     this.on('createGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
-      const { title, parentId, description, operationId, context: suppliedContext } = msg.payload as {
+      const { title, parentId, description, operationId, context: suppliedContext, conversationId } = msg.payload as {
         title: string;
         parentId?: GoalId;
         description: string;
         operationId?: string;
         context?: ConversationContext;
+        conversationId?: string;
       };
       requireNonEmpty(title, 'title');
       requireNonEmpty(description, 'description');
       if (operationId !== undefined) requireNonEmpty(operationId, 'operationId');
+      // Private when asked for, or under a private parent (whose circle the
+      // caller must be in: to anyone else that parent does not exist). A
+      // private goal under one that is not private would put its tasks in a
+      // shared queue, so that is refused.
+      const parentPrivate = !!parentId && this.isPrivateGoal(parentId);
+      if (parentPrivate && !(await this.goalFor(msg, parentId))) throw new Error(PRIVATE_GOAL_UNAVAILABLE);
+      const isPrivate = isPrivatePayload(msg.payload) || parentPrivate;
+      if (isPrivate && parentId && !parentPrivate) throw new Error('A private goal cannot be a sub-goal of a goal that is not private');
+      const privateRoot = parentPrivate ? this.rootOf(this.goals.get(parentId!)!) : undefined;
       const inherited = parentId ? this.goals.get(parentId)?.scratchpad[CONVERSATION_CONTEXT_KEY] : undefined;
       const context = structuredClone(suppliedContext ?? inherited) as ConversationContext | undefined;
       if (context) {
@@ -3063,7 +3504,7 @@ hear assumptionResolved and goalReaction.
           // A lost reply or interrupted first publication must not orphan round 0.
           // ScrumMaster deduplicates goalCreated by goal and round.
           if (prior.status === 'active' && prior.currentScrumNumber === 0) {
-            this.changed('goalCreated', { goalId: prior.id, title: prior.title, description: prior.description, parentId: prior.parentId });
+            this.notifyGoal(prior.id, 'goalCreated', { goalId: prior.id, title: prior.title, description: prior.description, parentId: prior.parentId });
           }
           return { goalId: prior.id, duplicate: true };
         }
@@ -3088,6 +3529,12 @@ hear assumptionResolved and goalReaction.
           currentScrumNumber: 0,
           interjections: [],
         };
+        if (isPrivate) {
+          goal.private = true;
+          goal.ownerId = privateRoot?.ownerId ?? callerId;
+          const conversation = privateRoot?.conversationId ?? (typeof conversationId === 'string' && conversationId ? conversationId : context?.conversationId);
+          if (conversation) goal.conversationId = conversation;
+        }
 
         this.goals.set(goalId, goal);
         this.goalOrder.push(goalId);
@@ -3101,8 +3548,10 @@ hear assumptionResolved and goalReaction.
           }
         }
 
-        // Create + subscribe to per-goal SharedState namespace
-        if (this.sharedStateId) {
+        if (isPrivate) {
+          await this.preparePrivateGoal(goal);
+        } else if (this.sharedStateId) {
+          // Create + subscribe to per-goal SharedState namespace
           const ns = `goal-${goalId}`;
           try {
             await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
@@ -3111,10 +3560,10 @@ hear assumptionResolved and goalReaction.
         }
 
         if (operationId || context) await this.persistLearning(goal);
-        log.info(`Goal created: "${goal.title}" (${goalId})`);
-        this.changed('goalCreated', { goalId, title: goal.title, description: goal.description, parentId });
+        log.info(`Goal created: "${shown(goal.title, isPrivate)}" (${goalId})`);
+        this.notifyGoal(goalId, 'goalCreated', { goalId, title: goal.title, description: goal.description, parentId });
         this.syncGoalToSharedState(goal);
-        this.saveGoalIndex();
+        if (!isPrivate) this.saveGoalIndex();
 
         return { goalId };
       });
@@ -3126,7 +3575,7 @@ hear assumptionResolved and goalReaction.
         taskId?: string; step?: number; maxSteps?: number; say?: string;
       };
       const said = typeof say === 'string' ? say.replace(/\s+/g, ' ').trim().slice(0, GoalManager.SAY_MAX) : '';
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || goal.status !== 'active') return;
 
       // Heartbeats arrive at ~1Hz with identical text ("working"). Collapse
@@ -3141,7 +3590,7 @@ hear assumptionResolved and goalReaction.
         last.timestamp = Date.now();
         if (said) last.say = said;
       } else {
-        log.info(`updateProgress ${goalId.slice(0, 8)} phase=${phase ?? '?'} agent=${agentName ?? '?'}: ${message.slice(0, 80)}`);
+        log.info(`updateProgress ${goalId.slice(0, 8)} phase=${phase ?? '?'} agent=${agentName ?? '?'}: ${shown(message.slice(0, 80), this.isPrivateGoal(goalId))}`);
         goal.progress.push({
           timestamp: Date.now(),
           agentName: agentName ?? 'Unknown',
@@ -3161,7 +3610,7 @@ hear assumptionResolved and goalReaction.
       }
       goal.updatedAt = Date.now();
 
-      this.changed('goalUpdated', {
+      this.notifyGoal(goalId, 'goalUpdated', {
         goalId,
         parentId: goal.parentId,
         message,
@@ -3173,19 +3622,23 @@ hear assumptionResolved and goalReaction.
 
     this.on('completeGoal', async (msg: AbjectMessage) => {
       const { goalId, result } = msg.payload as { goalId: GoalId; result?: unknown };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || goal.status !== 'active') return;
 
       goal.status = 'completed';
       goal.result = result;
       goal.updatedAt = Date.now();
 
-      goal.scratchpad['learning/review'] = 'pending';
-      this.countFinishedGoal();
+      const isPrivate = this.isPrivateGoal(goalId);
+      if (!isPrivate) {
+        goal.scratchpad['learning/review'] = 'pending';
+        this.countFinishedGoal();
+      }
       await this.persistLearning(goal);
-      log.info(`Goal completed: "${goal.title}" (${goalId})`);
-      this.changed('goalCompleted', { goalId, result });
+      log.info(`Goal completed: "${shown(goal.title, isPrivate)}" (${goalId})`);
+      this.notifyGoal(goalId, 'goalCompleted', { goalId, result });
       this.syncGoalToSharedState(goal);
+      if (isPrivate && !goal.parentId) void this.finishPrivateGoal(goalId, 'completed');
     });
 
     /**
@@ -3196,7 +3649,7 @@ hear assumptionResolved and goalReaction.
     this.on('startNextScrum', async msg => {
       const {goalId,operationId,preserveTaskIds=[]}=msg.payload as {goalId:GoalId;operationId?:string;preserveTaskIds?:string[]};
       return withKeyedLock(`${this.id}:round:${goalId}`,async()=>{
-        const goal=this.goals.get(goalId);
+        const goal=await this.goalFor(msg,goalId);
         if(!goal || goal.status!=='active')throw new Error('Goal is not active');
         const key=operationId?`learning/round/${operationId}`:undefined;
         if(key && goal.scratchpad[key]!==undefined){await this.persistLearning(goal);return {scrumNumber:goal.scratchpad[key],duplicate:true};}
@@ -3214,13 +3667,14 @@ hear assumptionResolved and goalReaction.
         goal.scratchpad[`learning/backlog/${goal.currentScrumNumber}`] = [...new Set(preserveTaskIds)];
         if(key)goal.scratchpad[key]=goal.currentScrumNumber;
         await this.persistLearning(goal);
-        this.changed('goalUpdated',{goalId,parentId:goal.parentId,message:`Scrum ${goal.currentScrumNumber} planned`,phase:'planning'});
+        this.notifyGoal(goalId,'goalUpdated',{goalId,parentId:goal.parentId,message:`Scrum ${goal.currentScrumNumber} planned`,phase:'planning'});
         return {scrumNumber:goal.currentScrumNumber};
       });
     });
 
     this.on('failGoal', async (msg: AbjectMessage) => {
       const { goalId, error } = msg.payload as { goalId: GoalId; error?: string };
+      if (await this.hiddenFrom(msg, goalId)) return;
       await this.failGoalWith(goalId, error);
     });
 
@@ -3241,7 +3695,7 @@ hear assumptionResolved and goalReaction.
      */
     this.on('pauseGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: GoalId };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || goal.status !== 'active') return false;
 
       goal.status = 'paused';
@@ -3254,15 +3708,15 @@ hear assumptionResolved and goalReaction.
         } catch { /* best effort — the claimTask/scrum gates still hold */ }
       }
 
-      log.info(`Goal paused: "${goal.title}" (${goalId})`);
+      log.info(`Goal paused: "${shown(goal.title, this.isPrivateGoal(goalId))}" (${goalId})`);
       await this.persistLearning(goal);
-      this.changed('goalPaused', { goalId });
+      this.notifyGoal(goalId, 'goalPaused', { goalId });
       return true;
     });
 
     this.on('resumeGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: GoalId };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || goal.status !== 'paused') return false;
 
       goal.status = 'active';
@@ -3275,9 +3729,9 @@ hear assumptionResolved and goalReaction.
         } catch { /* best effort */ }
       }
 
-      log.info(`Goal resumed: "${goal.title}" (${goalId})`);
+      log.info(`Goal resumed: "${shown(goal.title, this.isPrivateGoal(goalId))}" (${goalId})`);
       await this.persistLearning(goal);
-      this.changed('goalResumed', { goalId });
+      this.notifyGoal(goalId, 'goalResumed', { goalId });
       // The round may have reached all-terminal right as the user paused —
       // re-check so the next scrum isn't lost.
       this.maybeEmitGoalReadyForCompletion(goalId).catch(() => { /* best effort */ });
@@ -3290,7 +3744,7 @@ hear assumptionResolved and goalReaction.
      */
     this.on('stopGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: GoalId };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return false;
 
       const { cancelled } = await this.cancelTasksForGoalInternal(goalId).catch(() => ({ cancelled: 0 }));
@@ -3299,15 +3753,19 @@ hear assumptionResolved and goalReaction.
       goal.error = 'Stopped by user';
       goal.updatedAt = Date.now();
 
-      log.info(`Goal stopped by user: "${goal.title}" (${goalId}) — ${cancelled} tasks cancelled`);
-      goal.scratchpad['learning/review'] = 'deferred:user-stop';
-      this.countFinishedGoal();
+      const isPrivate = this.isPrivateGoal(goalId);
+      log.info(`Goal stopped by user: "${shown(goal.title, isPrivate)}" (${goalId}) — ${cancelled} tasks cancelled`);
+      if (!isPrivate) {
+        goal.scratchpad['learning/review'] = 'deferred:user-stop';
+        this.countFinishedGoal();
+      }
       for (const [key,value] of Object.entries(goal.scratchpad)) if (key.startsWith('learning/decision/')) {
         const decision = value as LearningDecision; decision.paused = true;
         for (const e of decision.effects) if (!['applied','abandoned'].includes(e.state)) { e.state = 'waiting'; e.error = 'Goal stopped; explicit learning resumption required'; }
       }
       await this.persistLearning(goal);
-      this.changed('goalFailed', { goalId, error: 'Stopped by user' });
+      this.notifyGoal(goalId, 'goalFailed', { goalId, error: 'Stopped by user' });
+      if (isPrivate && !goal.parentId) void this.finishPrivateGoal(goalId, 'cancelled');
       return true;
     });
 
@@ -3329,7 +3787,7 @@ hear assumptionResolved and goalReaction.
       if (!(await this.isBuiltInCaller(msg.routing.from, ['Chat']))) {
         throw new Error('Only the chat adds user notes to a goal');
       }
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return false;
 
       const at = Date.now();
@@ -3337,11 +3795,12 @@ hear assumptionResolved and goalReaction.
       goal.interjections.push({ note, at, status: 'pending' });
       goal.updatedAt = at;
 
-      log.info(`Goal interjection queued for "${goal.title}" (${goalId}): ${note.slice(0, 80)}`);
-      this.changed('goalUpdated', { goalId, parentId: goal.parentId, message: `User note: ${note.slice(0, 120)}` });
+      const isPrivate = this.isPrivateGoal(goalId);
+      log.info(`Goal interjection queued for "${shown(goal.title, isPrivate)}" (${goalId}): ${shown(note.slice(0, 80), isPrivate)}`);
+      this.notifyGoal(goalId, 'goalUpdated', { goalId, parentId: goal.parentId, message: `User note: ${note.slice(0, 120)}` });
       // Dedicated aspect so ScrumMaster can wake mid-round and weigh the note
       // against the plan and in-flight work.
-      this.changed('goalInterjection', { goalId, parentId: goal.parentId, note, at });
+      this.notifyGoal(goalId, 'goalInterjection', { goalId, parentId: goal.parentId, note, at });
       this.syncGoalToSharedState(goal);
       // The note covers the work under the goal as well, so tasks of its
       // sub-goals hear it too.
@@ -3358,10 +3817,10 @@ hear assumptionResolved and goalReaction.
     this.on('reportGoalProgress', async (msg: AbjectMessage) => {
       const { goalId, message } = msg.payload as { goalId: GoalId; message: string };
       requireNonEmpty(message, 'message');
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return false;
       goal.updatedAt = Date.now();
-      this.changed('goalUpdated', { goalId, parentId: goal.parentId, message: message.slice(0, 300) });
+      this.notifyGoal(goalId, 'goalUpdated', { goalId, parentId: goal.parentId, message: message.slice(0, 300) });
       return true;
     });
 
@@ -3376,7 +3835,7 @@ hear assumptionResolved and goalReaction.
       const { goalId, question, choices: rawChoices } = msg.payload as { goalId: GoalId; question: string; choices?: unknown };
       requireNonEmpty(question, 'question');
       const choices = cleanChoices(rawChoices);
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || goal.status !== 'active') return false;
 
       goal.status = 'paused';
@@ -3389,10 +3848,11 @@ hear assumptionResolved and goalReaction.
         } catch { /* best effort — the claimTask/scrum gates still hold */ }
       }
 
-      log.info(`Clarification requested for "${goal.title}" (${goalId}): ${question.slice(0, 80)}`);
+      const isPrivate = this.isPrivateGoal(goalId);
+      log.info(`Clarification requested for "${shown(goal.title, isPrivate)}" (${goalId}): ${shown(question.slice(0, 80), isPrivate)}`);
       await this.persistLearning(goal);
-      this.changed('goalPaused', { goalId });
-      this.changed('goalClarificationRequested', { goalId, parentId: goal.parentId, question, ...(choices ? { choices } : {}) });
+      this.notifyGoal(goalId, 'goalPaused', { goalId });
+      this.notifyGoal(goalId, 'goalClarificationRequested', { goalId, parentId: goal.parentId, question, ...(choices ? { choices } : {}) });
       return true;
     });
 
@@ -3403,7 +3863,7 @@ hear assumptionResolved and goalReaction.
      */
     this.on('markInterjectionsIncorporated', async (msg: AbjectMessage) => {
       const { goalId, upTo } = msg.payload as { goalId: GoalId; upTo: number };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal?.interjections?.length) return 0;
       let flipped = 0;
       for (const entry of goal.interjections) {
@@ -3433,7 +3893,7 @@ hear assumptionResolved and goalReaction.
      */
     this.on('cancelOutstandingTasks', async (msg: AbjectMessage) => {
       const { goalId, preserveTaskIds: requested = [] } = msg.payload as { goalId: GoalId; preserveTaskIds?: string[] };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || goal.status !== 'active') return { cancelled: 0, safe: false, inactive: true, error: 'Goal is no longer active' };
       if (!this.tupleSpaceId) return { cancelled: 0, safe: false, error: 'TupleSpace unavailable' };
 
@@ -3475,7 +3935,7 @@ hear assumptionResolved and goalReaction.
 
       if (cancelled > 0) {
         goal.updatedAt = Date.now();
-        this.changed('goalUpdated', {
+        this.notifyGoal(goalId, 'goalUpdated', {
           goalId, parentId: goal.parentId,
           message: `Re-planning: ${cancelled} outstanding task(s) cancelled to make way for the new plan`,
         });
@@ -3486,7 +3946,7 @@ hear assumptionResolved and goalReaction.
 
     this.on('readGoalContext', async msg => {
       const { goalId, sourceGoalId, messageId, key } = msg.payload as { goalId: string; sourceGoalId?: string; messageId?: string; key?: string };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       const context = goal?.scratchpad[CONVERSATION_CONTEXT_KEY] as ConversationContext | undefined;
       if (!goal || !context) throw new Error('Goal conversation context unavailable');
       if (messageId && sourceGoalId || key !== undefined && !sourceGoalId) throw new Error('Select a message or a linked goal and optional key');
@@ -3502,7 +3962,8 @@ hear assumptionResolved and goalReaction.
       const importKey = `context/imports/${JSON.stringify([sourceGoalId, key ?? null])}`;
       return withKeyedLock(`${this.id}:${goalId}:${importKey}`, async () => {
         if (Object.hasOwn(goal.scratchpad, importKey)) return structuredClone(goal.scratchpad[importKey]);
-        const source = await this.readRetainedGoal(sourceGoalId);
+        const retained = await this.readRetainedGoal(sourceGoalId);
+        const source = retained && this.sourceShared(goal, retained) ? retained : null;
         if (!source) throw new Error('Referenced goal data unavailable; do not reconstruct its selection');
         const sourceContext = source.scratchpad[CONVERSATION_CONTEXT_KEY] as ConversationContext | undefined;
         if (sourceContext ? sourceContext.conversationId !== context.conversationId : source.createdBy !== goal.createdBy) {
@@ -3524,7 +3985,7 @@ hear assumptionResolved and goalReaction.
 
     this.on('getGoalBriefing', async (msg: AbjectMessage) => {
       const { goalId, keys = [] } = msg.payload as { goalId: GoalId; keys?: string[] };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal) return null;
       const all = Object.keys(goal.scratchpad);
       // The spend ledger ('resources') is GoalManager's budget record, read with
@@ -3549,6 +4010,7 @@ hear assumptionResolved and goalReaction.
     this.on('getGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
       const { goalId } = msg.payload as { goalId: GoalId };
+      if (await this.hiddenFrom(msg, goalId)) return null;
       const goal = await this.readRetainedGoal(goalId);
       if (!goal) return null;
       // When each key was last written, so a reader can tell a round-1 figure
@@ -3562,7 +4024,7 @@ hear assumptionResolved and goalReaction.
       const { status, parentId, includeArchived } = (msg.payload ?? {}) as {
         status?: string; parentId?: GoalId; includeArchived?: boolean;
       };
-      const live = this.goalOrder
+      const listed = this.goalOrder
         .map(id => this.goals.get(id))
         .filter((g): g is Goal => {
           if (!g) return false;
@@ -3571,6 +4033,8 @@ hear assumptionResolved and goalReaction.
           if (parentId !== undefined && g.parentId !== parentId) return false;
           return true;
         });
+      // Private goals list only for the members of their circle asking.
+      const live = await this.visibleTo(msg.routing.from, listed);
       if (!includeArchived || (status && status !== 'archived')) return live;
       // Cold-archived goals list as summaries; getGoal reads one whole.
       const cold = [...this.coldIndex.values()]
@@ -3591,6 +4055,7 @@ hear assumptionResolved and goalReaction.
       let kept = 0;
       for (const [, goal] of this.goals) {
         if (!finished(goal) || !this.ownGoal(goal)) continue;
+        if (this.isPrivateGoal(goal.id)) continue; // deleted when its outcome is delivered
         if (this.hasUnfinishedLearning(goal)) { kept++; continue; }
         goalsToClear.push(goal);
       }
@@ -3653,10 +4118,12 @@ hear assumptionResolved and goalReaction.
       return { cleared: goalsToClear.length, archived, kept };
     });
 
-    this.on('getStats', async () => {
+    this.on('getStats', async (msg: AbjectMessage) => {
       await this.sweepGoals();
       let active = 0, paused = 0, completed = 0, failed = 0, archived = 0;
+      const counted = new Set((await this.visibleTo(msg.routing.from, [...this.goals.values()])).map(g => g.id));
       for (const [, goal] of this.goals) {
+        if (!counted.has(goal.id)) continue; // a private goal outside the caller's circle
         if (this.coldIndex.has(goal.id)) continue; // brought back for a review; counted as archived below
         switch (goal.status) {
           case 'active': active++; break;
@@ -3667,7 +4134,7 @@ hear assumptionResolved and goalReaction.
         }
       }
       archived += this.coldIndex.size;
-      return { active, paused, completed, failed, archived, total: [...this.goals.keys()].filter(id => !this.coldIndex.has(id)).length + this.coldIndex.size };
+      return { active, paused, completed, failed, archived, total: [...this.goals.keys()].filter(id => counted.has(id) && !this.coldIndex.has(id)).length + this.coldIndex.size };
     });
 
     // ── Task convenience methods (delegate to TupleSpace) ──
@@ -3685,7 +4152,7 @@ hear assumptionResolved and goalReaction.
       requireNonEmpty(goalId, 'goalId');
       requireNonEmpty(description, 'description');
 
-      const goal = this.goals.get(goalId as GoalId);
+      const goal = await this.goalFor(msg, goalId as GoalId);
       if (!goal) return { error: 'Goal not found' };
 
       // Refuse tasks for terminated goals. Under the Scrum model, ScrumMaster
@@ -3729,13 +4196,16 @@ hear assumptionResolved and goalReaction.
           },
         })
       );
+      // The agent a private task is assigned to joins the goal's crew.
+      this.addPrivateCrew(goalId as GoalId, assignedAgentId);
+      const isPrivate = this.isPrivateGoal(goalId as GoalId);
       const contractParts: string[] = [];
-      if (produces?.length) contractParts.push(`produces=[${produces.map(p => p.key).join(',')}]`);
-      if (consumes?.length) contractParts.push(`consumes=[${consumes.join(',')}]`);
+      if (produces?.length) contractParts.push(`produces=[${shown(produces.map(p => p.key).join(','), isPrivate)}]`);
+      if (consumes?.length) contractParts.push(`consumes=[${shown(consumes.join(','), isPrivate)}]`);
       if (assignedAgentId) contractParts.push(`assigned=${assignedAgentId.slice(0, 8)}`);
       contractParts.push(`scrum=${effectiveScrumNumber}`);
       const contractSuffix = ` (${contractParts.join(' ')})`;
-      log.info(`Task added for goal ${goalId}: "${description.slice(0, 60)}"${dependsOn?.length ? ` (depends on ${dependsOn.length} task(s))` : ''}${contractSuffix}`);
+      log.info(`Task added for goal ${goalId}: "${shown(description.slice(0, 60), isPrivate)}"${dependsOn?.length ? ` (depends on ${dependsOn.length} task(s))` : ''}${contractSuffix}`);
       return { taskId: result.tupleId };
     });
 
@@ -3743,6 +4213,7 @@ hear assumptionResolved and goalReaction.
       const { goalId, type } = (msg.payload ?? {}) as { goalId?: string; type?: string };
       if (!this.tupleSpaceId) { log.info(`claimTask — no TupleSpace`); return null; }
 
+      if (await this.hiddenFrom(msg, goalId)) return null;
       // A paused goal's tasks are frozen, not claimable.
       if (goalId && this.goals.get(goalId as GoalId)?.status === 'paused') {
         log.info(`claimTask — goal ${goalId.slice(0, 8)} is paused, nothing claimable`);
@@ -3764,7 +4235,7 @@ hear assumptionResolved and goalReaction.
 
     this.on('updateTaskFields', async (msg: AbjectMessage) => {
       const { goalId, taskId, fields } = msg.payload as { goalId: string; taskId: string; fields: Record<string, unknown> };
-      if (!this.tupleSpaceId) return false;
+      if (!this.tupleSpaceId || await this.hiddenFrom(msg, goalId)) return false;
       const ns = this.getTupleNamespace(goalId as GoalId);
       return this.request(request(this.id, this.tupleSpaceId, 'update', {
         namespace: ns, tupleId: taskId, fields,
@@ -3773,7 +4244,7 @@ hear assumptionResolved and goalReaction.
 
     this.on('admitTask', async msg => {
       const { taskId, goalId } = msg.payload as { taskId:string; goalId:string };
-      const goal=this.goals.get(goalId);
+      const goal=await this.goalFor(msg,goalId);
       if (!goal || goal.status!=='active' || !this.tupleSpaceId) return { accepted:false, reason:'Goal is not active' };
       const tasks=await this.request<Array<{id:string;fields:Record<string,unknown>}>>(request(this.id,this.tupleSpaceId,'scan',{namespace:this.getTupleNamespace(goalId as GoalId),pattern:{goalId}}));
       const task=tasks.find(t=>t.id===taskId);
@@ -3783,7 +4254,7 @@ hear assumptionResolved and goalReaction.
 
     this.on('assessTask', async (msg: AbjectMessage) => {
       const { taskId, goalId } = msg.payload as { taskId: string; goalId: string };
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal || goal.status !== 'active' || !this.tupleSpaceId) return { accepted: false, reason: 'Goal is not active' };
       const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(request(this.id, this.tupleSpaceId, 'scan', {
         namespace: this.getTupleNamespace(goalId), pattern: { goalId },
@@ -3801,7 +4272,7 @@ hear assumptionResolved and goalReaction.
       requireNonEmpty(taskId, 'taskId');
       if (!this.tupleSpaceId || !goalId) return { accepted: false, reason: 'Task settlement requires a goal and TupleSpace' };
       return withKeyedLock(`${this.id}:settle:${taskId}`, async () => {
-        const goal = this.goals.get(goalId);
+        const goal = await this.goalFor(msg, goalId);
         if (!goal || goal.status !== 'active') return { accepted: false, reason: 'Goal is not active' };
         const ns = this.getTupleNamespace(goalId);
         const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
@@ -3834,8 +4305,8 @@ hear assumptionResolved and goalReaction.
         await this.syncGoalToSharedState(goal);
         await this.persistLearning(goal);
         this.emittedTerminalTasks.add(taskId);
-        this.changed('taskCompleted', { taskId, goalId, result, evidence });
-        this.changed('taskUnblocked', { goalId, completedTaskId: taskId });
+        this.notifyGoal(goalId, 'taskCompleted', { taskId, goalId, result, evidence });
+        this.notifyGoal(goalId, 'taskUnblocked', { goalId, completedTaskId: taskId });
         this.maybeEmitGoalReadyForCompletion(goalId).catch(() => {});
         return { accepted: true };
       });
@@ -3846,9 +4317,10 @@ hear assumptionResolved and goalReaction.
         taskId: string; error?: string; goalId?: string; agentName?: string; agentId?: string;
       };
       requireNonEmpty(taskId, 'taskId');
-      if (!this.tupleSpaceId) return false;
+      if (!this.tupleSpaceId || await this.hiddenFrom(msg, goalId)) return false;
+      const isPrivate = this.isPrivateGoal(goalId);
 
-      log.info(`failTask ${taskId.slice(0, 8)} agent=${agentName ?? '?'} error="${(error ?? '').slice(0, 80)}" from=${msg.routing.from.slice(0, 8)}`);
+      log.info(`failTask ${taskId.slice(0, 8)} agent=${agentName ?? '?'} error="${shown((error ?? '').slice(0, 80), isPrivate)}" from=${msg.routing.from.slice(0, 8)}`);
 
       const ns = goalId ? this.getTupleNamespace(goalId as GoalId) : undefined;
 
@@ -3896,7 +4368,7 @@ hear assumptionResolved and goalReaction.
         await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId, ...(ns ? { namespace: ns } : {}) }));
       } catch { /* best effort */ }
       this.emittedTerminalTasks.add(taskId);
-      this.changed('taskPermanentlyFailed', { taskId, goalId, error, attempts });
+      this.notifyGoal(goalId, 'taskPermanentlyFailed', { taskId, goalId, error, attempts });
       if (goalId) {
         // Classify the failure for the planner first, bounded, so the review
         // scrum this may trigger sees the class beside the error.
@@ -3914,6 +4386,7 @@ hear assumptionResolved and goalReaction.
     this.on('getTasksForGoal', async (msg: AbjectMessage) => {
       const { goalId, status } = msg.payload as { goalId: string; status?: string };
       requireNonEmpty(goalId, 'goalId');
+      if (await this.hiddenFrom(msg, goalId)) return [];
       // An archived goal's tasks were kept in its cold record (also while it
       // is back in memory for a reaction review: its task queue is gone).
       if (this.coldIndex.has(goalId)) {
@@ -3934,7 +4407,7 @@ hear assumptionResolved and goalReaction.
     this.on('getResultsForGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: string };
       requireNonEmpty(goalId, 'goalId');
-      if (!this.tupleSpaceId) return [];
+      if (!this.tupleSpaceId || await this.hiddenFrom(msg, goalId)) return [];
 
       const ns = this.getTupleNamespace(goalId as GoalId);
       return this.request(
@@ -3948,6 +4421,10 @@ hear assumptionResolved and goalReaction.
     this.on('subscribeGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: string };
       requireNonEmpty(goalId, 'goalId');
+
+      // A private goal is never fetched from or offered to peers; outside its
+      // circle it does not exist.
+      if (this.isPrivateGoal(goalId as GoalId)) return (await this.goalFor(msg, goalId as GoalId)) ?? null;
 
       // Already tracking this goal locally
       if (this.goals.has(goalId as GoalId)) {
@@ -4008,11 +4485,11 @@ hear assumptionResolved and goalReaction.
       if (key === CONVERSATION_CONTEXT_KEY || key.startsWith('context/imports/')) throw new Error('Conversation context is managed by GoalManager');
       if (/^learning\/(decision|assessment)\//.test(key)) throw new Error('Use the reviewer-owned learning protocol for decisions and assessments');
       if (key === 'goal/assumptions' || /^learning\/(reaction\/|reactionReview$)/.test(key)) throw new Error('Assumptions and reactions are recorded with recordAssumptions, updateAssumption and recordReaction');
-      const goal = this.goals.get(goalId);
+      const goal = await this.goalFor(msg, goalId);
       if (!goal) return { success: false };
       goal.scratchpad[key] = value;
       goal.updatedAt = Date.now();
-      this.changed('goalUpdated', { goalId, message: `scratchpad.${key} updated` });
+      this.notifyGoal(goalId, 'goalUpdated', { goalId, message: `scratchpad.${key} updated` });
       // The authoritative value for a single key is its own register. `meta` is
       // still written below (it carries title/status/childIds), but routing the
       // key through `meta` alone would let two collaborators writing different
@@ -4029,6 +4506,7 @@ hear assumptionResolved and goalReaction.
       requireNonEmpty(goalId, 'goalId');
       requireNonEmpty(taskId, 'taskId');
       requireNonEmpty(status, 'status');
+      if (await this.hiddenFrom(msg, goalId)) return { success: false };
 
       const record: RemoteTaskProgress = {
         taskId, goalId, status, message, agentName,
@@ -4037,13 +4515,14 @@ hear assumptionResolved and goalReaction.
       };
       this.remoteTasks.set(this.remoteTaskKey(goalId, taskId), record);
       this.setRegister(goalId, `task:${taskId}`, record);
-      this.changed('taskProgress', record);
+      this.notifyGoal(goalId, 'taskProgress', record);
       return { success: true };
     });
 
     this.on('getCollaboratorTasks', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: GoalId };
       requireNonEmpty(goalId, 'goalId');
+      if (await this.hiddenFrom(msg, goalId)) return [];
       const prefix = `${goalId}::`;
       return Array.from(this.remoteTasks.entries())
         .filter(([k]) => k.startsWith(prefix))
@@ -4053,6 +4532,7 @@ hear assumptionResolved and goalReaction.
     this.on('getCollaborators', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: GoalId };
       requireNonEmpty(goalId, 'goalId');
+      if (await this.hiddenFrom(msg, goalId)) return [];
       return Array.from(this.collaborators.get(goalId)?.values() ?? []);
     });
 
@@ -4061,7 +4541,8 @@ hear assumptionResolved and goalReaction.
     this.on('reconcileGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: GoalId };
       requireNonEmpty(goalId, 'goalId');
-      if (!this.sharedStateId || !this.goals.has(goalId)) return { reconciled: 0 };
+      // A private goal has no collaborators to reconcile with.
+      if (!this.sharedStateId || !this.goals.has(goalId) || this.isPrivateGoal(goalId)) return { reconciled: 0 };
       try {
         const all = await this.request<Record<string, unknown>>(
           request(this.id, this.sharedStateId, 'getAll', { name: this.goalNamespace(goalId) })
@@ -4078,6 +4559,7 @@ hear assumptionResolved and goalReaction.
     this.on('readGoalData', async (msg: AbjectMessage) => {
       const { goalId, key } = msg.payload as { goalId: GoalId; key?: string };
       requireNonEmpty(goalId, 'goalId');
+      if (await this.hiddenFrom(msg, goalId)) return null;
       const goal = await this.readRetainedGoal(goalId);
       if (!goal) return null;
       if (key) {
@@ -4096,7 +4578,7 @@ hear assumptionResolved and goalReaction.
     this.on('cancelPendingTasks', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: string };
       requireNonEmpty(goalId, 'goalId');
-      if (!this.tupleSpaceId) return { cancelled: 0 };
+      if (!this.tupleSpaceId || await this.hiddenFrom(msg, goalId)) return { cancelled: 0 };
 
       const ns = this.getTupleNamespace(goalId as GoalId);
       const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
@@ -4123,13 +4605,14 @@ hear assumptionResolved and goalReaction.
     this.on('cancelTasksForGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: string };
       requireNonEmpty(goalId, 'goalId');
+      if (await this.hiddenFrom(msg, goalId)) return { cancelled: 0 };
       return this.cancelTasksForGoalInternal(goalId);
     });
 
     this.on('updateTaskAttempts', async (msg: AbjectMessage) => {
       const { taskId, goalId } = msg.payload as { taskId: string; goalId?: string };
       requireNonEmpty(taskId, 'taskId');
-      if (!this.tupleSpaceId) return false;
+      if (!this.tupleSpaceId || await this.hiddenFrom(msg, goalId)) return false;
 
       const ns = goalId ? this.getTupleNamespace(goalId as GoalId) : undefined;
 
@@ -4152,6 +4635,11 @@ hear assumptionResolved and goalReaction.
       );
     });
 
+    // Tuple events for a private task queue come to this owner directly.
+    this.on('tupleUpdated', async (msg: AbjectMessage) => {
+      if (msg.routing.from === this.tupleSpaceId && msg.payload) this.onTupleUpdated(msg.payload as { id: string; fields: Record<string, unknown> });
+    });
+
     // Changed handler — routes TupleSpace and SharedState events
     this.on('changed', async (msg: AbjectMessage) => {
       const fromId = msg.routing.from;
@@ -4159,24 +4647,7 @@ hear assumptionResolved and goalReaction.
 
       // ── TupleSpace tupleUpdated: detect remote terminal status transitions ──
       if (fromId === this.tupleSpaceId && aspect === 'tupleUpdated' && eventValue) {
-        const tuple = eventValue as { id: string; fields: Record<string, unknown> };
-        const taskId = tuple.id;
-        const status = tuple.fields?.status as string | undefined;
-        const goalId = tuple.fields?.goalId as string | undefined;
-
-        if (status === 'permanently_failed' && !this.emittedTerminalTasks.has(taskId)) {
-          this.emittedTerminalTasks.add(taskId);
-          const err = (tuple.fields?.error as string) ?? 'Task permanently failed (remote)';
-          const attempts = (tuple.fields?.attempts as number) ?? 0;
-          log.info(`Remote permanently_failed detected for ${taskId.slice(0, 8)}`);
-          this.changed('taskPermanentlyFailed', { taskId, goalId, error: err, attempts });
-        }
-        if (status === 'done' && !this.emittedTerminalTasks.has(taskId)) {
-          this.emittedTerminalTasks.add(taskId);
-          const result = tuple.fields?.result;
-          log.info(`Remote task completion detected for ${taskId.slice(0, 8)}`);
-          this.changed('taskCompleted', { taskId, goalId, result });
-        }
+        this.onTupleUpdated(eventValue as { id: string; fields: Record<string, unknown> });
         return;
       }
 
@@ -4193,6 +4664,8 @@ hear assumptionResolved and goalReaction.
         void this.handleCatalogEntry(key, value);
         return;
       }
+      // A private goal's namespace only echoes this object's own writes.
+      if (namespace?.startsWith('private-goal-')) return;
       log.info(`SharedState changed: ns=${namespace ?? '?'} key=${key ?? '?'}`);
       if (!namespace || !key) return;
       if (!namespace.startsWith('goal-')) return;

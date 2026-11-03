@@ -8,6 +8,7 @@ import { Log } from '../../core/timed-log.js';
 import { require } from '../../core/contracts.js';
 import { event } from '../../core/message.js';
 import { UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods } from '../../core/undo.js';
+import { PRIVATE_KEY_PREFIX, PRIVATE_STORAGE_READERS, isPrivateKey } from '../../core/privacy.js';
 
 const log = new Log('Storage');
 
@@ -30,6 +31,9 @@ interface ManyWrite {
   value?: unknown;
   delete?: boolean;
 }
+
+/** The error a write to a `private:` key gets from a caller outside PRIVATE_STORAGE_READERS. */
+const PRIVATE_WRITE_REFUSED = 'Storage: private keys are written only by private conversations';
 
 const undoParam = {
   name: 'undo',
@@ -205,17 +209,26 @@ export class Storage extends Abject {
   private setupHandlers(): void {
     this.on('get', async (msg: AbjectMessage) => {
       const { key } = msg.payload as { key: string };
+      if (isPrivateKey(key) && !(await this.admitsPrivate(msg))) return null;
       return this.getValue(key);
     });
 
     this.on('set', async (msg: AbjectMessage) => {
       const { key, value, undo } = msg.payload as { key: string; value: unknown; undo?: string };
+      if (isPrivateKey(key)) {
+        await this.requirePrivateWriter(msg);
+        return this.setValue(key, value);
+      }
       if (undo === undefined) return this.setValue(key, value);
       return this.writeWithUndo(msg, undo, [{ key, value }]);
     });
 
     this.on('delete', async (msg: AbjectMessage) => {
       const { key, undo } = msg.payload as { key: string; undo?: string };
+      if (isPrivateKey(key)) {
+        await this.requirePrivateWriter(msg);
+        return this.deleteValue(key);
+      }
       if (undo === undefined) return this.deleteValue(key);
       return this.writeWithUndo(msg, undo, [{ key, delete: true }]);
     });
@@ -224,6 +237,18 @@ export class Storage extends Abject {
       const { writes, undo } = msg.payload as { writes: ManyWrite[]; undo?: string };
       require(Array.isArray(writes) && writes.every(w => typeof w?.key === 'string' && w.key.length > 0),
         'setMany: writes must be [{ key, value }] or [{ key, delete: true }]');
+      if (writes.some(w => isPrivateKey(w.key))) {
+        await this.requirePrivateWriter(msg);
+        // Private keys keep no undo journal: they are written straight
+        // through, and only the rest of the change is kept for undo.
+        if (undo !== undefined) {
+          for (const w of writes.filter(w => isPrivateKey(w.key))) {
+            if (w.delete) await this.deleteValue(w.key); else await this.setValue(w.key, w.value);
+          }
+          const rest = writes.filter(w => !isPrivateKey(w.key));
+          return rest.length > 0 ? this.writeWithUndo(msg, undo, rest) : true;
+        }
+      }
       if (undo === undefined) {
         for (const w of writes) {
           if (w.delete) await this.deleteValue(w.key); else await this.setValue(w.key, w.value);
@@ -240,27 +265,58 @@ export class Storage extends Abject {
 
     this.on('has', async (msg: AbjectMessage) => {
       const { key } = msg.payload as { key: string };
+      if (isPrivateKey(key) && !(await this.admitsPrivate(msg))) return false;
       return this.hasKey(key);
     });
 
     this.on('getPrevious', async (msg: AbjectMessage) => {
       const { key } = msg.payload as { key: string };
+      // Private keys have no earlier copies to offer, to anyone.
+      if (isPrivateKey(key)) return null;
       return this.getPreviousValue(key);
     });
 
     this.on('getByPrefix', async (msg: AbjectMessage) => {
       const { prefix } = msg.payload as { prefix: string };
       require(typeof prefix === 'string' && prefix.length > 0, 'getByPrefix: prefix must be a non-empty string');
-      return this.getValuesByPrefix(prefix);
+      if (isPrivateKey(prefix)) return (await this.admitsPrivate(msg)) ? this.getValuesByPrefix(prefix) : {};
+      const values = await this.getValuesByPrefix(prefix);
+      // Only a prefix of 'private:' itself (say 'p') can reach private keys.
+      if (!PRIVATE_KEY_PREFIX.startsWith(prefix)) return values;
+      const privateKeys = Object.keys(values).filter(isPrivateKey);
+      if (privateKeys.length === 0 || await this.admitsPrivate(msg)) return values;
+      for (const key of privateKeys) delete values[key];
+      return values;
     });
 
-    this.on('keys', async () => {
-      return this.getKeys();
+    this.on('keys', async (msg: AbjectMessage) => {
+      const keys = await this.getKeys();
+      if (!keys.some(isPrivateKey) || await this.admitsPrivate(msg)) return keys;
+      return keys.filter(key => !isPrivateKey(key));
     });
 
-    this.on('clear', async () => {
-      return this.clearAll();
+    this.on('clear', async (msg: AbjectMessage) => {
+      const keys = await this.getKeys();
+      if (!keys.some(isPrivateKey) || await this.admitsPrivate(msg)) return this.clearAll();
+      // Everyone else's clear keeps the private keys.
+      for (const key of keys) if (!isPrivateKey(key)) await this.deleteValue(key);
+      return true;
     });
+  }
+
+  // ── Private keys ────────────────────────────────────────────────
+
+  /**
+   * Whether the sender may read and write `private:` keys: built-in
+   * ChatManager or Chat only (src/core/privacy.ts). Asked only when a
+   * private key is involved, so ordinary keys pay nothing for it.
+   */
+  private async admitsPrivate(msg: AbjectMessage): Promise<boolean> {
+    return this.isBuiltInCaller(msg.routing.from, PRIVATE_STORAGE_READERS);
+  }
+
+  private async requirePrivateWriter(msg: AbjectMessage): Promise<void> {
+    if (!(await this.admitsPrivate(msg))) throw new Error(PRIVATE_WRITE_REFUSED);
   }
 
   // ── Undo journal ────────────────────────────────────────────────

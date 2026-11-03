@@ -24,6 +24,7 @@ import { chromeCase } from '../core/theme-data.js';
 import { livingStyle, eyeSigilOps, removeSigilOps, type SceneOp, sigilStreamOps } from './ui-kit.js';
 import type { ChatActivity, ChatControls, ChatImage, ChatMessageView } from './chat.js';
 import { Log } from '../core/timed-log.js';
+import { PRIVATE_BANNER, PRIVATE_TITLE } from '../core/privacy.js';
 
 const log = new Log('ChatWindow');
 const CHAT_WINDOW_INTERFACE: InterfaceId = 'abjects:chat-window';
@@ -72,6 +73,10 @@ const COMPOSER_HINT_CLARIFY = `\u21B5  Answer to continue the goal   \u00B7   ${
 // ── Status strip + eye ─────────────────────────────────────────────────
 /** Height of the status strip above the message log. */
 const STATUS_STRIP_H = 18;
+/** Height of a private conversation's banner line (room for it to wrap once). */
+const PRIVATE_BANNER_H = 30;
+/** The mark a private conversation's window title starts with. */
+const PRIVATE_LOCK = '\u{1F512}';
 const CHAT_EYE_PREFIX = 'chat-eye';
 const CHAT_EYE_SIZE = 18;
 /** Motes per second rising off the eye while the chat is working. */
@@ -119,6 +124,8 @@ interface ChatWindowArgs {
   conversationId?: string;
   title?: string;
   rect?: { x: number; y: number; width: number; height: number };
+  /** The conversation is private (src/core/privacy.ts): banner, lock, private window. */
+  private?: boolean;
 }
 
 const NO_CONTROLS: ChatControls = { turnBusy: false, goalActive: false, paused: false, clarifying: false };
@@ -126,6 +133,8 @@ const NO_CONTROLS: ChatControls = { turnBusy: false, goalActive: false, paused: 
 export class ChatWindow extends Abject {
   /** The conversation this window shows. */
   private readonly chatId: AbjectId;
+  /** A private conversation: its window says so and is created private. */
+  private readonly isPrivate: boolean;
   private conversationId?: string;
   private conversationTitle?: string;
   private initialRect?: { x: number; y: number; width: number; height: number };
@@ -242,6 +251,7 @@ export class ChatWindow extends Abject {
     });
     precondition(typeof args?.chatId === 'string' && args.chatId.length > 0, 'ChatWindow needs the Chat it shows');
     this.chatId = args.chatId;
+    this.isPrivate = args.private === true;
     this.conversationId = args.conversationId;
     this.conversationTitle = args.title;
     this.initialRect = args.rect;
@@ -613,6 +623,7 @@ export class ChatWindow extends Abject {
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
         resizable: true,
+        ...(this.isPrivate ? { private: true } : {}),
       })
     );
 
@@ -644,6 +655,23 @@ export class ChatWindow extends Abject {
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: STATUS_STRIP_H },
     }));
+
+    // A private conversation says what that means, above its transcript.
+    if (this.isPrivate) {
+      const { widgetIds: [bannerId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', {
+          specs: [{
+            type: 'label', windowId: this.windowId, text: `${PRIVATE_LOCK} ${PRIVATE_BANNER}`,
+            style: { fontSize: 11, color: this.theme.textSecondary, wordWrap: true, selectable: false },
+          }],
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+        widgetId: bannerId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: PRIVATE_BANNER_H },
+      }));
+    }
 
     // Scrollable VBox for message log (expanding, auto-scroll to follow new messages).
     // A bottom margin keeps the last bubble clear of the composer instead of
@@ -910,6 +938,8 @@ export class ChatWindow extends Abject {
         conversationId: this.conversationId ?? '',
         throughMessageId: messageId,
         show: true,
+        // ChatManager keeps a private conversation's forks private; said here too.
+        ...(this.isPrivate ? { private: true } : {}),
       }), 60_000);
     } catch (err) {
       log.warn(`fork failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -958,7 +988,9 @@ export class ChatWindow extends Abject {
     const pinboardId = await this.discoverDep('Pinboard');
     if (!pinboardId) return;
     try {
-      await this.request(request(this.id, pinboardId, 'pin', { typeId, title: this.conversationTitle ?? 'Pinned' }), 30_000);
+      // A pinned copy lives outside the conversation, so it never carries a private title.
+      const title = this.isPrivate ? PRIVATE_TITLE : this.conversationTitle ?? 'Pinned';
+      await this.request(request(this.id, pinboardId, 'pin', { typeId, title }), 30_000);
     } catch { /* no desktop, or the card is gone */ }
   }
 
@@ -1236,7 +1268,8 @@ export class ChatWindow extends Abject {
    */
   private formatWindowTitle(title?: string): string {
     const t = (title ?? this.conversationTitle ?? 'Chat').trim();
-    const base = t || 'Chat';
+    const named = t || 'Chat';
+    const base = this.isPrivate ? `${PRIVATE_LOCK} ${named}` : named;
     return this.working ? `${base} ●` : base;
   }
 

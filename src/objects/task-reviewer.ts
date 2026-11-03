@@ -53,6 +53,7 @@ import { criterion, instruction } from '../core/decision-questions.js';
 import type { DecisionMode } from '../core/decision-sites.js';
 import { Log } from '../core/timed-log.js';
 import { parseRuntimeFault } from '../core/runtime-fault.js';
+import { isPrivatePayload } from '../core/privacy.js';
 import { ATTRIBUTION_SOURCES, MAX_ASSUMPTIONS_PER_GOAL, confidenceOf, isNegativeReaction, reactionKindOf, surpriseBits,
   type AttributionSource, type Assumption, type Confidence, type Reaction } from '../core/surprise.js';
 import type { EntryEvidence } from '../core/learning.js';
@@ -921,7 +922,9 @@ export class TaskReviewer extends Abject {
       await this.onGoalTerminal(this.pendingGoalReviews.shift()!);
     }
     if (this.inFlight) return;
-    const pending = await this.request<PendingGoalReview[]>(request(this.id, this.goalManagerId, 'pendingReviews', {}));
+    // Private goals are never reviewed; GoalManager leaves them out, and so does this.
+    const pending = (await this.request<PendingGoalReview[]>(request(this.id, this.goalManagerId, 'pendingReviews', {})))
+      .filter(review => !isPrivatePayload(review));
     for (const review of this.worthByGoal.size && await this.worthOrdering() ? this.sortByWorth(pending) : pending) {
       await this.onGoalTerminal(review);
       if (this.inFlight) break;
@@ -1085,6 +1088,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (msg.routing.from !== this.agentAbjectId) return;
       const ev = msg.payload as TaskCompletedEvent;
       if (!ev?.taskId || ev.agentId === this.id) return;
+      // A private task's event carries no goal and no content: it is never counted or reviewed.
+      if (isPrivatePayload(ev)) return;
       // Goal-bound tasks wait for their goal's outcome; only standalone
       // tasks run on the counter cadence.
       if (ev.goalId) return;
@@ -1097,7 +1102,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     this.on('goalCompleted', async (msg: AbjectMessage) => {
       if (msg.routing.from !== this.goalManagerId) return;
       const { goalId, result } = msg.payload as { goalId: string; result?: unknown };
-      if (!goalId) return;
+      if (!goalId || isPrivatePayload(msg.payload)) return;
       this.onGoalTerminal({ goalId, outcome: 'completed', detail: typeof result === 'string' ? result : undefined })
         .catch(err => log.warn(`goal review failed: ${err instanceof Error ? err.message : String(err)}`));
     });
@@ -1105,7 +1110,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     this.on('goalFailed', async (msg: AbjectMessage) => {
       if (msg.routing.from !== this.goalManagerId) return;
       const { goalId, error } = msg.payload as { goalId: string; error?: string };
-      if (!goalId) return;
+      if (!goalId || isPrivatePayload(msg.payload)) return;
       if (error === 'Stopped by user') return;
       this.onGoalTerminal({ goalId, outcome: 'failed', detail: error })
         .catch(err => log.warn(`goal review failed: ${err instanceof Error ? err.message : String(err)}`));
@@ -1117,7 +1122,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     this.on('goalReaction', async (msg: AbjectMessage) => {
       if (msg.routing.from !== this.goalManagerId) return;
       const { goalId, kind } = msg.payload as { goalId?: string; kind?: string; negative?: boolean };
-      if (typeof goalId !== 'string' || !goalId) return;
+      if (typeof goalId !== 'string' || !goalId || isPrivatePayload(msg.payload)) return;
       this.onGoalReaction(goalId, kind)
         .catch(err => log.warn(`reaction review failed: ${err instanceof Error ? err.message : String(err)}`));
     });
@@ -2252,6 +2257,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * the queue is full, routine reviews make room (GoalManager still holds them).
    */
   private queueGoalReview(review: PendingGoalReview): void {
+    if (isPrivatePayload(review)) return;
     const queued = this.pendingGoalReviews.findIndex(p => p.goalId === review.goalId);
     if (review.kind === 'reaction') {
       if (queued >= 0) this.pendingGoalReviews.splice(queued, 1);
@@ -2283,7 +2289,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   private async recoverReactionReviews(): Promise<void> {
     const pending = await this.request<Array<{ goalId?: string }>>(request(this.id, this.goalManagerId!, 'pendingReactionReviews', {}), 10000);
     for (const item of Array.isArray(pending) ? pending : []) {
-      if (typeof item?.goalId === 'string' && item.goalId) this.queueGoalReview(await this.reactionReview(item.goalId));
+      if (typeof item?.goalId === 'string' && item.goalId && !isPrivatePayload(item)) this.queueGoalReview(await this.reactionReview(item.goalId));
     }
     this.recoveredReactions = true;
   }
@@ -2325,6 +2331,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       request(this.id, this.goalManagerId!, 'getGoal', { goalId: review.goalId }),
       10000,
     ).catch(() => null);
+    // A private goal reads as absent to this object; should one come back, it is not reviewed.
+    if (isPrivatePayload(goal)) return;
     // A reaction still waiting for its review (GoalManager marks it pending)
     // makes any review of the goal a reaction review.
     if (goal?.scratchpad?.['learning/reactionReview'] === 'pending') review = { ...review, kind: 'reaction' };
@@ -2364,7 +2372,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       10000,
     ).catch(() => []);
     const goalTaskIds = tasks
-      .filter(t => t.goalId === review.goalId
+      .filter(t => !isPrivatePayload(t) && t.goalId === review.goalId
         && t.agentName !== 'TaskReviewer'
         && (t.phase === 'done' || t.phase === 'error'))
       .map(t => t.id)
@@ -3091,7 +3099,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       request(this.id, this.agentAbjectId!, 'getTaskTranscript', { taskId }),
       10000,
     ).catch(() => null);
-    return record?.transcript ? record : null;
+    // A private task's transcript is never reviewed.
+    return record?.transcript && !isPrivatePayload(record) ? record : null;
   }
 
   /**

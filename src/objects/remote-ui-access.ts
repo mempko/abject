@@ -270,8 +270,20 @@ export class RemoteUIAccess extends Abject {
 
   // ── Handlers ─────────────────────────────────────────────────────────
 
+  /** Remote access is the person's to grant: only the built-in Network window changes it. */
+  private async requireAccessOwner(msg: AbjectMessage, method: string): Promise<void> {
+    precondition(await this.isBuiltInCaller(msg.routing.from, ['PeerNetwork']),
+      `RemoteUIAccess.${method} is only for the Network settings window`);
+  }
+
   private setupHandlers(): void {
+    // A pairing token lets a browser anywhere attach as a desktop client: it
+    // sees every window, private conversations included, and types into
+    // them. Only the person's own Network window mints one, turns remote
+    // access on, or revokes a device; any other caller (an agent's job code
+    // included) is refused.
     this.on('generatePairingToken', async (msg: AbjectMessage) => {
+      await this.requireAccessOwner(msg, 'generatePairingToken');
       const { name } = (msg.payload as { name?: string }) ?? {};
       return this.handleGeneratePairingToken(name ?? '');
     });
@@ -281,6 +293,7 @@ export class RemoteUIAccess extends Abject {
     });
 
     this.on('revokeClient', async (msg: AbjectMessage) => {
+      await this.requireAccessOwner(msg, 'revokeClient');
       const { peerId } = msg.payload as { peerId: string };
       precondition(typeof peerId === 'string' && peerId.length > 0, 'peerId required');
       return this.handleRevokeClient(peerId);
@@ -294,6 +307,7 @@ export class RemoteUIAccess extends Abject {
     });
 
     this.on('setEnabled', async (msg: AbjectMessage) => {
+      await this.requireAccessOwner(msg, 'setEnabled');
       const { enabled } = msg.payload as { enabled: boolean };
       precondition(typeof enabled === 'boolean', 'enabled must be a boolean');
       return this.handleSetEnabled(enabled);

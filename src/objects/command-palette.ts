@@ -38,8 +38,8 @@ interface PaletteEntry {
   id: AbjectId;
   name: string;
   description: string;
-  /** Special action entries (start a chat, a desktop command) instead of showing an object. */
-  action?: 'chat' | 'expose';
+  /** Special action entries (start a chat, a private chat, a desktop command) instead of showing an object. */
+  action?: 'chat' | 'privateChat' | 'expose';
   /** The typed query, carried on the chat action entry. */
   query?: string;
 }
@@ -57,6 +57,12 @@ const PALETTE_COMMANDS: readonly PaletteEntry[] = [
     name: 'Show All Windows',
     description: 'Expos\u00E9: spread every open window to pick one (F3 or Ctrl+\u2191)',
     action: 'expose',
+  },
+  {
+    id: 'palette:new-private-chat' as AbjectId,
+    name: 'New Private Chat',
+    description: 'A chat nothing is learned from; its goals are deleted when they finish',
+    action: 'privateChat',
   },
 ];
 
@@ -325,6 +331,14 @@ export class CommandPaletteAbject extends Abject {
       } catch { /* no client to show it on */ }
       return;
     }
+    if (entry.action === 'privateChat') {
+      // An empty private chat: its window opens and waits for the first
+      // message, typed there (a private Chat takes messages only from its views).
+      const chatId = await this.startChat('', true);
+      if (!chatId) { this.playEffect('shake'); return; }
+      await this.closePalette();
+      return;
+    }
     if (entry.action === 'chat') {
       const text = (entry.query ?? this.query).trim();
       const chatId = await this.startChat(text);
@@ -347,18 +361,21 @@ export class CommandPaletteAbject extends Abject {
   }
 
   /**
-   * Spawn a fresh chat conversation titled with the typed query. Returns the
-   * new chat's id, or undefined when no conversation could be created.
+   * Spawn a fresh chat conversation titled with the typed query, or an
+   * untitled private one. Returns the new chat's id, or undefined when no
+   * conversation could be created.
    */
-  private async startChat(text: string): Promise<AbjectId | undefined> {
-    if (!text) return undefined;
+  private async startChat(text: string, isPrivate = false): Promise<AbjectId | undefined> {
+    if (!text && !isPrivate) return undefined;
     if (!this.chatManagerId) {
       this.chatManagerId = await this.discoverDep('ChatManager') ?? undefined;
     }
     if (!this.chatManagerId) return undefined;
     try {
       const res = await this.request<{ conversationId: string; chatId: AbjectId }>(
-        request(this.id, this.chatManagerId, 'newConversation', { title: text.slice(0, 60) }),
+        request(this.id, this.chatManagerId, 'newConversation', isPrivate
+          ? { private: true }
+          : { title: text.slice(0, 60) }),
         10000,
       );
       return res?.chatId || undefined;

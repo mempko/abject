@@ -139,6 +139,11 @@ Which web pages may open a local socket. An `OriginPolicy` is
   `VITE_CLIENT_PORT` (default 5174, omitted when `ELECTRON_PACKAGED=1`), and
   `ABJECTS_ALLOWED_ORIGINS` (comma or space separated; invalid entries are
   returned in `ignored`).
+- `isOwnDesktopUrl(url, env)`: whether a URL is this instance's own desktop,
+  one of those pages or any loopback address on their port, the UI socket's
+  or the CLI gateway's. The agent browser (WebBrowser) never opens one: a
+  browser on the desktop's page is a desktop client, which sees every window,
+  private conversations included, and can type into them.
 
 Matching the Host header is deliberately not enough: a DNS-rebinding page is
 same-origin by that test.
@@ -246,7 +251,10 @@ bus. Senders never know whether a target is local.
   Announced hop counts must be honest (0 only for the announcer's own
   workspace, at most 32), and an announcement may not claim an object
   already reached through another peer's live route. A sender's reply route
-  is recorded only once its message is admitted or relayed. Mesh admission
+  is recorded only once its message is admitted or relayed. Nor may an
+  inbound message claim to come from an object of this instance (or the
+  bootstrap sender): handlers decide who a caller is from `routing.from`, so
+  such a message is dropped (`AUTHENTICATED_SENDER_LOCAL`). Mesh admission
   (`PeerRegistry`) limits all of this to admitted peers.
 - **System object bypass.** `allowSystemObjectDirect()` admits only the
   well-known signaling objects (the workspace share registry), each with an

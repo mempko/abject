@@ -81,7 +81,7 @@ export class Factory extends Abject {
    * entry is dropped in the same synchronous step that writes the lasting
    * record, so nothing can run between the two.
    */
-  private building: Map<AbjectId, { builtIn: boolean; registryId?: AbjectId }> = new Map();
+  private building: Map<AbjectId, { builtIn: boolean; name?: string; registryId?: AbjectId }> = new Map();
   private constructors: Map<string, ObjectFactory> = new Map();
   private packageTypes: Map<string, PackageTypeRegistration> = new Map();
   private _factoryBus?: MessageBusLike;
@@ -132,6 +132,18 @@ export class Factory extends Abject {
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'describeBuilding',
+                description: 'For an object this Factory is still starting (its init running, not yet registered anywhere): its manifest name and whether it runs a server class. null for anything else; ask its registry then.',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The ID of the Abject',
+                  },
+                ],
+                returns: { kind: 'reference', reference: 'BuildingIdentity | null' },
               },
               {
                 name: 'respawn',
@@ -267,6 +279,14 @@ export class Factory extends Abject {
       return this.spawn(await this.admitSpawn(msg.routing.from, req));
     });
 
+    // An object asks for things during its onInit, before any registry knows
+    // it; callers judging it (isBuiltInCaller) learn what it is from here.
+    this.on('describeBuilding', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      const entry = this.building.get(objectId);
+      return entry?.name ? { name: entry.name, builtIn: entry.builtIn } : null;
+    });
+
     this.on('kill', async (msg: AbjectMessage) => {
       const { objectId, keepSnapshot } = msg.payload as { objectId: AbjectId; keepSnapshot?: boolean };
       await this.admitKill(msg.routing.from, objectId);
@@ -355,7 +375,7 @@ export class Factory extends Abject {
    * track it as spawned in the same step.
    */
   private async initRecorded(obj: Abject, registryId: AbjectId | undefined, init: () => Promise<void>): Promise<void> {
-    this.building.set(obj.id, { builtIn: Factory.isServerClass(obj), registryId });
+    this.building.set(obj.id, { builtIn: Factory.isServerClass(obj), name: obj.manifest.name, registryId });
     try {
       await init();
     } catch (err) {
@@ -790,7 +810,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       }
       const isScriptable = constructorName === 'ScriptableAbject';
       const isWasm = constructorName === WASM_ABJECT_CONSTRUCTOR;
-      this.building.set(objectId, { builtIn: !CODE_CONSTRUCTORS.has(constructorName), registryId: effectiveRegistryId });
+      this.building.set(objectId, { builtIn: !CODE_CONSTRUCTORS.has(constructorName), name: existingReg?.manifest?.name ?? constructorName, registryId: effectiveRegistryId });
       try {
         if (isScriptable || isWasm) {
           if (!existingReg?.source) {
@@ -1140,7 +1160,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
     // Spawn in worker — pass registryId and parentId so the worker-side
     // object can discover dependencies and communicate with the bus hub
-    this.building.set(objectId, { builtIn: true, registryId: req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId) });
+    this.building.set(objectId, { builtIn: true, name: realManifest.name, registryId: req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId) });
     try {
       await this._workerPool!.spawnInWorker(objectId, req.manifest.name, {
         constructorArgs: req.constructorArgs,

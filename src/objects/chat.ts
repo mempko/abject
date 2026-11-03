@@ -32,6 +32,11 @@ import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
 import { oneLine, resultText, type ProgressLike } from './goal-tree.js';
 import { parseAbjectUrl, imageMimeForPath } from './widgets/markdown-image-resolver.js';
+import {
+  PRIVATE_KEY_PREFIX, PRIVATE_REMEMBER_REFUSAL, PRIVATE_CONVERSATION_UNAVAILABLE, PRIVATE_ATTACHMENT_MAX_BYTES,
+  PRIVATE_ELSEWHERE_CHAT_PROMPT, PRIVATE_AUDIT_EXCEPTION,
+  privateHistoryKey, isPrivateKey, shown, type PrivateGoalOutcome,
+} from '../core/privacy.js';
 
 const log = new Log('Chat');
 const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
@@ -163,6 +168,22 @@ const ASSISTANT_SENDER = 'Abject';
 
 /** How long the answer to "does this instance have a display" is trusted. */
 const DISPLAY_CHECK_TTL_MS = 60_000;
+
+// ── Private conversations ──────────────────────────────────────────────
+/**
+ * How long a private goal that reads as missing after a respawn waits for its
+ * outcome before the chat says it was lost: a Chat spawned to take a finished
+ * goal's outcome hears of it moments after its own start.
+ */
+const LOST_GOAL_GRACE_MS = 10_000;
+const PRIVATE_GOAL_LOST =
+  'The private goal running here was lost when Abjects restarted (private goals live in memory only). Ask again to start it over.';
+/** What the routing model reads in a private conversation. */
+const PRIVATE_CHAT_PROMPT = `## This conversation is private
+
+Nothing said here is remembered, and goals started here are deleted when they finish. The \`remember\` action saves nothing in this conversation: when the person shares something worth keeping, answer with "${PRIVATE_REMEMBER_REFUSAL}" and carry on with the rest of their message.
+
+`;
 
 /** Who a message is from, as the transcript and its listeners see it. */
 export type ChatRole = 'user' | 'assistant' | 'system' | 'error' | 'activity';
@@ -313,6 +334,8 @@ interface ChatConstructorArgs {
   conversationId?: string;
   title?: string;
   rect?: { x: number; y: number; width: number; height: number };
+  /** A private conversation (src/core/privacy.ts), for this Chat's lifetime. */
+  private?: boolean;
 }
 
 export class Chat extends Abject {
@@ -328,6 +351,15 @@ export class Chat extends Abject {
 
   // Conversation identity (passed via constructor args; unset for legacy callers)
   private conversationId?: string;
+  /**
+   * A private conversation: its contents stay with its window, ChatManager
+   * and the terminal gateway (and each goal's crew); nothing is learned from
+   * it, its stores are the `private:` keys, and it keeps no card objects or
+   * workspace files.
+   */
+  private isPrivate = false;
+  /** A private goal that read as missing on respawn, until its grace runs out. */
+  private lostGoal?: { goalId: string; timer: ReturnType<typeof setTimeout> };
   private conversationTitle?: string;
   /** Where the window opens; the window reports moves back here. */
   private initialRect?: { x: number; y: number; width: number; height: number };
@@ -580,6 +612,18 @@ export class Chat extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'privateGoalOutcome',
+                description: 'How a private goal this conversation started ended, from GoalManager (or ChatManager, which spawns a dormant conversation to take it). Recorded exactly as a goal outcome event is; returns { accepted }.',
+                parameters: [
+                  { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'The private root goal' },
+                  { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'The conversation that started it', optional: true },
+                  { name: 'status', type: { kind: 'primitive', primitive: 'string' }, description: 'completed | failed | cancelled' },
+                  { name: 'result', type: { kind: 'object', properties: {} }, description: 'The goal result, when it completed', optional: true },
+                  { name: 'error', type: { kind: 'primitive', primitive: 'string' }, description: 'Why it did not complete', optional: true },
+                ],
+                returns: { kind: 'object', properties: { accepted: { kind: 'primitive', primitive: 'boolean' } } },
+              },
               ...undoMethods('the last clearing or title change of this conversation'),
             ],
             events: [
@@ -630,6 +674,8 @@ export class Chat extends Abject {
             ],
           },
         tags: ['system', 'agent'],
+        // A private conversation stays on this machine: never offered to peers.
+        ...(args?.private === true ? { sharing: 'user-local' as const } : {}),
       },
     });
 
@@ -637,6 +683,7 @@ export class Chat extends Abject {
       this.conversationId = args.conversationId;
       this.conversationTitle = args.title;
       this.initialRect = args.rect;
+      this.isPrivate = args.private === true;
     }
 
     this.setupHandlers();
@@ -662,7 +709,7 @@ export class Chat extends Abject {
       } else {
         try {
           const hist = await this.request<ConversationEntry[] | null>(
-            request(this.id, this.storageId, 'get', { key: `chats:history:${this.conversationId}` })
+            request(this.id, this.storageId, 'get', { key: this.historyKey() })
           );
           if (Array.isArray(hist)) {
             this.conversationHistory = identifyMessages(this.conversationId, hist);
@@ -718,10 +765,77 @@ export class Chat extends Abject {
     }
   }
 
-  private setupHandlers(): void {
-    this.on('show', async () => this.openWindow());
+  // ═══════════════════════════════════════════════════════════════════
+  // Privacy: who may read or drive a private conversation
+  // ═══════════════════════════════════════════════════════════════════
 
-    this.on('hide', async () => this.closeWindow());
+  /** Where the transcript is kept: behind the `private:` gate for a private conversation. */
+  private historyKey(): string {
+    return this.isPrivate ? privateHistoryKey(this.conversationId!) : `chats:history:${this.conversationId}`;
+  }
+
+  /** Where the running goal's marker is kept. */
+  private activeGoalKey(): string {
+    return this.isPrivate
+      ? `${PRIVATE_KEY_PREFIX}chats:activegoal:${this.conversationId}`
+      : `chats:activegoal:${this.conversationId}`;
+  }
+
+  /** Events carry the conversation, so a private one admits only its viewers as dependents. */
+  protected override async admitsDependent(callerId: AbjectId): Promise<boolean> {
+    return this.admitsViewer(callerId);
+  }
+
+  /**
+   * Whether a caller may read or drive this conversation: anyone, unless it
+   * is private; then only its window, ChatManager and the terminal gateway.
+   */
+  private async admitsViewer(callerId: AbjectId): Promise<boolean> {
+    if (!this.isPrivate) return true;
+    if (this.windowId !== undefined && callerId === this.windowId) return true;
+    return this.isBuiltInCaller(callerId, ['ChatManager', 'CliServer']);
+  }
+
+  /** A content reader or driver: refuse callers outside a private conversation's circle. */
+  private async requireViewer(msg: AbjectMessage): Promise<void> {
+    if (!(await this.admitsViewer(msg.routing.from))) throw new Error(PRIVATE_CONVERSATION_UNAVAILABLE);
+  }
+
+  /**
+   * The agent loop's callbacks that read the conversation or act for it come
+   * from AgentAbject, directly or through the step job it submits. Every
+   * job's calls arrive from JobManager, whoever wrote the job, so a job is
+   * admitted only when JobManager's invocation context says AgentAbject
+   * submitted it for a task that is this Chat's own.
+   */
+  private async admitsAgentLoop(msg: AbjectMessage): Promise<boolean> {
+    if (!this.isPrivate) return true;
+    const callerId = msg.routing.from;
+    if (this.agentAbjectId && callerId === this.agentAbjectId) return true;
+    const jobs = await this.discoverDep('JobManager');
+    if (!jobs || callerId !== jobs || !this.agentAbjectId) return false;
+    try {
+      const context = await this.request<{ callerId?: AbjectId; taskId?: string } | null>(
+        request(this.id, jobs, 'getInvocationContext', { messageId: msg.header.messageId }), 10_000);
+      if (context?.callerId !== this.agentAbjectId || !context.taskId) return false;
+      const task = await this.request<{ agentId?: AbjectId } | null>(
+        request(this.id, this.agentAbjectId, 'getTaskStatus', { taskId: context.taskId }), 10_000);
+      return task?.agentId === this.id;
+    } catch {
+      return false;
+    }
+  }
+
+  private setupHandlers(): void {
+    this.on('show', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
+      return this.openWindow();
+    });
+
+    this.on('hide', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
+      return this.closeWindow();
+    });
 
     // The window closed itself (its close button): forget it.
     this.on('windowClosed', async (msg: AbjectMessage) => {
@@ -739,6 +853,7 @@ export class Chat extends Abject {
     });
 
     this.on('sendMessage', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
       const { message, images } = msg.payload as { message?: string; images?: ChatImage[] };
       const text = (message ?? '').trim();
       const pasted = Array.isArray(images) ? images.filter(i => i && typeof i.base64 === 'string' && i.base64.length > 0) : [];
@@ -747,23 +862,23 @@ export class Chat extends Abject {
       // terminal, a bridge) goes to that goal as a note the scrum master weighs.
       if (this._currentGoalId) {
         if (!text) return false;
-        log.info(`[Chat] sendMessage → goal interjection: "${text.slice(0, 80)}"`);
+        log.info(`[Chat] sendMessage → goal interjection: "${shown(text.slice(0, 80), this.isPrivate)}"`);
         await this.sendInterjection(text);
         return true;
       }
       if (this.turnPhase !== 'idle') {
-        log.info(`[Chat] sendMessage dropped (turn busy): "${text.slice(0, 80)}"`);
+        log.info(`[Chat] sendMessage dropped (turn busy): "${shown(text.slice(0, 80), this.isPrivate)}"`);
         return false;
       }
-      log.info(`[Chat] sendMessage: "${text.slice(0, 80)}"`);
+      log.info(`[Chat] sendMessage: "${shown(text.slice(0, 80), this.isPrivate)}"`);
       if (pasted.length > 0) await this.commitImages(pasted);
       this.runChatTask(text);
       return true;
     });
 
-    this.on('pauseGoal', async () => this.pauseGoal());
-    this.on('resumeGoal', async () => this.resumeGoal());
-    this.on('stopGoal', async () => this.stopGoal());
+    this.on('pauseGoal', async (msg: AbjectMessage) => { await this.requireViewer(msg); return this.pauseGoal(); });
+    this.on('resumeGoal', async (msg: AbjectMessage) => { await this.requireViewer(msg); return this.resumeGoal(); });
+    this.on('stopGoal', async (msg: AbjectMessage) => { await this.requireViewer(msg); return this.stopGoal(); });
 
     this.on('attachMedia', async (msg: AbjectMessage) => {
       const { markdown, sender } = msg.payload as { markdown: string; sender?: string };
@@ -784,6 +899,7 @@ export class Chat extends Abject {
     // Store it in the workspace FileSystem and record an attachment entry for
     // the LLM context.
     this.on('fileUploaded', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
       const { name, mimeType, base64 } = msg.payload as { name: string; mimeType: string; base64: string };
       precondition(typeof name === 'string' && name.length > 0, 'fileUploaded needs a file name');
       await this.handleFileUploaded(name, mimeType ?? 'application/octet-stream', base64 ?? '');
@@ -793,7 +909,7 @@ export class Chat extends Abject {
     this.on('addNotification', async (msg: AbjectMessage) => {
       const { sender, message } = msg.payload as { sender: string; message: string };
       if (!message?.trim()) return false;
-      log.info(`[Chat] addNotification from "${sender}": "${message.trim().slice(0, 80)}"`);
+      log.info(`[Chat] addNotification from "${sender}": "${shown(message.trim().slice(0, 80), this.isPrivate)}"`);
       const id = uuidv4();
       this.recordEntry({ id, role: 'assistant', content: `[${sender}]: ${message.trim()}` });
       this.appendMessage('system', sender || 'System', message.trim(), true, id);
@@ -807,25 +923,36 @@ export class Chat extends Abject {
       const { card, typeId, text, sender } = msg.payload as { card?: unknown; typeId?: string; text?: string; sender?: string };
       precondition(card !== undefined || (typeof typeId === 'string' && typeId.length > 0), 'postCard needs card data or the typeId of an object to show');
       const words = typeof text === 'string' ? text.trim().slice(0, 4000) : '';
-      let shown: { typeId: string; text: string };
+      if (card !== undefined && this.isPrivate) {
+        // A private conversation keeps no card object: what the card shows
+        // goes into the message itself, for every view and the model alike.
+        const content = this.withPrivateCard(words, card);
+        const id = uuidv4();
+        this.recordEntry({ id, role: 'assistant', content, ...(sender ? { sender } : {}) });
+        this.appendMessage('assistant', sender || ASSISTANT_SENDER, content, true, id);
+        this.schedulePersist();
+        return { messageId: id, typeId: '' };
+      }
+      let cardShown: { typeId: string; text: string };
       if (card !== undefined) {
-        shown = await this.makeCard(card);
+        cardShown = await this.makeCard(card);
       } else {
         const storeId = await this.discoverDep('AbjectStore');
         precondition(!!storeId, 'postCard needs the workspace AbjectStore');
         const kept = await this.request<Array<{ typeId: string; name: string; description?: string }>>(request(this.id, storeId!, 'list', {}));
         const found = kept.find(e => e.typeId === typeId);
         precondition(!!found, `postCard: no kept object '${typeId}' in this workspace`);
-        shown = { typeId: found!.typeId, text: `[${found!.name}: ${found!.description ?? ''}]` };
+        cardShown = { typeId: found!.typeId, text: `[${found!.name}: ${found!.description ?? ''}]` };
       }
       const id = uuidv4();
-      this.recordEntry({ id, role: 'assistant', content: words, card: shown, ...(sender ? { sender } : {}) });
-      this.appendMessage('assistant', sender || ASSISTANT_SENDER, words, true, id, { card: shown });
+      this.recordEntry({ id, role: 'assistant', content: words, card: cardShown, ...(sender ? { sender } : {}) });
+      this.appendMessage('assistant', sender || ASSISTANT_SENDER, words, true, id, { card: cardShown });
       this.schedulePersist();
-      return { messageId: id, typeId: shown.typeId };
+      return { messageId: id, typeId: cardShown.typeId };
     });
 
-    this.on('getState', async () => {
+    this.on('getState', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
       return {
         phase: this.turnPhase,
         messageCount: this.conversationHistory.length,
@@ -834,16 +961,20 @@ export class Chat extends Abject {
       };
     });
 
-    this.on('getTranscript', async () => ({
-      conversationId: this.conversationId ?? '',
-      title: this.conversationTitle ?? '',
-      messages: await this.transcriptViews(),
-      controls: this.controls(),
-      activity: this.activitySnapshot(),
-      working: this.isGoalActive(),
-    }));
+    this.on('getTranscript', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
+      return {
+        conversationId: this.conversationId ?? '',
+        title: this.conversationTitle ?? '',
+        messages: await this.transcriptViews(),
+        controls: this.controls(),
+        activity: this.activitySnapshot(),
+        working: this.isGoalActive(),
+      };
+    });
 
-    this.on('clearHistory', async () => {
+    this.on('clearHistory', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
       if (this.conversationHistory.length > 0) {
         if (this.conversationId) this.conversationHistory = identifyMessages(this.conversationId, this.conversationHistory);
         this.edits.record('Clear chat', { kind: 'clear', entries: this.conversationHistory });
@@ -855,7 +986,7 @@ export class Chat extends Abject {
       if (this.conversationId && this.storageId) {
         try {
           await this.request(request(this.id, this.storageId, 'delete', {
-            key: `chats:history:${this.conversationId}`,
+            key: this.historyKey(),
           }));
         } catch { /* best effort */ }
       }
@@ -866,6 +997,7 @@ export class Chat extends Abject {
     });
 
     this.on('setTitle', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
       const { title } = msg.payload as { title: string };
       const next = (title ?? '').trim().slice(0, 80);
       const before = this.conversationTitle ?? '';
@@ -879,17 +1011,35 @@ export class Chat extends Abject {
       return true;
     });
 
-    this.on('undo', async () => {
+    this.on('undo', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
       const result = await this.edits.undo(step => this.applyEdit(step.data, 'undo'));
       this.changed('undoStateChanged', this.edits.state());
       return result;
     });
-    this.on('redo', async () => {
+    this.on('redo', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
       const result = await this.edits.redo(step => this.applyEdit(step.data, 'redo'));
       this.changed('undoStateChanged', this.edits.state());
       return result;
     });
-    this.on('getUndoState', async () => this.edits.state());
+    this.on('getUndoState', async (msg: AbjectMessage) => {
+      await this.requireViewer(msg);
+      return this.edits.state();
+    });
+
+    // How a private goal ended, handed over by GoalManager (or by ChatManager,
+    // which spawned this Chat to take it). It lands exactly as an outcome event does.
+    this.on('privateGoalOutcome', async (msg: AbjectMessage) => {
+      if (!(await this.isBuiltInCaller(msg.routing.from, ['GoalManager', 'ChatManager']))) {
+        throw new Error('Private goal outcomes come from GoalManager or ChatManager');
+      }
+      const outcome = msg.payload as PrivateGoalOutcome;
+      precondition(typeof outcome?.goalId === 'string' && outcome.goalId.length > 0, 'privateGoalOutcome needs a goalId');
+      precondition(['completed', 'failed', 'cancelled'].includes(outcome.status), 'privateGoalOutcome needs a status of completed, failed or cancelled');
+      if (outcome.conversationId && this.conversationId && outcome.conversationId !== this.conversationId) return { accepted: false };
+      return { accepted: await this.acceptPrivateGoalOutcome(outcome) };
+    });
 
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
@@ -915,7 +1065,7 @@ export class Chat extends Abject {
       if (aspect === 'taskPermanentlyFailed') {
         const data = value as { taskId: string; goalId?: string; error?: string; attempts?: number };
         const hasPending = this.pendingTaskCompletions.has(data.taskId);
-        log.info(`[Chat] GoalManager taskPermanentlyFailed ${data.taskId.slice(0, 8)} attempts=${data.attempts ?? '?'} hasPending=${hasPending} error="${(data.error ?? '').slice(0, 60)}"`);
+        log.info(`[Chat] GoalManager taskPermanentlyFailed ${data.taskId.slice(0, 8)} attempts=${data.attempts ?? '?'} hasPending=${hasPending} error="${shown((data.error ?? '').slice(0, 60), this.isPrivate)}"`);
         const pending = this.pendingTaskCompletions.get(data.taskId);
         if (pending) {
           this.pendingTaskCompletions.delete(data.taskId);
@@ -1046,7 +1196,8 @@ export class Chat extends Abject {
 
     // ── AgentAbject callback handlers ──
 
-    this.on('agentObserve', async (_msg: AbjectMessage) => {
+    this.on('agentObserve', async (msg: AbjectMessage) => {
+      if (!(await this.admitsAgentLoop(msg))) throw new Error(PRIVATE_CONVERSATION_UNAVAILABLE);
       // Surface live goal state to the planning LLM. This matters most after
       // a goal action "failed" from a transient wait timeout: the goal keeps
       // running (or completes) in the background, and without this the LLM
@@ -1061,7 +1212,13 @@ export class Chat extends Abject {
 
     this.on('agentAct', (msg: AbjectMessage) => {
       const { action, taskId } = msg.payload as { taskId: string; step: number; action: AgentAction };
-      this.handleAgentAct(action, { id: msg.routing.from, taskId }).then(
+      const acted = this.isPrivate
+        ? this.admitsAgentLoop(msg).then((ok) => {
+          if (!ok) throw new Error(PRIVATE_CONVERSATION_UNAVAILABLE);
+          return this.handleAgentAct(action, { id: msg.routing.from, taskId });
+        })
+        : this.handleAgentAct(action, { id: msg.routing.from, taskId });
+      acted.then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => this.sendDeferredReply(msg, {
           success: false,
@@ -1153,6 +1310,7 @@ export class Chat extends Abject {
           conversationId: this.conversationId,
           title: this.conversationTitle,
           rect: this.initialRect,
+          ...(this.isPrivate ? { private: true } : {}),
         },
       }), 20000);
       windowId = spawned.objectId;
@@ -1525,7 +1683,7 @@ export class Chat extends Abject {
    *  re-spawned Chat can reconnect to it after a restart. Best-effort. */
   private async persistActiveGoal(goalId: string | undefined): Promise<void> {
     if (!this.storageId || !this.conversationId) return;
-    const key = `chats:activegoal:${this.conversationId}`;
+    const key = this.activeGoalKey();
     try {
       if (goalId) {
         await this.request(request(this.id, this.storageId, 'set', { key, value: goalId }));
@@ -1544,7 +1702,7 @@ export class Chat extends Abject {
     let activeGoalId: string | null = null;
     try {
       activeGoalId = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: `chats:activegoal:${this.conversationId}` }),
+        request(this.id, this.storageId, 'get', { key: this.activeGoalKey() }),
       );
     } catch { return; }
     if (typeof activeGoalId !== 'string' || !activeGoalId) return;
@@ -1565,6 +1723,10 @@ export class Chat extends Abject {
       this.liveGoals.delete(activeGoalId);
       this.emitGoalActivity();
       await this.persistActiveGoal(undefined);
+      // A private goal lives in memory only, so a missing one was lost in a
+      // restart, unless its outcome is on its way (this Chat may have been
+      // spawned to take it): say so once the grace runs out.
+      if (this.isPrivate) this.awaitLostGoal(activeGoalId);
       return;
     }
     const reconnected = this.liveGoals.get(activeGoalId)!;
@@ -1606,8 +1768,9 @@ export class Chat extends Abject {
     this.removeActivity();
     await this.deliverLateGoalOutcome({ status, result, error, goalId });
     // The person's next message may react to this result. A stop they asked
-    // for is their own doing, not a result to react to.
-    this.pendingOutcome = userStopped ? undefined : {
+    // for is their own doing, not a result to react to. Nothing is learned
+    // from a private conversation, so it reads no reactions.
+    this.pendingOutcome = userStopped || this.isPrivate ? undefined : {
       goalId, title: entry.title, at: Date.now(),
       result: oneLine(status === 'completed' ? resultText(result) ?? '' : `did not complete: ${error ?? 'unknown error'}`, 400),
     };
@@ -1643,6 +1806,16 @@ export class Chat extends Abject {
   private async postReply(rawText: string, opts: { sourceGoalId?: string; card?: unknown } = {}): Promise<void> {
     const { text, card: block } = extractCardBlock(rawText);
     const cardData = opts.card ?? block;
+    if (this.isPrivate) {
+      // No card object for a private conversation: what it shows joins the text.
+      const content = cardData !== undefined ? this.withPrivateCard(text.trim(), cardData) : text.trim();
+      if (!content) return;
+      const id = uuidv4();
+      this.recordEntry({ id, role: 'assistant', content, ...(opts.sourceGoalId ? { sourceGoalId: opts.sourceGoalId } : {}) });
+      this.appendMessage('assistant', ASSISTANT_SENDER, await this.showable(content), true, id);
+      this.schedulePersist();
+      return;
+    }
     const card = cardData !== undefined ? await this.makeCard(cardData).catch((err) => {
       log.warn(`[Chat] card left out: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
@@ -1674,6 +1847,74 @@ export class Chat extends Abject {
       owner: '',
     }), 30_000);
     return { typeId: made.typeId, text: cardText(card) };
+  }
+
+  /**
+   * Words with a card's content under them, as markdown: how a private
+   * conversation keeps a card (it saves no card object). Card data that does
+   * not pass its check is left out and the words still go.
+   */
+  private withPrivateCard(words: string, raw: unknown): string {
+    let quoted = '';
+    try {
+      quoted = cardText(cleanCardData(raw)).split('\n').filter(l => l.trim()).map(l => `> ${l}`).join('\n');
+    } catch (err) {
+      log.warn(`[Chat] card left out: ${shown(err instanceof Error ? err.message : String(err), this.isPrivate)}`);
+    }
+    return [words, quoted].filter(Boolean).join('\n\n');
+  }
+
+  /**
+   * A private goal read as missing on respawn: wait a moment for its outcome
+   * (privateGoalOutcome cancels this), then tell the person it was lost.
+   */
+  private awaitLostGoal(goalId: string): void {
+    if (this.lostGoal) this.cancelTimer(this.lostGoal.timer);
+    const timer = this.setTimer(() => {
+      if (this.lostGoal?.goalId !== goalId) return;
+      this.lostGoal = undefined;
+      this.postDisplayOnly('system', 'Chat', PRIVATE_GOAL_LOST);
+    }, LOST_GOAL_GRACE_MS);
+    this.lostGoal = { goalId, timer };
+  }
+
+  /** Whether a goal's outcome already reached this conversation. */
+  private outcomeDelivered(goalId: string): boolean {
+    return this.recentGoalOutcomes.some(g => g.goalId === goalId)
+      || this.conversationHistory.some(e => e.sourceGoalId === goalId);
+  }
+
+  /**
+   * Take a private goal's outcome through the same path as an outcome event
+   * (acceptGoalOutcome), so it reads exactly the same, then save the
+   * transcript before acknowledging: GoalManager deletes the goal on our word.
+   * An outcome the targeted event already delivered is acknowledged as is.
+   */
+  private async acceptPrivateGoalOutcome(outcome: PrivateGoalOutcome): Promise<boolean> {
+    if (this.lostGoal?.goalId === outcome.goalId) {
+      this.cancelTimer(this.lostGoal.timer);
+      this.lostGoal = undefined;
+    }
+    if (this.outcomeDelivered(outcome.goalId)) return true;
+    // A Chat spawned to take the outcome, or one whose marker read as lost,
+    // has no live entry for the goal: seed it so the outcome lands as usual.
+    if (!this.liveGoals.has(outcome.goalId)) {
+      this.liveGoals.set(outcome.goalId, { title: '(private goal)', status: 'active' });
+    }
+    if (!this._currentGoalId) this._currentGoalId = outcome.goalId;
+    const status = outcome.status === 'completed' ? 'completed' : 'failed';
+    const error = outcome.status === 'cancelled' ? (outcome.error ?? 'Stopped') : outcome.error;
+    const current = this._currentGoalId === outcome.goalId;
+    await this.acceptGoalOutcome(outcome.goalId, status, outcome.result, error);
+    // An outcome event for a goal that is no longer current is only noted;
+    // a private goal is deleted once this returns, so its result is posted.
+    if (!current) await this.deliverLateGoalOutcome({ status, result: outcome.result, error, goalId: outcome.goalId });
+    if (this.persistTimer) {
+      this.cancelTimer(this.persistTimer);
+      this.persistTimer = undefined;
+    }
+    await this.persistHistory();
+    return true;
   }
 
   /** The folder this conversation's cards live in. */
@@ -1885,7 +2126,11 @@ export class Chat extends Abject {
       return { success: true };
     }
 
-    // Handle remember action directly (no agent dispatch needed)
+    // Handle remember action directly (no agent dispatch needed). A private
+    // conversation saves nothing, and the model hears why.
+    if (action.action === 'remember' && this.isPrivate) {
+      return { success: false, error: PRIVATE_REMEMBER_REFUSAL };
+    }
     if (action.action === 'remember') {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (!knowledgeBaseId) return { success: false, error: 'KnowledgeBase not available' };
@@ -1919,11 +2164,17 @@ export class Chat extends Abject {
         if (!this._currentGoalId) {
           // Capture the actual conversation, independently of the model's prose.
           // Persisting it with the goal also survives closing/clearing the chat.
-          const context = this.turnContext ?? this.captureGoalContext();
+          const captured = this.turnContext ?? this.captureGoalContext();
+          // A private goal's crew reads attachments from the goal itself, not
+          // from workspace files: the context says where, the data follows.
+          const shared = this.isPrivate && captured ? await this.privateGoalContext(captured) : undefined;
+          const context = shared?.context ?? captured;
           const created = await this.request<{ goalId: string }>(request(this.id, this.goalManagerId, 'createGoal', {
             title: title.slice(0, 200), description, operationId: `chat:${caller.taskId}`,
             ...(context ? { context } : {}),
+            ...(this.isPrivate ? { private: true, ...(this.conversationId ? { conversationId: this.conversationId } : {}) } : {}),
           }));
+          if (shared) await this.shareAttachmentsWithGoal(created.goalId, shared.attachments);
           this._currentGoalId = created.goalId;
           this.pendingOutcome = undefined;
           this.goalPaused = false;
@@ -1996,7 +2247,7 @@ ${this.recentGoalOutcomes.map(g => `- [${g.status}] "${g.title}"${g.resultPrevie
 
 Current date: ${dateLine} (${isoDate}). When the user mentions relative times ("today", "tomorrow", "next week", "in 3 days"), resolve them against this date.${recentGoalsBlock}
 
-A \`goal\` action ends this routing turn once GoalManager accepts it. The chat receives progress and the final result through bus events. Do not poll goal status or narrate unobserved progress.
+${this.isPrivate ? PRIVATE_CHAT_PROMPT : ''}${PRIVATE_ELSEWHERE_CHAT_PROMPT}A \`goal\` action ends this routing turn once GoalManager accepts it. The chat receives progress and the final result through bus events. Do not poll goal status or narrate unobserved progress.
 
 ${desktop ? DESKTOP_SCENE_PROMPT : ''}## Action Format
 
@@ -2223,7 +2474,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       await this.persistHistory();
     } else if (this.conversationId && this.storageId) {
       try {
-        await this.request(request(this.id, this.storageId, 'delete', { key: `chats:history:${this.conversationId}` }));
+        await this.request(request(this.id, this.storageId, 'delete', { key: this.historyKey() }));
       } catch { /* best effort */ }
     }
     if (this.windowId) {
@@ -2245,7 +2496,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.conversationHistory = identifyMessages(this.conversationId, this.conversationHistory);
     try {
       await this.request(request(this.id, this.storageId, 'set', {
-        key: `chats:history:${this.conversationId}`,
+        key: this.historyKey(),
         value: this.conversationHistory,
       }));
     } catch { /* best effort */ }
@@ -2253,10 +2504,12 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   /**
    * Auto-derive a title from the first user message. No-op if the user or a
-   * caller has already given the conversation a non-default title.
+   * caller has already given the conversation a non-default title, and for a
+   * private conversation, whose title would show its words in the roster: it
+   * keeps its neutral title unless the person renames it.
    */
   private maybeAutoTitle(userText: string): void {
-    if (!this.conversationId) return;
+    if (!this.conversationId || this.isPrivate) return;
     const current = (this.conversationTitle ?? '').trim();
     if (current && current !== 'New chat') return;
     const cleaned = userText.replace(/\s+/g, ' ').trim();
@@ -2275,6 +2528,7 @@ A single successful creation goal is a complete turn. End it with **done**.
    * context once on the next turn (see `runChatTask`), then referenced by name.
    */
   private async handleFileUploaded(name: string, mimeType: string, base64: string): Promise<void> {
+    if (this.isPrivate) return this.handlePrivateUpload(name, mimeType, base64);
     if (!this.fileSystemId) {
       this.postDisplayOnly('error', 'Upload', 'No filesystem available to store the file.');
       this.playEffect('shake');
@@ -2314,6 +2568,116 @@ A single successful creation goal is a complete turn. End it with **done**.
   }
 
   /**
+   * A private conversation's upload: kept in its private store (never the
+   * workspace FileSystem), at most PRIVATE_ATTACHMENT_MAX_BYTES, and recorded
+   * as an attachment whose path is that store key.
+   */
+  private async handlePrivateUpload(name: string, mimeType: string, base64: string): Promise<void> {
+    const safeName = name.replace(/[/\\]/g, '_');
+    const path = await this.storePrivateUpload(safeName, base64);
+    if (!path) {
+      this.playEffect('shake');
+      return;
+    }
+    const kind: 'text' | 'image' | 'document' =
+      IMAGE_MIME.has(mimeType) ? 'image' :
+      mimeType === 'application/pdf' ? 'document' : 'text';
+    const id = uuidv4();
+    this.recordEntry({
+      id,
+      role: 'user',
+      content: `${ATTACH_GLYPH} Attached ${safeName}`,
+      sender: 'You',
+      attachment: { path, name: safeName, mimeType, kind, injected: false },
+    });
+    this.appendMessage('user', 'You', `${ATTACH_GLYPH} Attached **${safeName}**`, true, id);
+    this.schedulePersist();
+    this.playEffect('flash', '$accent');
+  }
+
+  /**
+   * Keep a private upload's bytes under its conversation's `private:` upload
+   * key; the key, or undefined (with the reason shown) when it was refused.
+   */
+  private async storePrivateUpload(safeName: string, base64: string): Promise<string | undefined> {
+    precondition(this.isPrivate, 'only a private conversation keeps uploads in its private store');
+    const bytes = Math.floor(base64.length * 3 / 4);
+    if (bytes > PRIVATE_ATTACHMENT_MAX_BYTES) {
+      this.postDisplayOnly('error', 'Upload', `"${safeName}" is larger than a private chat keeps (${Math.round(PRIVATE_ATTACHMENT_MAX_BYTES / (1024 * 1024))} MB).`);
+      return undefined;
+    }
+    if (!this.storageId || !this.conversationId) {
+      this.postDisplayOnly('error', 'Upload', 'No private store available to keep the file.');
+      return undefined;
+    }
+    const key = `${PRIVATE_KEY_PREFIX}chats:upload:${this.conversationId}:${uuidv4()}`;
+    try {
+      await this.request(request(this.id, this.storageId, 'set', { key, value: base64 }), 30000);
+    } catch (err) {
+      log.warn(`[Chat] failed to keep a private upload: ${err instanceof Error ? err.message : String(err)}`);
+      this.postDisplayOnly('error', 'Upload', `Failed to store "${safeName}".`);
+      return undefined;
+    }
+    return key;
+  }
+
+  /** A private upload's bytes (base64), or null. */
+  private async readPrivateUpload(key: string): Promise<string | null> {
+    if (!this.storageId || !isPrivateKey(key)) return null;
+    const value = await this.request<unknown>(request(this.id, this.storageId, 'get', { key }), 30000);
+    return typeof value === 'string' ? value : null;
+  }
+
+  /**
+   * The conversation a private goal carries: each attachment's message says
+   * which goal data key holds it (text inline too), and the store keys stay
+   * here. Returns the attachments to write once the goal exists.
+   */
+  private async privateGoalContext(captured: ConversationContext): Promise<{
+    context: ConversationContext;
+    attachments: Array<{ key: string; path: string; name: string; mimeType: string; kind: string }>;
+  }> {
+    const attachments: Array<{ key: string; path: string; name: string; mimeType: string; kind: string }> = [];
+    const messages: ConversationContext['messages'] = [];
+    for (const m of captured.messages) {
+      if (!m.attachment || !isPrivateKey(m.attachment.path)) { messages.push(m); continue; }
+      const { path, name, mimeType, kind } = m.attachment;
+      const key = `attachments/${m.id}`;
+      attachments.push({ key, path, name, mimeType, kind });
+      let content = `[Attached ${name} (${mimeType}): read it from this goal's data under "${key}" ({ name, mimeType, kind, base64 })]`;
+      if (kind === 'text') {
+        const base64 = await this.readPrivateUpload(path).catch(() => null);
+        if (base64) {
+          const text = Buffer.from(base64, 'base64').toString('utf8');
+          const limit = await this.attachmentLimit();
+          content += `\n\`\`\`\n${text.length > limit ? text.slice(0, limit) + '\n…[truncated]' : text}\n\`\`\``;
+        }
+      }
+      const { attachment: _kept, ...rest } = m;
+      messages.push({ ...rest, content });
+    }
+    return { context: { ...captured, messages }, attachments };
+  }
+
+  /** Put a private goal's attachments in its own data, where its crew reads them. */
+  private async shareAttachmentsWithGoal(
+    goalId: string, attachments: Array<{ key: string; path: string; name: string; mimeType: string; kind: string }>,
+  ): Promise<void> {
+    if (!this.goalManagerId) return;
+    for (const a of attachments) {
+      try {
+        const base64 = await this.readPrivateUpload(a.path);
+        if (!base64) continue;
+        await this.request(request(this.id, this.goalManagerId, 'writeGoalData', {
+          goalId, key: a.key, value: { name: a.name, mimeType: a.mimeType, kind: a.kind, base64 },
+        }), 30000);
+      } catch (err) {
+        log.warn(`[Chat] a private attachment did not reach its goal: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  /**
    * Images pasted with a message: store the bytes in the workspace FileSystem
    * (so the LLM gets a vision block from the file path) and show each as an
    * inline image message. The message carries a `data:` URI directly, since a
@@ -2325,9 +2689,13 @@ A single successful creation goal is a complete turn. End it with **done**.
       const mimeType = IMAGE_MIME.has(img.mimeType) ? img.mimeType : 'image/png';
       const dataUri = `data:${mimeType};base64,${img.base64}`;
 
-      // Store the bytes so the LLM receives a vision block read from the path.
+      // Store the bytes so the LLM receives a vision block read from the path
+      // (a private conversation keeps them in its private store).
       let path: string | undefined;
-      if (this.fileSystemId) {
+      if (this.isPrivate) {
+        path = await this.storePrivateUpload(safeName, img.base64);
+        if (!path) continue; // refused, and said so: a private chat keeps no oversized copy
+      } else if (this.fileSystemId) {
         const convo = this.conversationId ?? this.id;
         path = `/uploads/${convo}/${Date.now()}-${safeName}`;
         try {
@@ -2383,6 +2751,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async buildAttachmentContent(att: {
     path: string; name: string; mimeType: string; kind: 'text' | 'image' | 'document';
   }): Promise<string | ContentPart[] | null> {
+    if (isPrivateKey(att.path)) return this.buildPrivateAttachmentContent(att);
     if (!this.fileSystemId) return null;
     try {
       if (att.kind === 'text') {
@@ -2408,6 +2777,35 @@ A single successful creation goal is a complete turn. End it with **done**.
       ];
     } catch (err) {
       log.warn(`[Chat] failed to read attachment ${att.name}:`, err);
+      return null;
+    }
+  }
+
+  /** buildAttachmentContent for an attachment in the private store. */
+  private async buildPrivateAttachmentContent(att: {
+    path: string; name: string; mimeType: string; kind: 'text' | 'image' | 'document';
+  }): Promise<string | ContentPart[] | null> {
+    try {
+      const base64 = await this.readPrivateUpload(att.path);
+      if (!base64) return null;
+      if (att.kind === 'text') {
+        const text = Buffer.from(base64, 'base64').toString('utf8');
+        const limit = await this.attachmentLimit();
+        const body = text.length > limit ? text.slice(0, limit) + '\n…[truncated]' : text;
+        return `Attached file ${att.name}:\n\`\`\`\n${body}\n\`\`\``;
+      }
+      if (att.kind === 'image') {
+        return [
+          { type: 'text', text: `Attached image: ${att.name}` },
+          { type: 'image', mediaType: att.mimeType, data: base64 } as ContentPart,
+        ];
+      }
+      return [
+        { type: 'text', text: `Attached document: ${att.name}` },
+        { type: 'document', mediaType: 'application/pdf', data: base64, name: att.name } as ContentPart,
+      ];
+    } catch (err) {
+      log.warn(`[Chat] failed to read a private attachment: ${err instanceof Error ? err.message : String(err)}`);
       return null;
     }
   }
@@ -2455,6 +2853,7 @@ A single successful creation goal is a complete turn. End it with **done**.
           initialMessages: messages,
           goalId: undefined,
           config: { queueName: `chat-${this.id}` },
+          ...(this.isPrivate ? { private: true } : {}),
         }),
         60000,
       );
@@ -2511,7 +2910,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       .map(e => ({ role: e.role, content: withCardText(e).slice(0, 300) }));
     const outcome = await this.askDecision('chat.audit', {
       request: userText.slice(0, 1500), text: draft.slice(0, 4000), recent,
-    }, replyKindQuestions(), { onBehalfOf: 'Chat', nativeOnly });
+    }, replyKindQuestions(), { onBehalfOf: 'Chat', nativeOnly, ...(this.isPrivate ? { private: true } : {}) });
     const kind = choiceOf(outcome, 'reply_kind');
     if (!outcome || !kind) return shaped;
     const p = kind.probabilities[kind.choice] ?? 0;
@@ -2561,7 +2960,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     const outcome = await this.askDecision('chat.route', {
       message: userText.slice(0, 3000), recent, recent_goals: recentGoals, has_new_attachment: newAttachment,
       ...(reactingTo ? { last_result: { goal: reactingTo.title, result: reactingTo.result } } : {}),
-    }, reactingTo ? { ...CHAT_ROUTE_QUESTIONS, reaction: CHAT_REACTION_QUESTION } : CHAT_ROUTE_QUESTIONS, { onBehalfOf: 'Chat' });
+    }, reactingTo ? { ...CHAT_ROUTE_QUESTIONS, reaction: CHAT_REACTION_QUESTION } : CHAT_ROUTE_QUESTIONS, { onBehalfOf: 'Chat', ...(this.isPrivate ? { private: true } : {}) });
     if (reactingTo) {
       // No reading came back (the routing site may want a native model the
       // reaction site does without): ask the reaction question on its own.
@@ -2580,7 +2979,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private takePendingOutcome(): PendingOutcome | undefined {
     const pending = this.pendingOutcome;
     this.pendingOutcome = undefined;
-    if (!pending || this._currentGoalId) return undefined;
+    if (!pending || this._currentGoalId || this.isPrivate) return undefined;
     return Date.now() - pending.at <= REACTION_WINDOW_MS ? pending : undefined;
   }
 
@@ -2648,7 +3047,7 @@ A single successful creation goal is a complete turn. End it with **done**.
    * own ungrounded claim when asked point-blank.
    */
   private buildAuditPrompt(draft: string): string {
-    return `Before this reply reaches the user, audit it:\n\n"${draft}"\n\nYou created NO goal this turn, so you did not actually perform any action or observe any live state. Two things to check, and either one means this reply is not ready:\n\n1. Does it claim an action was done, report the state of a window/screen/deck, or say something was "verified"?\n2. Does it tell the user something is missing, unavailable, not installed, not registered, or beyond reach?\n\nThe second is a report on live state exactly as much as the first, and you cannot establish it from here. A name that failed to resolve means nothing is registered under that spelling — it does not mean the system lacks the capability, because a registered name cannot see a skill, tool, or connection acquired after registration, and much of what this system can do is reached through an agent rather than an object of that name.\n\nIf either is YES, respond now with a \`goal\` action that actually attempts what the user asked, and report the outcome — including a genuine inability — only from what that goal returns. If the reply is only a greeting, a question, or an answer built from facts already in this conversation, it's fine — respond with the same \`done\` unchanged.`;
+    return `Before this reply reaches the user, audit it:\n\n"${draft}"\n\nYou created NO goal this turn, so you did not actually perform any action or observe any live state. Two things to check, and either one means this reply is not ready:\n\n1. Does it claim an action was done, report the state of a window/screen/deck, or say something was "verified"?\n2. Does it tell the user something is missing, unavailable, not installed, not registered, or beyond reach?\n\nThe second is a report on live state exactly as much as the first, and you cannot establish it from here. A name that failed to resolve means nothing is registered under that spelling — it does not mean the system lacks the capability, because a registered name cannot see a skill, tool, or connection acquired after registration, and much of what this system can do is reached through an agent rather than an object of that name.\n\nIf either is YES, respond now with a \`goal\` action that actually attempts what the user asked, and report the outcome — including a genuine inability — only from what that goal returns. If the reply is only a greeting, a question, or an answer built from facts already in this conversation, it's fine — respond with the same \`done\` unchanged. ${PRIVATE_AUDIT_EXCEPTION}`;
   }
 
   private async runChatTask(userText: string): Promise<void> {
@@ -2756,7 +3155,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       const errMsg = err instanceof Error ? err.message : String(err);
       this.postDisplayOnly('error', 'Error', errMsg.slice(0, 200));
       this.playEffect('glitch');
-      await this.notify(`Chat error: ${errMsg.slice(0, 80)}`, 'error');
+      await this.notify(`Chat error: ${shown(errMsg.slice(0, 80), this.isPrivate)}`, 'error');
     }
 
     this.turnPhase = 'idle';

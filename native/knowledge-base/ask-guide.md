@@ -15,6 +15,10 @@
 
   const entry = await call(await dep('KnowledgeBase'), 'get', { id: hits[0].id });
 
+A read on behalf of a private conversation passes `track: false` (recall, weave, match, get, list, listTags): the entry's access count stays as it was and the log keeps the query and titles out.
+
+  const quiet = await call(await dep('KnowledgeBase'), 'recall', { query: 'ui preferences', previews: true, track: false });
+
 ### How far to trust an entry
 Full entries carry `evidence`: how often predictions and assumptions that rested on the entry held (`held`/`missed` when it was cited, `shownHeld`/`shownMissed` when it was only shown), with `confidence` (the chance its claim holds), `uncertainty` (1 when untested, falling with tests and rising again as they age) and `flagged` (its misses outnumber its holds: check it before relying on it). Previews carry it once the entry has been tested. Reviewers record these tests; agents only read them. To find what is relied on most but known least, the entries most worth checking:
 

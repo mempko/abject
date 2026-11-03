@@ -16,6 +16,7 @@
 
 import { AbjectId, TypeId, AbjectMessage } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import { BOOTSTRAP_SENDER_ID } from '../core/built-in.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request as createRequest, error as createError } from '../core/message.js';
 import type { MessageInterceptor, MessageBus } from '../runtime/message-bus.js';
@@ -1018,6 +1019,14 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     const expectedPeerId = knownSystemRoute?.nextHop ?? knownWorkspaceRoute?.nextHop;
     if (expectedPeerId && expectedPeerId !== fromPeerId) {
       log.warn(`AUTHENTICATED_SENDER_MISMATCH: object=${claimedSender.slice(0, 16)} expected=${expectedPeerId.slice(0, 16)} authenticated=${fromPeerId.slice(0, 16)}`);
+      return;
+    }
+    // Nor may a peer speak as an object of this instance. Handlers decide who
+    // a caller is from routing.from (isBuiltInCaller looks the id up in the
+    // local Registry), so a remote message carrying a local id, or the
+    // bootstrap sender, would pass every built-in check on this side.
+    if (claimedSender === BOOTSTRAP_SENDER_ID || this._messageBus?.isRegistered(claimedSender)) {
+      log.warn(`AUTHENTICATED_SENDER_LOCAL: peer=${fromPeerId.slice(0, 16)} claimed local object=${String(claimedSender).slice(0, 16)}`);
       return;
     }
 

@@ -207,7 +207,10 @@ conversation), `goalProgress` (to connections watching a chat in that
 workspace), and to every connection `conversationCreated`,
 `conversationDeleted`, `conversationRenamed`, `conversationOpened`, `dialog`,
 `dialogClosed`, `settingsChanged` and `toast`. Chat subscriptions are shared
-and reference-counted across connections.
+and reference-counted across connections. `newChat {private: true}` starts a
+private chat (`/private` in the TUI); `listChats` rows carry `private: true`;
+roster events for private chats are passed on with their real title, which
+ChatManager gives only to views such as this one.
 
 ### auth.ts, auth-gate.ts
 
@@ -254,7 +257,12 @@ Desktop only; the headless bundle check forbids all three.
   re-allocated them at a new pixel ratio (`repaintSurfaces`). Frames are binary (`src/network/wire-codec.ts`), images go out
   once per client as content-addressed blobs (`abx:sha256:`), and each client
   has its own send queue with flow control (`frameAck`), coalescing, and a
-  hard cap that drops a stalled client.
+  hard cap that drops a stalled client. Private surfaces
+  (`createSurface { private, ownerId }`) are kept out of programmatic
+  captures: `captureScreenshot` only for the owner (Screenshot forwards
+  `onBehalfOf`), `captureDesktop` refused while one is on the active desktop,
+  `listWindows` untitled, synthetic input only from the surface and its
+  owner. Clients render them as usual.
 - **ui-transport.ts**: the `UITransport` abstraction over a client
   connection: `WebSocketUITransport` (main thread) and
   `MessagePortUITransport` (in the UI worker), plus helpers that pass binary
@@ -274,7 +282,9 @@ Desktop only; the headless bundle check forbids all three.
 prepared statements. The global store is `<dataDir>/storage.db`, each
 workspace's `<dataDir>/ws-<id>/storage.db`. A legacy `storage.json` beside it
 is imported once and renamed to `.bak`. If SQLite cannot open, it degrades to
-memory (no persistence) and logs an error.
+memory (no persistence) and logs an error. `secure_delete` is on, and deleting
+a `private:` key also checkpoints and truncates the write-ahead log, so no copy
+of a deleted private conversation stays in the files.
 
 ### node-worker-adapter.ts
 

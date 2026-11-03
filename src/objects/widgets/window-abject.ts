@@ -30,6 +30,7 @@ import {
 } from './popout.js';
 import { isScreenAnchor, type ScreenAnchor } from '../../ui/gl/scene-types.js';
 import { undoKeyAction } from '../../core/undo.js';
+import { PRIVATE_TITLE } from '../../core/privacy.js';
 
 /** The four title-bar buttons, as WindowManager names them. */
 type TitleButtonKind = 'close' | 'minimize' | 'maximize' | 'help';
@@ -70,6 +71,13 @@ export interface WindowConfig {
    * of the screen at a readable scale; the desktop at zoom 1 ignores it.
    */
   screenAnchor?: ScreenAnchor;
+  /**
+   * A private conversation's window: its title reads as PRIVATE_TITLE to
+   * anyone but its owner and WidgetManager, only its owner, its widgets and
+   * objects the owner granted access may become dependents (its events carry
+   * keys and uploaded files), and UIServer keeps its pixels from captures.
+   */
+  private?: boolean;
 }
 
 /**
@@ -108,6 +116,7 @@ export class WindowAbject extends Abject {
   /** Who made this window and for whom (see WindowConfig). */
   private readonly managerId?: AbjectId;
   private readonly ownerAppId?: AbjectId;
+  private readonly isPrivate: boolean;
   /** Senders WidgetManager admitted to this window, so they are asked about once. */
   private admitted = new Set<AbjectId>();
   private static readonly ADMITTED_MAX = 256;
@@ -188,7 +197,7 @@ export class WindowAbject extends Abject {
               },
               {
                 name: 'getTitle',
-                description: 'Get window title',
+                description: 'Get window title (a private window answers a placeholder to anyone but its owner)',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -325,6 +334,7 @@ export class WindowAbject extends Abject {
     this.uiServerId = config.uiServerId;
     this.managerId = config.managerId;
     this.ownerAppId = config.ownerAppId;
+    this.isPrivate = config.private === true;
     this.title = config.title;
     this.rect = { ...config.rect };
     this.focusDecoration = config.focusDecoration ?? null;
@@ -359,6 +369,26 @@ export class WindowAbject extends Abject {
       if (this.admitted.size >= WindowAbject.ADMITTED_MAX) this.admitted.clear();
       this.admitted.add(from);
     }
+    return ok === true;
+  }
+
+  /** Who reads a private window's real title: the window, its owner, WidgetManager and UIServer. */
+  private seesPrivateTitle(from: AbjectId): boolean {
+    return from === this.id || from === this.ownerAppId || from === this.managerId || from === this.uiServerId;
+  }
+
+  /**
+   * A private window's events (keys nobody consumed, uploaded files) go only
+   * to its owner, its widgets, WidgetManager and objects the owner granted
+   * access; WidgetManager answers for widgets it knows and grants. Other
+   * windows take any dependent, as before.
+   */
+  protected override async admitsDependent(callerId: AbjectId): Promise<boolean> {
+    if (!this.isPrivate || !this.managerId) return true;
+    if (this.seesPrivateTitle(callerId) || this.children.includes(callerId)) return true;
+    const ok = await this.request<boolean>(
+      request(this.id, this.managerId, 'admitsToWindow', { windowId: this.id, objectId: callerId, asDependent: true }), 5000,
+    ).catch(() => false);
     return ok === true;
   }
 
@@ -437,7 +467,8 @@ export class WindowAbject extends Abject {
       return { ...this.rect, w: this.rect.width, h: this.rect.height };
     });
 
-    this.on('getTitle', async () => {
+    this.on('getTitle', async (msg: AbjectMessage) => {
+      if (this.isPrivate && !this.seesPrivateTitle(msg.routing.from)) return PRIVATE_TITLE;
       return this.title;
     });
 
@@ -979,6 +1010,7 @@ by re-matching title/owner.
         closable: this.closable,
         chromeless: this.chromeless,
         ...(this.screenAnchor ? { screenAnchor: this.screenAnchor } : {}),
+        ...(this.isPrivate ? { private: true, ownerId: this.ownerAppId } : {}),
       })
     );
     // Forward title to frontend for mobile tab bar

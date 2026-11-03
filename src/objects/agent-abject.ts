@@ -38,6 +38,7 @@ import {
   criterion, instruction,
 } from '../core/decision-questions.js';
 import { CHARS_PER_TOKEN, SOFT_BUDGET_FRACTION, HARD_BUDGET_FRACTION, FALLBACK_CONVERSATION_CHARS, conversationBudget } from '../llm/context-window.js';
+import { isPrivatePayload, shown, PRIVATE_REMEMBER_REFUSAL, PRIVATE_REFUSAL_GUIDANCE } from '../core/privacy.js';
 
 const log = new Log('AgentAbject');
 
@@ -461,6 +462,8 @@ interface QueuedTask {
    * on a known existing object). AgentAbject does not interpret it.
    */
   data?: Record<string, unknown>;
+  /** Work for a private conversation's goal (see src/core/privacy.ts). */
+  private?: boolean;
 }
 
 /** What one think-step call returns from the LLM object's `stream`. */
@@ -582,6 +585,16 @@ interface TaskEntry {
    * PermissionBroker read this through getTaskStatus.
    */
   readOnly?: boolean;
+  /**
+   * Set for a private conversation's work (startTask/enqueueTask `private:
+   * true`, or work asked or delegated from a private task). Restriction only:
+   * nothing of it is checkpointed or learned, its LLM calls and decisions
+   * carry `private: true`, its reads answer only its circle, and its
+   * broadcasts carry no content. It runs only on built-in agents.
+   */
+  private?: boolean;
+  /** A private task whose goal was forgotten while it ran: dropped when its loop ends. */
+  forgotten?: boolean;
   /**
    * Patterns the goal's plan assigned to this task, with the planner's reason.
    * They reach the prompt beside the woven ones, so the agent applies them
@@ -1021,6 +1034,13 @@ function rankByOverlap<T extends { text: string }>(expect: string, candidates: T
     .map(r => ({ ...r.c, score: Math.round((r.shared / want.size) * 100) / 100 }));
 }
 
+/** Built-in objects that read a private task beside its agent and its caller (the goal's circle). */
+const PRIVATE_TASK_READERS = ['GoalManager', 'ScrumMaster'] as const;
+/** The refusal for private work handed to an agent that is not built-in. */
+const PRIVATE_BUILT_IN_ONLY = 'Private goals run only on built-in agents.';
+/** What a reader outside a private task's circle hears in place of its contents. */
+const PRIVATE_TASK_UNAVAILABLE = 'private task';
+
 /** Runtime verbs a check step keeps: they read, or something downstream enforces their effect. */
 const READ_ONLY_RUNTIME_VERBS = new Set(['replan', 'recall', 'read_chunk', 'read_context', 'submit_job']);
 /** Shell actions: PermissionBroker judges their effect for a check step. */
@@ -1156,6 +1176,13 @@ export class AgentAbject extends Abject {
    * pauseTasksByGoal/resumeTasksByGoal (called from GoalManager).
    */
   private pausedGoals = new Set<string>();
+  /**
+   * Goals whose work is private, learned from the private tasks and queued
+   * work that named them. Any later task on one of them is private too, so a
+   * caller that forgets the flag cannot widen what a private goal shows.
+   * Memory only; a goal leaves at forgetPrivateGoal.
+   */
+  private privateGoals = new Set<string>();
   /** Hold queued admission while a specialist is restoring its task-local state. */
   private restoringAgents = new Set<AbjectId>();
 
@@ -1247,6 +1274,7 @@ export class AgentAbject extends Abject {
                 { name: 'config', type: { kind: 'object', properties: {} }, description: 'Per-task config overrides: { maxSteps?: number (default 25), timeout?: number (default 300000ms) }', optional: true },
                 { name: 'responseSchema', type: { kind: 'object', properties: {} }, description: 'JSON Schema for structured result', optional: true },
                 { name: 'readOnly', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Run the task as a read-only check step: actions that change things are refused. Queued tasks get this from dispatch data `check: true`.', optional: true },
+                { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Work for a private conversation: kept in memory only, nothing learned, LLM calls private, readable only by its agent, its caller and its goal\'s circle. Runs only on built-in agents. Work asked or delegated from a private task is private too.', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 ticketId: { kind: 'primitive', primitive: 'string' },
@@ -1270,7 +1298,7 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'getTaskStatus',
-              description: 'Get status of a task. readOnly is true for a check step (dispatch data `check: true`), which may only read.',
+              description: 'Get status of a task. readOnly is true for a check step (dispatch data `check: true`), which may only read. private is true for a private conversation\'s task.',
               parameters: [
                 { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task ID' },
               ],
@@ -1280,6 +1308,7 @@ export class AgentAbject extends Abject {
                 error: { kind: 'primitive', primitive: 'string' },
                 agentId: { kind: 'primitive', primitive: 'string' },
                 readOnly: { kind: 'primitive', primitive: 'boolean' },
+                private: { kind: 'primitive', primitive: 'boolean' },
               } },
             },
             {
@@ -1393,6 +1422,7 @@ export class AgentAbject extends Abject {
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal this task belongs to (for cancellation cascades and progress)', optional: true },
                 { name: 'dispatchTupleId', type: { kind: 'primitive', primitive: 'string' }, description: 'TupleSpace tuple ID — when set, AgentAbject calls completeTask/failTask on this tuple after the OTA loop terminates', optional: true },
                 { name: 'data', type: { kind: 'object', properties: {} }, description: 'Opaque task-specific data forwarded to the agent\'s executeTask `data` field (e.g. { target } naming a concrete object). AgentAbject does not interpret it.', optional: true },
+                { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Work for a private goal (see startTask private). Refused for an agent that is not built-in; executeTask carries private: true.', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 taskId: { kind: 'primitive', primitive: 'string' },
@@ -1430,7 +1460,7 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'taskCompleted',
-              description: 'A task completed (broadcast)',
+              description: 'A task completed (broadcast). A private task\'s carries only { taskId, private: true, success }.',
               payload: { kind: 'object', properties: {
                 taskId: { kind: 'primitive', primitive: 'string' },
                 agentId: { kind: 'primitive', primitive: 'string' },
@@ -1689,6 +1719,148 @@ The registered object must implement these handlers to participate in the agent 
     return goals.size === 1 ? only : undefined;
   }
 
+  /**
+   * Whether a live private task's current action is a message to this agent.
+   * Work an agent starts because a private task called it is that task's
+   * work (the reasoning of goalOfCallingTask), so it is private too. Any
+   * private caller is enough: the flag only restricts.
+   */
+  private privateCallingTask(agentId: AbjectId): boolean {
+    const name = this.registeredAgents.get(agentId)?.name;
+    for (const e of this.taskEntries.values()) {
+      if (!e.private || e.finished || e.state.phase === 'error') continue;
+      const action = (e.outstandingOperation as { action?: Record<string, unknown> } | undefined)?.action;
+      if (!action) continue;
+      for (const target of [action.object, action.target, action.agent]) {
+        if (target !== undefined && (target === agentId || target === name)) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Who may read a private task: its agent, its caller, this runtime, and the
+   * built-in objects of its goal's circle (PRIVATE_TASK_READERS). Everyone
+   * reads an ordinary task. The returned check asks the Registry at most once
+   * per caller, so a listing pays for one lookup however many tasks it holds.
+   */
+  private taskVisibility(msg: AbjectMessage): (task: { private?: boolean; agentId: AbjectId; callerId: AbjectId; state?: { id: string } }) => Promise<boolean> {
+    const callerId = msg.routing.from;
+    let reader: Promise<boolean> | undefined;
+    let stepOf: Promise<string | undefined> | undefined;
+    return async task => {
+      if (!task.private || callerId === this.id || callerId === task.agentId || callerId === task.callerId) return true;
+      if (await (reader ??= this.isBuiltInCaller(callerId, PRIVATE_TASK_READERS))) return true;
+      // Every job's calls arrive from JobManager, whoever wrote the job, so
+      // JobManager is no reader by name: a job sees a private task only when
+      // it is this runtime's own step for that very task.
+      const stepTask = await (stepOf ??= this.runtimeStepTaskOf(msg));
+      return stepTask !== undefined && stepTask === task.state?.id;
+    };
+  }
+
+  /**
+   * The task a call made by a job works for, when the job is one this runtime
+   * submitted (JobManager's invocation context says who submitted it);
+   * undefined for any other caller or job.
+   */
+  private async runtimeStepTaskOf(msg: AbjectMessage): Promise<string | undefined> {
+    const jobs = await this.discoverDep('JobManager');
+    if (!jobs || msg.routing.from !== jobs) return undefined;
+    try {
+      const context = await this.request<{ callerId?: AbjectId; taskId?: string } | null>(
+        request(this.id, jobs, 'getInvocationContext', { messageId: msg.header.messageId }), 10_000);
+      return context?.callerId === this.id ? context.taskId : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * A private task's start: its agent joins the goal's crew (the circle that
+   * may read the goal), and the LLM keeps no text of calls made under its id.
+   */
+  private async enterPrivate(entry: TaskEntry): Promise<void> {
+    const goalId = entry.goalId ?? entry.incomingGoalId;
+    if (goalId) {
+      this.privateGoals.add(goalId);
+      await this.addCrew(goalId, entry.agentId);
+    }
+    await this.markPrivate(entry.state.id, true);
+  }
+
+  /** Ask GoalManager to admit an agent to a private goal's circle. */
+  private async addCrew(goalId: string, agentId: AbjectId): Promise<void> {
+    requireNonEmpty(goalId, 'goalId');
+    if (!this.goalManagerId) return;
+    try {
+      await this.request(request(this.id, this.goalManagerId, 'addCrew', { goalId, agentId }), 10_000);
+    } catch (err) {
+      log.warn(`addCrew for private goal ${goalId.slice(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Tell the LLM to keep (or stop keeping) a task's calls out of its text records. */
+  private async markPrivate(taskId: string, active: boolean): Promise<void> {
+    requireNonEmpty(taskId, 'taskId');
+    const llmId = this.llmId ?? await this.discoverDep('LLM') ?? undefined;
+    if (!llmId) return;
+    try {
+      await this.request(request(this.id, llmId, 'markPrivate', { taskId, active }), 5_000);
+    } catch (err) {
+      log.warn(`markPrivate for task ${taskId.slice(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Drop every in-memory trace of private tasks: their entries, queued work,
+   * delegations, held payloads and progress echoes, and the goals they named.
+   * A task still running is cancelled and dropped when its loop ends. Private
+   * tasks were never checkpointed, so nothing durable remains to delete.
+   */
+  private forgetPrivateTasks(taskIds: ReadonlySet<string>, goalIds: ReadonlySet<string>): number {
+    const goals = new Set(goalIds);
+    let dropped = 0;
+    for (const taskId of taskIds) {
+      const entry = this.taskEntries.get(taskId);
+      if (!entry) continue;
+      const goalId = entry.goalId ?? entry.incomingGoalId;
+      if (goalId) goals.add(goalId);
+      if (!entry.finished) {
+        entry.forgotten = true;
+        if (entry.state.phase !== 'error') {
+          entry.state.phase = 'error';
+          entry.state.error = 'Cancelled';
+          this.cancelDescendants(taskId);
+          this.notifyAgentCancelled(entry, 'goal stopped');
+        }
+        continue;
+      }
+      this.taskEntries.delete(taskId);
+      const idx = this.taskOrder.indexOf(taskId);
+      if (idx >= 0) this.taskOrder.splice(idx, 1);
+      for (const [key, streaming] of this.streamingEntries) if (streaming === entry) this.streamingEntries.delete(key);
+      this.staleSlotStrikes.delete(taskId);
+      void this.markPrivate(taskId, false);
+      dropped++;
+    }
+    for (const q of this.agentTaskQueues.values()) {
+      const before = q.pending.length;
+      q.pending = q.pending.filter(t => !(taskIds.has(t.taskId) || (t.private && t.goalId && goals.has(t.goalId))));
+      dropped += before - q.pending.length;
+    }
+    for (const [key, d] of this.delegations) {
+      if (taskIds.has(d.parentTaskId) || taskIds.has(d.taskId)) this.delegations.delete(key);
+    }
+    for (const goalId of goals) {
+      this.privateGoals.delete(goalId);
+      this.pausedGoals.delete(goalId);
+      this.lastGoalProgressTs.delete(goalId);
+      this.lastGoalProgressMessage.delete(goalId);
+    }
+    return dropped;
+  }
+
   private cancelDescendants(parentTaskId:string):void {
     for (const child of this.delegations.values()) {
       if (child.parentTaskId!==parentTaskId || child.status==='done' || child.status==='error') continue;
@@ -1704,7 +1876,8 @@ The registered object must implement these handlers to participate in the agent 
   private sessionStoreId?: AbjectId;
 
   private async checkpointSession(entry: TaskEntry, outstandingOperation: unknown = entry.outstandingOperation): Promise<void> {
-    if (!this.sessionStoreId) return;
+    // A private task keeps nothing in Storage: it lives in memory and ends with its goal.
+    if (!this.sessionStoreId || entry.private) return;
     await this.archivePayloads(entry);
     const usage=this.llmId?await this.request<SessionRecord['usage']>(request(this.id,this.llmId,'getTaskUsage',{taskId:entry.state.id,sessionId:entry.sessionId})).catch(()=>undefined):undefined;
     const specialist = entry.config.snapshotMethod ? await this.request(request(this.id, entry.agentId, entry.config.snapshotMethod, { taskId: entry.state.id })) : undefined;
@@ -1831,6 +2004,7 @@ The registered object must implement these handlers to participate in the agent 
       { name: "resumeTask", description: "Resume from a durable checkpoint after reconciling unknown effects.", parameters: { "id": protocolText, "expectedRevision": protocolNumber } },
       { name: "forkTask", description: "Fork conversation and evidence; external changes are not undone.", parameters: { "id": protocolText, "newId": protocolText } },
       { name: "reconcileTask", description: "Record receiver evidence for an unresolved operation before resumption.", parameters: { "id": protocolText, "expectedRevision": protocolNumber, "evidence": protocolText, "outcome": protocolObject } },
+      { name: "forgetPrivateGoal", description: "GoalManager only (event): a private goal ended; drop every record of its tasks (entries, queued work, payloads, delegations).", parameters: { goalId: protocolText, taskIds: { kind: 'array', elementType: protocolText } } },
     ]);
     // ── Registration ──
     this.on('registerAgent', async (msg: AbjectMessage) => {
@@ -1887,8 +2061,10 @@ The registered object must implement these handlers to participate in the agent 
       });
     });
 
-    this.on('getDelegations', msg => {
+    this.on('getDelegations', async msg => {
       const { taskId }=msg.payload as { taskId:string };
+      const parent=this.taskEntries.get(taskId);
+      if (parent && !(await this.taskVisibility(msg)(parent))) return [];
       return [...this.delegations.values()].filter(d=>d.parentTaskId===taskId).map(d=>structuredClone(d));
     });
     this.on('delegateTask', async msg => {
@@ -1907,11 +2083,18 @@ The registered object must implement these handlers to participate in the agent 
       while(cursor?.parentTaskId){if(++depth>=4)throw new Error('Delegation depth limit reached');cursor=this.taskEntries.get(cursor.parentTaskId);}
       const target=this.registeredAgents.get(p.agentId);
       if (!target?.canExecute) throw new Error('Collaborator does not execute tasks; Ask for its direct protocol');
+      // A private parent delegates only to built-in agents, each admitted to
+      // the goal's circle before it hears the task.
+      if (parent.private) {
+        if (!(await this.isBuiltInCaller(p.agentId))) throw new Error(PRIVATE_BUILT_IN_ONLY);
+        const parentGoal = parent.goalId ?? parent.incomingGoalId;
+        if (parentGoal) await this.addCrew(parentGoal, p.agentId);
+      }
       const child={parentTaskId:p.parentTaskId,taskId:key,agentId:p.agentId,task:p.task,status:'starting' as const};
       this.delegations.set(key,child);
       await this.checkpointSession(parent);
       let agreement: unknown;
-      try { agreement=await this.request(request(this.id,p.agentId,'ask',{question:`Can you execute this bounded child task using executeTask? ${p.task}. Return constraints, expected evidence, and failure semantics. It shares its parent's goal budget and cancellation.`}),30000); }
+      try { agreement=await this.request(request(this.id,p.agentId,'ask',{question:`Can you execute this bounded child task using executeTask? ${p.task}. Return constraints, expected evidence, and failure semantics. It shares its parent's goal budget and cancellation.`,...(parent.private?{private:true}:{})}),30000); }
       catch (err) { const d=this.delegations.get(key)!; d.status='error'; d.error=String(err); await this.checkpointSession(parent); throw err; }
       if (parent.finished || String(parent.state.phase)==='error' || this.cancelledBeforeStart.has(key)) throw new Error('Parent was cancelled during collaborator negotiation');
       const declined = await this.delegationJudgment(parent, p.task, target, agreement);
@@ -1922,12 +2105,14 @@ The registered object must implement these handlers to participate in the agent 
       // queue; it cannot wait behind its parent in the runtime dispatch queue.
       void this.request(request(this.id,p.agentId,'executeTask',{taskId:key,tupleId:key,
         description:p.task,goalId:parent.goalId ?? parent.incomingGoalId,
-        data:{parentTaskId:p.parentTaskId},config:{directExecution:true,maxSteps:Math.min(15,parent.state.maxSteps-parent.state.step)}}),600000).then(result=>{
-          const d=this.delegations.get(key)!; if(d.status==='error')return;
+        data:{parentTaskId:p.parentTaskId},config:{directExecution:true,maxSteps:Math.min(15,parent.state.maxSteps-parent.state.step)},
+        ...(parent.private?{private:true}:{})}),600000).then(result=>{
+          // Gone when a private goal was forgotten while the child ran.
+          const d=this.delegations.get(key); if(!d||d.status==='error')return;
           d.status=(result && typeof result==='object' && 'success' in result && result.success===false)?'error':'done';d.result=result;
           parent.state.llmMessages.push({role:'user',content:`Child ${key} reported: ${JSON.stringify(result)}`});
-          this.changed('childTaskCompleted',{parentTaskId:p.parentTaskId,taskId:key,result});
-        },err=>{const d=this.delegations.get(key)!;d.status='error';d.error=String(err);});
+          this.changed('childTaskCompleted',parent.private?{parentTaskId:p.parentTaskId,taskId:key,private:true}:{parentTaskId:p.parentTaskId,taskId:key,result});
+        },err=>{const d=this.delegations.get(key);if(!d)return;d.status='error';d.error=String(err);});
       return structuredClone(child);
     });
 
@@ -2102,14 +2287,23 @@ The registered object must implement these handlers to participate in the agent 
       config.restoreMethod = agent.config.restoreMethod;
       const prompt = systemPrompt ?? agent.systemPrompt ?? '';
 
-      const taskState = this.createTask(taskId, task, { maxSteps: config.maxSteps, timeout: config.timeout });
-
       // Use the provided goal if given. Goal creation is the responsibility
       // of the calling agent, not the runtime. Work an agent starts on its own
       // because a goal's task called it is that task's work, and shares its
       // goal (queued and delegated work arrive with theirs).
       const goalId = incomingGoalId
         ?? (queued || delegation ? undefined : this.goalOfCallingTask(agentId));
+
+      // Private work stays private whoever starts the next piece of it: the
+      // caller's word, the queued work's, a private parent's, a private goal's,
+      // or a private task calling this agent. It runs only on built-in agents.
+      const isPrivate = isPrivatePayload(msg.payload) || queued?.private === true
+        || !!(delegation && this.taskEntries.get(delegation.parentTaskId)?.private)
+        || (!!goalId && this.privateGoals.has(goalId))
+        || (!queued && !delegation && this.privateCallingTask(agentId));
+      if (isPrivate && !(await this.isBuiltInCaller(agentId))) throw new Error(PRIVATE_BUILT_IN_ONLY);
+
+      const taskState = this.createTask(taskId, task, { maxSteps: config.maxSteps, timeout: config.timeout });
 
       const entry: TaskEntry = {
         admissionKey,
@@ -2131,7 +2325,9 @@ The registered object must implement these handlers to participate in the agent 
         // a check step is held to the same rule.
         ...(queued?.data?.check === true || (msg.payload as { readOnly?: unknown }).readOnly === true
           || (delegation && this.taskEntries.get(delegation.parentTaskId)?.readOnly) ? { readOnly: true } : {}),
+        ...(isPrivate ? { private: true } : {}),
       };
+      if (isPrivate && goalId) this.privateGoals.add(goalId);
 
       this.taskEntries.set(taskId, entry);
 
@@ -2142,7 +2338,8 @@ The registered object must implement these handlers to participate in the agent 
         log.error(`runTaskAsync for ${taskId.slice(0, 8)} escaped: ${err instanceof Error ? err.message : String(err)}`);
         this.releaseQueueSlot(entry.agentId, taskId);
       });
-      return { ticketId: taskId };
+      // The agent learns here when the runtime found its task private, so its own calls follow suit.
+      return { ticketId: taskId, ...(isPrivate ? { private: true } : {}) };
       });
     });
 
@@ -2188,6 +2385,8 @@ The registered object must implement these handlers to participate in the agent 
       if (!targetAgentId) throw new Error('enqueueTask requires agentId');
       const agent = this.registeredAgents.get(targetAgentId);
       if (!agent) throw new Error(`Agent "${targetAgentId}" is not registered`);
+      const isPrivate = isPrivatePayload(msg.payload) || (!!goalId && this.privateGoals.has(goalId));
+      if (isPrivate && !(await this.isBuiltInCaller(targetAgentId))) throw new Error(PRIVATE_BUILT_IN_ONLY);
 
       const taskId = callerTaskId ?? `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const callerId = explicitCaller ?? msg.routing.from;
@@ -2212,6 +2411,7 @@ The registered object must implement these handlers to participate in the agent 
         enqueuedAt: Date.now(),
         data,
         priority: (msg.payload as { priority?: number }).priority,
+        ...(isPrivate ? { private: true } : {}),
       };
       for(const [queuedAgent,queue] of this.agentTaskQueues){
         const old=queue.pending.find(t=>t.taskId===taskId) ?? queue.inFlight.get(taskId)?.queued;
@@ -2233,10 +2433,11 @@ The registered object must implement these handlers to participate in the agent 
         }
       }
       if(this.cancelledBeforeStart.has(taskId))throw new Error('Task was cancelled before dispatch');
+      if (isPrivate && goalId) this.privateGoals.add(goalId);
       q.pending.push(queued);
       const limit = agent.config.maxConcurrentTasks;
       const queuePosition = q.pending.length - 1 + q.inFlight.size;
-      log.info(`enqueueTask: agent=${agent.name} task="${task.slice(0, 60)}" position=${queuePosition} (running=${q.inFlight.size}/${limit})`);
+      log.info(`enqueueTask: agent=${agent.name} task="${shown(task.slice(0, 60), isPrivate)}" position=${queuePosition} (running=${q.inFlight.size}/${limit})`);
       // Kick the queue runner — no-op if inFlight is already set.
       this.processNextInQueue(targetAgentId);
       return { taskId, queuePosition };
@@ -2252,16 +2453,24 @@ The registered object must implement these handlers to participate in the agent 
       const { agentId } = msg.payload as { agentId: AbjectId };
       const q = this.agentTaskQueues.get(agentId);
       if (!q) return { inFlight: null, pending: [] };
+      // Private work is left out for anyone outside its circle.
+      const sees = this.taskVisibility(msg);
+      const visible = async (t: QueuedTask | undefined, taskId: string): Promise<boolean> => {
+        const entry = this.taskEntries.get(taskId);
+        if (entry) return sees(entry);
+        return !t?.private || sees({ private: true, agentId, callerId: t.callerId });
+      };
       const summarise = (t: QueuedTask) => ({
         taskId: t.taskId,
         task: t.task.slice(0, 100),
         goalId: t.goalId ?? null,
         enqueuedAt: t.enqueuedAt,
       });
-      return {
-        inFlight: [...q.inFlight.values()].map(f => ({ taskId: f.taskId, goalId: f.goalId ?? null })),
-        pending: q.pending.map(summarise),
-      };
+      const inFlight: Array<{ taskId: string; goalId: string | null }> = [];
+      for (const f of q.inFlight.values()) if (await visible(f.queued, f.taskId)) inFlight.push({ taskId: f.taskId, goalId: f.goalId ?? null });
+      const pending: ReturnType<typeof summarise>[] = [];
+      for (const t of q.pending) if (await visible(t, t.taskId)) pending.push(summarise(t));
+      return { inFlight, pending };
     });
 
     /**
@@ -2300,20 +2509,29 @@ The registered object must implement these handlers to participate in the agent 
       const { taskId } = msg.payload as { taskId: string };
       const entry = this.taskEntries.get(taskId);
       if (!entry) return { phase: 'unknown', step: 0, error: 'Task not found' };
+      // A private task's status still answers (JobManager and PermissionBroker
+      // read it to hold its work to its rules); its error text only to its circle.
+      const sees = !entry.private || await this.taskVisibility(msg)(entry);
       return {
         phase: entry.state.phase,
         step: entry.state.step,
-        error: entry.state.error,
+        error: sees ? entry.state.error : undefined,
         agentId: entry.agentId,
         ...(entry.readOnly ? { readOnly: true } : {}),
+        // GoalManager admits a private task's jobs to its goal by this id.
+        ...(entry.private ? { private: true, ...((entry.goalId ?? entry.incomingGoalId) ? { goalId: entry.goalId ?? entry.incomingGoalId } : {}) } : {}),
       };
     });
 
     this.on('listTasks', async (msg: AbjectMessage) => {
       const { agentId } = (msg.payload ?? {}) as { agentId?: AbjectId };
-      return this.taskOrder
-        .map(id => this.taskEntries.get(id))
-        .filter((e): e is TaskEntry => !!e && (!agentId || e.agentId === agentId))
+      const sees = this.taskVisibility(msg);
+      const listed: TaskEntry[] = [];
+      for (const id of this.taskOrder) {
+        const e = this.taskEntries.get(id);
+        if (e && (!agentId || e.agentId === agentId) && await sees(e)) listed.push(e);
+      }
+      return listed
         .map(e => ({
           id: e.state.id,
           agentId: e.agentId,
@@ -2322,6 +2540,7 @@ The registered object must implement these handlers to participate in the agent 
           task: e.state.task.slice(0, 100),
           step: e.state.step,
           goalId: e.goalId ?? null,
+          ...(e.private ? { private: true } : {}),
         }));
     });
 
@@ -2333,6 +2552,7 @@ The registered object must implement these handlers to participate in the agent 
       // still be running (phase flipped mid-await). Only finished entries
       // have a stable transcript.
       if (!entry || !entry.finished) return null;
+      if (!(await this.taskVisibility(msg)(entry))) return { taskId, private: true, error: PRIVATE_TASK_UNAVAILABLE };
       return {
         taskId: entry.state.id,
         agentId: entry.agentId,
@@ -2359,6 +2579,7 @@ The registered object must implement these handlers to participate in the agent 
       const { taskId, id } = msg.payload as { taskId: string; id: string };
       const entry = this.taskEntries.get(taskId);
       if (!entry) throw new Error(`No task "${taskId}"`);
+      if (!(await this.taskVisibility(msg)(entry))) throw new Error(PRIVATE_TASK_UNAVAILABLE);
       const stored = await this.loadPayload(entry, id);
       if (!stored) {
         const have = (entry.payloads ?? []).map(p => p.id).join(', ') || '(none)';
@@ -2385,8 +2606,9 @@ The registered object must implement these handlers to participate in the agent 
       const agent = this.registeredAgents.get(agentId);
       if (!agent) return { error: 'Agent not found' };
       const tasks: { id: string; phase: string; task: string; step: number; goalId: string | null }[] = [];
+      const sees = this.taskVisibility(msg);
       for (const entry of this.taskEntries.values()) {
-        if (entry.agentId === agentId && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
+        if (entry.agentId === agentId && entry.state.phase !== 'done' && entry.state.phase !== 'error' && await sees(entry)) {
           tasks.push({
             id: entry.state.id,
             phase: entry.state.phase,
@@ -2409,6 +2631,7 @@ The registered object must implement these handlers to participate in the agent 
       const { ticketId } = msg.payload as { ticketId: string };
       const entry = this.taskEntries.get(ticketId);
       if (!entry) return { ticketId, status: 'unknown' };
+      if (!(await this.taskVisibility(msg)(entry))) return { ticketId, status: 'unknown', private: true, error: PRIVATE_TASK_UNAVAILABLE };
       const phase = entry.state.phase;
       const status = phase === 'done' ? 'completed'
         : phase === 'error' ? 'failed'
@@ -2477,8 +2700,9 @@ The registered object must implement these handlers to participate in the agent 
       return { success: false };
     });
 
-    this.on('getGoalExecutionHealth', msg => {
+    this.on('getGoalExecutionHealth', async msg => {
       const {goalId}=msg.payload as {goalId:string};
+      const sees=this.taskVisibility(msg);
       const tasks=[...this.taskEntries.values()].filter(e=>(e.goalId===goalId||e.incomingGoalId===goalId)&&!e.finished);
       // Work admitted but not yet running: waiting in an agent's queue, or
       // holding a slot while its agent sets up.
@@ -2487,7 +2711,10 @@ The registered object must implement these handlers to participate in the agent 
         queued+=q.pending.filter(t=>t.goalId===goalId).length;
         for (const [taskId,f] of q.inFlight) if (f.goalId===goalId && !this.taskEntries.has(taskId)) queued++;
       }
-      return {ownedWorkActive:tasks.length>0,queued,tasks:tasks.map(e=>({taskId:e.state.id,agentId:e.agentId,phase:e.state.phase,step:e.state.step,operation:e.outstandingOperation}))};
+      // A private task's operation (its action) shows only to its circle.
+      const rows=[];
+      for (const e of tasks) rows.push({taskId:e.state.id,agentId:e.agentId,phase:e.state.phase,step:e.state.step,operation:await sees(e)?e.outstandingOperation:undefined});
+      return {ownedWorkActive:tasks.length>0,queued,tasks:rows};
     });
 
     this.on('awaitGoalQuiescence', async msg => {
@@ -2496,7 +2723,11 @@ The registered object must implement these handlers to participate in the agent 
         && !preserveTaskIds.includes(e.state.id));
       const deadline = Date.now() + 10000;
       while (affected().some(e => !e.finished) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
-      const pending = affected().filter(e => !e.finished || e.outstandingOperation).map(e => ({ taskId:e.state.id, operation:e.outstandingOperation, finished:!!e.finished }));
+      const sees = this.taskVisibility(msg);
+      const pending = [];
+      for (const e of affected().filter(e => !e.finished || e.outstandingOperation)) {
+        pending.push({ taskId:e.state.id, operation:await sees(e) ? e.outstandingOperation : undefined, finished:!!e.finished });
+      }
       return { safe:pending.length === 0, pending };
     });
 
@@ -2589,6 +2820,31 @@ The registered object must implement these handlers to participate in the agent 
       return reached;
     });
 
+    /**
+     * A private goal is over and its outcome has reached its conversation.
+     * GoalManager names the root goal and every task of it and its children;
+     * the runtime drops all it holds of them (entries, queued work, payloads,
+     * delegations) and the LLM forgets their ids. Tasks match by their own id
+     * or the goal task they execute, and any private task on the root goal
+     * that GoalManager did not list (an agent's direct work on it) goes too.
+     */
+    this.on('forgetPrivateGoal', async (msg: AbjectMessage) => {
+      if (!(await this.isBuiltInCaller(msg.routing.from, ['GoalManager']))) return false;
+      const { goalId, taskIds } = msg.payload as { goalId: string; taskIds?: unknown };
+      requireNonEmpty(goalId, 'goalId');
+      const named = new Set((Array.isArray(taskIds) ? taskIds : []).filter((t): t is string => typeof t === 'string'));
+      const ids = new Set(named);
+      for (const [id, e] of this.taskEntries) {
+        if ((e.dispatchTupleId && named.has(e.dispatchTupleId)) || (e.private && (e.goalId ?? e.incomingGoalId) === goalId)) ids.add(id);
+      }
+      for (const q of this.agentTaskQueues.values()) {
+        for (const t of q.pending) if (t.dispatchTupleId && named.has(t.dispatchTupleId)) ids.add(t.taskId);
+      }
+      const dropped = this.forgetPrivateTasks(ids, new Set([goalId]));
+      log.info(`forgetPrivateGoal: goal ${goalId.slice(0, 8)} forgotten (${dropped} task record(s) dropped)`);
+      return true;
+    });
+
     this.on('resumeTasksByGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: string };
       this.pausedGoals.delete(goalId);
@@ -2608,6 +2864,8 @@ The registered object must implement these handlers to participate in the agent 
     this.on('_think', async (msg: AbjectMessage) => {
       const { taskId } = msg.payload as { taskId: string };
       const entry = requireDefined(this.taskEntries.get(taskId), `Task ${taskId} not found`);
+      // Thinking returns the task's next action, so a private task thinks only for its circle (its job runs in JobManager).
+      if (entry.private && !(await this.taskVisibility(msg)(entry))) throw new Error(PRIVATE_TASK_UNAVAILABLE);
       return this.think(entry);
     });
 
@@ -2923,6 +3181,7 @@ The registered object must implement these handlers to participate in the agent 
 
   private async runTaskAsync(entry: TaskEntry): Promise<void> {
     try {
+      if (entry.private) await this.enterPrivate(entry);
       // The first observation arrives before the first think picks a route;
       // size it by the balanced tier until then.
       entry.contextBudget ??= await this.resolveContextBudget({ tier: 'balanced' });
@@ -3051,7 +3310,8 @@ The registered object must implement these handlers to participate in the agent 
     // decides that after reviewing the task evidence, including direct calls.
 
     const evidenceGoal = entry.goalId ?? entry.incomingGoalId;
-    if (evidenceGoal && this.goalManagerId) {
+    // A private task leaves no evidence record: nothing of it is learned.
+    if (evidenceGoal && this.goalManagerId && !entry.private) {
       try {
         await this.request(request(this.id, this.goalManagerId, 'recordTaskEvidence', {
           goalId: evidenceGoal, taskId: entry.state.id,
@@ -3119,7 +3379,9 @@ The registered object must implement these handlers to participate in the agent 
     entry.delivery = { id: resultPayload.deliveryId, destination: entry.callerId,
       destinationName: this.registeredAgents.get(entry.callerId)?.name,
       payload: resultPayload, delivered: false };
-    if (this.sessionStoreId) {
+    // A private task has no durable outbox (it is never checkpointed), so its
+    // result goes straight to the caller.
+    if (this.sessionStoreId && !entry.private) {
       try {
         await this.checkpointSession(entry);
         void this.deliverSessionOutbox().catch(err => log.warn('Session delivery deferred:', err));
@@ -3138,7 +3400,8 @@ The registered object must implement these handlers to participate in the agent 
     }
 
     try {
-      this.changed('taskCompleted', {
+      // Dependents hear that a private task ended, and nothing of what it was.
+      this.changed('taskCompleted', entry.private ? { taskId: entry.state.id, private: true, success } : {
         taskId: entry.state.id,
         agentId: entry.agentId,
         agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'unknown',
@@ -3150,6 +3413,15 @@ The registered object must implement these handlers to participate in the agent 
       });
     } catch (err) {
       log.warn(`changed(taskCompleted) failed for ${entry.state.id.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // A private task with no goal (a chat turn), or one whose goal was
+    // forgotten while it ran, has nobody left to read it once its result is
+    // delivered: drop it now. A goal's tasks wait for forgetPrivateGoal.
+    if (entry.private && (entry.forgotten || !(entry.goalId ?? entry.incomingGoalId))) {
+      entry.finished = true;
+      this.forgetPrivateTasks(new Set([entry.state.id]), new Set());
+      return;
     }
 
     // Bound the task graveyard: keep only the most recent terminal entries so
@@ -3377,6 +3649,9 @@ The registered object must implement these handlers to participate in the agent 
       return;
     }
     log.info(`Queue runner: starting task ${queued.taskId.slice(0, 8)} on agent ${agent.name}`);
+    // The agent's own setup may call the LLM under this task's id before the
+    // loop starts, so the LLM hears it is private first.
+    if (queued.private) await this.markPrivate(queued.taskId, true);
     // The runner starts this asynchronously, so awaiting its reply does not
     // occupy another queue. Observe setup failures before startTask as well as
     // normal deferred completion; otherwise a rejected bootstrap silently stalls.
@@ -3394,6 +3669,7 @@ The registered object must implement these handlers to participate in the agent 
         responseSchema: queued.responseSchema,
         dispatchTupleId: queued.dispatchTupleId,
         data: queued.data,
+        ...(queued.private ? { private: true } : {}),
       }), 600000);
       if (!this.taskEntries.has(queued.taskId) && this.agentTaskQueues.get(agentId)?.inFlight.has(queued.taskId)) {
         throw new Error(result?.error ?? 'Agent returned without starting the queued task');
@@ -3407,7 +3683,7 @@ The registered object must implement these handlers to participate in the agent 
       state.phase = 'error'; state.error = `Task setup failed: ${err instanceof Error ? err.message : String(err)}`;
       const entry: TaskEntry = { state, agentId, callerId: queued.callerId, goalId: queued.goalId,
         dispatchTupleId: queued.dispatchTupleId, systemPrompt: queued.systemPrompt ?? agent.systemPrompt ?? '',
-        config: { ...agent.config, snapshotMethod: undefined } };
+        config: { ...agent.config, snapshotMethod: undefined }, ...(queued.private ? { private: true } : {}) };
       this.taskEntries.set(queued.taskId, entry);
       try { await this.finalizeTask(entry); }
       finally { this.releaseQueueSlot(agentId, queued.taskId); }
@@ -3423,8 +3699,8 @@ The registered object must implement these handlers to participate in the agent 
     if (task.phase === 'error' || entry.finished) return;
     const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
     log.info(task.step > 0
-      ? `[${agentName}] Task resumed at step ${task.step + 1}: "${task.task.slice(0, 80)}" (${task.id})`
-      : `[${agentName}] Task started: "${task.task.slice(0, 80)}" (${task.id}, max ${task.maxSteps} steps)`);
+      ? `[${agentName}] Task resumed at step ${task.step + 1}: "${shown(task.task.slice(0, 80), entry.private)}" (${task.id})`
+      : `[${agentName}] Task started: "${shown(task.task.slice(0, 80), entry.private)}" (${task.id}, max ${task.maxSteps} steps)`);
 
     let phase = 'observing' as AgentPhase;
     task.phase = phase;
@@ -3697,6 +3973,7 @@ The registered object must implement these handlers to participate in the agent 
                       request(this.id, jmId, 'submitJob', {
                         description,
                         code, taskId: task.id,
+                        ...(entry.private ? { private: true } : {}),
                         // Held payloads are reachable from job code by
                         // message, so filtering or counting a large result
                         // is one job instead of paging it in by hand. Only
@@ -3724,7 +4001,7 @@ The registered object must implement these handlers to participate in the agent 
                       ? { success: true, data: jobReply.result }
                       : { success: false, error: jobReply?.error ?? `Job did not complete (status: ${jobReply?.status ?? 'missing'})` };
                     if (!observed.success) {
-                      log.info(`[${agentName}] submit_job "${description.slice(0, 60)}" failed: ${observed.error}`);
+                      log.info(`[${agentName}] submit_job "${shown(description.slice(0, 60), entry.private)}" failed: ${shown(observed.error, entry.private)}`);
                       task.llmMessages.push({ role: 'user', content: `[Job Error] ${observed.error}` });
                     } else {
                       const value = jobReply?.result;
@@ -3736,7 +4013,7 @@ The registered object must implement these handlers to participate in the agent 
                         rendered = rendered.slice(0, resultLimit)
                           + `\n[... job result truncated at ${resultLimit} chars — aggregate inside the job next time ...]`;
                       }
-                      log.info(`[${agentName}] submit_job "${description.slice(0, 60)}" completed (${rendered.length} chars)`);
+                      log.info(`[${agentName}] submit_job "${shown(description.slice(0, 60), entry.private)}" completed (${rendered.length} chars)`);
                       task.llmMessages.push({ role: 'user', content: `[Job Result] ${rendered}` });
                     }
                   } else {
@@ -3805,7 +4082,7 @@ The registered object must implement these handlers to participate in the agent 
             entry.outstandingOperation = { taskId: task.id, step: task.step, action: task.action };
             await this.checkpointSession(entry);
             if (cancelledExternally()) { entry.outstandingOperation = undefined; break; }
-            log.info(`[${agentName}] Step ${task.step + 1} — acting: ${task.action?.action} (${(task.action?.reasoning ?? '').toString().slice(0, 60)})`);
+            log.info(`[${agentName}] Step ${task.step + 1} — acting: ${task.action?.action} (${shown((task.action?.reasoning ?? '').toString().slice(0, 60), entry.private)})`);
             const desc = (task.action?.reasoning ?? task.action?.action ?? 'act').toString().slice(0, 80);
             // Job calls agent directly (not through _act handler) to avoid
             // deadlocks — the agent's act callback may call other objects that
@@ -3817,8 +4094,9 @@ The registered object must implement these handlers to participate in the agent 
             // `fetch(` inside the payload, and any action text could reshape
             // the code around it. As data it is inert.
             // A check step's actions that change things never reach the agent.
-            const refusal = this.readOnlyRefusal(entry, task.action);
-            if (refusal) log.info(`[${agentName}] Step ${task.step + 1}: check step refused ${task.action?.action}`);
+            // A private task's question to an object that is not built-in is refused too.
+            const refusal = this.readOnlyRefusal(entry, task.action) ?? await this.privateAskRefusal(entry, task.action);
+            if (refusal) log.info(`[${agentName}] Step ${task.step + 1}: ${entry.readOnly ? 'check step' : 'private task'} refused ${task.action?.action}`);
             const actResult: AgentActionResult = refusal ? { success: false, error: refusal } : await this.executeStep(
               entry,
               `[${agentName}] ${desc} (step ${task.step + 1})`,
@@ -3840,7 +4118,7 @@ The registered object must implement these handlers to participate in the agent 
             entry.outstandingOperation = undefined;
             await this.checkpointSession(entry);
             this.emitActionResult(entry);
-            log.info(`[${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + actResult.error}`);
+            log.info(`[${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + shown(actResult.error, entry.private)}`);
 
             // An effectful terminal is a proposal until its receiver accepts it.
             // Failed dispatches return to observe/think with their real error;
@@ -3889,7 +4167,7 @@ The registered object must implement these handlers to participate in the agent 
       if (task.phase === 'done') {
         log.info(`[${agentName}] Task done in ${task.step} steps`);
       } else if (task.phase === 'error') {
-        log.info(`[${agentName}] Task error at step ${task.step}: ${task.error}`);
+        log.info(`[${agentName}] Task error at step ${task.step}: ${shown(task.error, entry.private)}`);
       }
     }
   }
@@ -4140,6 +4418,7 @@ The registered object must implement these handlers to participate in the agent 
           messages: AgentAbject.forModel(task.llmMessages),
           onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
           goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id,
+          ...(entry.private ? { private: true } : {}),
           // Thinking / action decisions run on 'smart' regardless of the observe
           // hint (fast-tier models drop the JSON action envelope under load,
           // producing prose that the parser can't accept), adjusted for vision
@@ -4267,6 +4546,8 @@ The registered object must implement these handlers to participate in the agent 
         // The loop's own observe/think/act dispatch, not agent-authored code:
         // the action it carries was already held to a check step's rule here.
         runtimeStep: true,
+        // JobManager keeps a private task's jobs out of its logs and listings.
+        ...(entry.private ? { private: true } : {}),
         code: fullCode,
         context: { ...(jobContext ?? {}), taskId: entry.state.id },
         queue: `${entry.config.queueName ?? 'agent'}:${entry.state.id}`,
@@ -4341,8 +4622,10 @@ The registered object must implement these handlers to participate in the agent 
     return this.registeredAgents.get(entry.agentId)?.name ?? 'agent';
   }
 
-  private decisionScope(entry: TaskEntry): { goalId?: string; taskId: string; onBehalfOf: string } {
-    return { goalId: entry.config?.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id, onBehalfOf: this.agentNameOf(entry) };
+  private decisionScope(entry: TaskEntry): { goalId?: string; taskId: string; onBehalfOf: string; private?: boolean } {
+    return { goalId: entry.config?.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id, onBehalfOf: this.agentNameOf(entry),
+      // Every decision about a private task is itself private.
+      ...(entry.private ? { private: true } : {}) };
   }
 
   /**
@@ -4539,14 +4822,14 @@ The registered object must implement these handlers to participate in the agent 
     const all = [...late.map(l => `(about an earlier step) ${l}`), ...lines];
     if (all.length) {
       entry.state.llmMessages.push({ role: 'user', content: `[Runtime check]\n${all.map(l => `- ${l}`).join('\n')}` });
-      log.info(`[${this.agentNameOf(entry)}] Runtime check before step ${entry.state.step + 1}: ${all.map(l => l.slice(0, 140)).join(' | ')}`);
+      log.info(`[${this.agentNameOf(entry)}] Runtime check before step ${entry.state.step + 1}: ${shown(all.map(l => l.slice(0, 140)).join(' | '), entry.private)}`);
     }
 
     if (entry.stopJudgment) {
       const reason = entry.stopJudgment;
       entry.stopJudgment = undefined;
       entry.state.stalledOut = true;
-      log.warn(`[${this.agentNameOf(entry)}] ${reason}`);
+      log.warn(`[${this.agentNameOf(entry)}] ${shown(reason, entry.private)}`);
       const errorTerminal = Object.entries(entry.config.terminalActions).find(([, v]) => v.type === 'error')?.[0];
       if (errorTerminal) return { action: errorTerminal, reason, error: reason };
       entry.state.error = reason;
@@ -4940,6 +5223,8 @@ The registered object must implement these handlers to participate in the agent 
       // runtime that happens to run every agent's loop.
       onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
           goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id,
+          // A private task's prompt and answer stay out of the ledger.
+          ...(entry.private ? { private: true } : {}),
         });
 
     this.streamingEntries.set(streamRequest.header.messageId, entry);
@@ -5008,7 +5293,7 @@ The registered object must implement these handlers to participate in the agent 
       log.warn(`[${agentName}] Step ${task.step + 1} — stream ended without a finish frame after ${trimmedContent.length} chars; treating as truncated`);
     }
     const parsed = this.parseAction(entry, llmResult.content, streamTruncated);
-    log.info(`[${agentName}] Step ${task.step + 1} — LLM action: ${parsed.action}${parsed.reasoning ? ' (' + parsed.reasoning.slice(0, 60) + ')' : ''}`);
+    log.info(`[${agentName}] Step ${task.step + 1} — LLM action: ${parsed.action}${parsed.reasoning ? ' (' + shown(parsed.reasoning.slice(0, 60), entry.private) + ')' : ''}`);
     return parsed;
   }
 
@@ -5149,6 +5434,7 @@ The registered object must implement these handlers to participate in the agent 
   private async recordKnowledgeSelection(entry: TaskEntry, selected: { id: string; title?: string; content?: string; knowledgeRef?: string }, complete = false): Promise<void> {
     const receipt = { id: selected.id, title: selected.title ?? '', content: selected.content?.slice(0, 4000), knowledgeRef: selected.knowledgeRef, source: 'relevant' as const };
     (entry.injectedKnowledge ??= []).push(receipt);
+    if (entry.private) return; // Read, never recorded: nothing of a private task is learned.
     if (this.registeredAgents.get(entry.agentId)?.name === 'TaskReviewer') await this.request(request(this.id, entry.agentId, 'recordKnowledgeSelection', { taskId: entry.state.id, selection: { ...receipt, complete } }));
   }
 
@@ -5206,6 +5492,9 @@ The preview often answers the question on its own — when it does, just act.`, 
     // Per-task addendum from the caller (task hints, the browsing goal): the
     // reason `systemPrompt` can stay identical across an agent's tasks.
     add('task-prompt', entry.taskPrompt, false);
+    if (entry.private) {
+      add('private', '\n\n## Private conversation\nThis task belongs to a private conversation. Existing knowledge is yours to read; nothing from this task is saved, so leave remember out and carry what matters in your result.', false);
+    }
     if (entry.readOnly) {
       add('check-step', '\n\n## Check step\nThis task is a read-only check step: the plan staged it to test a belief before the goal acts on it. Read, list, look and ask as the check needs, and leave everything as you found it. Finish with your done action, and say plainly whether the belief held, with the evidence you read.', false);
     }
@@ -5239,23 +5528,25 @@ The preview often answers the question on its own — when it does, just act.`, 
         // follow-up question or a planner's paraphrase still finds what the
         // knowledge base holds about the subject.
         const recallQuery = [entry.recallContext, entry.goalRecallText, entry.state.task].filter(Boolean).join('\n').slice(0, 3000);
+        // A private task reads knowledge without a trace: no access counters, no query in the log.
+        const track = entry.private ? { track: false } : {};
         const [profileAll, matched, tagList, woven] = await Promise.all([
           // Worth order inside the KnowledgeBase, before the limit: what the
           // user wrote first, then what reviewers found useful, then recency.
           this.request<KEntry[] | null>(
-            request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50, order: 'worth', scope: entry.config.knowledgeScope }),
+            request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50, order: 'worth', scope: entry.config.knowledgeScope, ...track }),
             5000,
           ).catch(() => null),
           this.request<KEntry[] | null>(
-            request(this.id, knowledgeBaseId, 'recall', { query: recallQuery, limit: 5, scope: entry.config.knowledgeScope }),
+            request(this.id, knowledgeBaseId, 'recall', { query: recallQuery, limit: 5, scope: entry.config.knowledgeScope, ...track }),
             5000,
           ).catch(() => null),
           this.request<Array<{ tag: string; count: number }> | null>(
-            request(this.id, knowledgeBaseId, 'listTags', { limit: 20 }),
+            request(this.id, knowledgeBaseId, 'listTags', { limit: 20, ...track }),
             5000,
           ).catch(() => null),
           this.request<{ patterns?: Array<KEntry & { via?: string }> } | null>(
-            request(this.id, knowledgeBaseId, 'weave', { query: recallQuery, limit: 3, scope: entry.config.knowledgeScope }),
+            request(this.id, knowledgeBaseId, 'weave', { query: recallQuery, limit: 3, scope: entry.config.knowledgeScope, ...track }),
             5000,
           ).catch(() => null),
         ]);
@@ -5313,7 +5604,7 @@ The preview often answers the question on its own — when it does, just act.`, 
         // with the planner's reason; the plan's choice stands over keyword match.
         const assigned = (await Promise.all((entry.assignedPatterns ?? []).map(async a => {
           const found = patterns.find(e => e.id === a.id) ?? await this.request<(KEntry & { via?: string }) | null>(
-            request(this.id, knowledgeBaseId, 'get', { id: a.id }), 5000).catch(() => null);
+            request(this.id, knowledgeBaseId, 'get', { id: a.id, ...track }), 5000).catch(() => null);
           return found?.type === 'pattern' && !found.archived ? { ...found, via: `assigned by the plan: ${a.why}` } : undefined;
         }))).filter((e): e is KEntry & { via: string } => !!e);
         const patternIds = new Set([...patterns, ...assigned].map(e => e.id));
@@ -5380,6 +5671,8 @@ Every Abject has two kinds of handle:
 - Its **AbjectId** (a UUID like \`adac6cc1-...\`) is EPHEMERAL — objects are re-spawned with a fresh AbjectId every time they are restored on restart, so a UUID copied from an earlier goal, scratchpad, or saved memory is usually stale and resolves to nothing.
 
 Reference objects by their registered name wherever possible — name-based calls and lookups always reach the live object. When you write a goal, hand off a target, or save a fact about an object, use its name (and typeId if you have one), not its UUID.`, true);
+
+    add('private-refusals', `\n\n${PRIVATE_REFUSAL_GUIDANCE}`, true);
 
     // Always-present guidance on memory tools
     add('memory-tools', `\n\n## Memory Tools
@@ -6027,7 +6320,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     if (action.action === 'replan') {
       const reason = typeof action.reason === 'string' ? action.reason : 'Agent requested replan';
       const goalId = entry.goalId ?? entry.incomingGoalId;
-      if (goalId && this.goalManagerId) {
+      if (goalId && this.goalManagerId && !entry.private) {
         const receipt = await this.request<{ success: boolean; error?: string }>(request(this.id, this.goalManagerId, 'recordObservation', {
           goalId, operationId: `${task.id}:replan:${task.step}`,
           observation: { taskId: task.id, material: true, reason, hypotheses: action.hypotheses, nextExperiment: action.nextExperiment },
@@ -6041,9 +6334,15 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       reflection += '\nRe-evaluate and pick a different action that addresses what went wrong. If the task is outside your capability, emit fail with a clear reason.';
       return { result: { success: true, data: { reason, reflection } }, message: reflection };
     }
+    // A private task saves nothing; the refusal is the step's result, so the
+    // agent carries on with what it has.
+    if (action.action === 'remember' && entry.private) {
+      return { result: { success: false, error: PRIVATE_REMEMBER_REFUSAL }, message: `[Remember] ${PRIVATE_REMEMBER_REFUSAL}` };
+    }
     const kbId = await this.discoverDep('KnowledgeBase');
     if (task.phase === 'error' || entry.finished) throw new Error('Task cancelled');
     if (!kbId) throw new Error('KnowledgeBase not available');
+    const track = entry.private ? { track: false } : {};
     if (action.action === 'remember') {
       const saved = await this.request<{ id?: string; success?: boolean; error?: string }>(request(this.id, kbId, 'remember', {
         title: (action.title as string) ?? (action.description as string) ?? 'Untitled',
@@ -6061,7 +6360,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     let rendered: string;
     if (id) {
       const e = await this.request<{ title?: string; type?: string; content?: string; knowledgeRef?: string; patternRef?: string } | null>(
-        request(this.id, kbId, 'get', { id }), 10000);
+        request(this.id, kbId, 'get', { id, ...track }), 10000);
       if (e?.patternRef) (entry.patternSelections ??= {})[id] = e.patternRef;
       if (e) await this.recordKnowledgeSelection(entry, { ...e, id }, (e.content?.length ?? 0) <= this.chunkLimit(entry));
       rendered = e
@@ -6069,7 +6368,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         : `No entry with id "${id}".`;
     } else if (pattern) {
       const hits = await this.request<Array<{ id: string; title: string; type: string; content: string; knowledgeRef?: string; patternRef?: string }>>(
-        request(this.id, kbId, 'match', { pattern, limit, scope: entry.config.knowledgeScope }), 10000);
+        request(this.id, kbId, 'match', { pattern, limit, scope: entry.config.knowledgeScope, ...track }), 10000);
       for (const h of hits) await this.recordKnowledgeSelection(entry, { ...h, content: h.content.slice(0, 300) });
       for (const h of hits) if (h.patternRef) (entry.patternSelections ??= {})[h.id] = h.patternRef;
       rendered = hits.length
@@ -6077,7 +6376,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         : `No entries match pattern "${pattern}".`;
     } else if (query || tags?.length) {
       const hits = await this.request<Array<{ id: string; title: string; type: string; snippet?: string }>>(
-        request(this.id, kbId, 'recall', { query, tags, limit, previews: true, scope: entry.config.knowledgeScope }), 10000);
+        request(this.id, kbId, 'recall', { query, tags, limit, previews: true, scope: entry.config.knowledgeScope, ...track }), 10000);
       rendered = hits.length
         ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.snippet ?? ''}`).join('\n')
         : 'No matching entries. Try different terms, or a pattern for exact names.';
@@ -6285,6 +6584,30 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       + 'then finish with your done action and report what you found and whether the belief held.';
   }
 
+  /**
+   * Why a private task may not send this question, or undefined when it may.
+   * A question sets its receiver thinking about the private work, so it goes
+   * only to built-in objects, and an agent asked joins the goal's circle
+   * (GoalManager addCrew) before the question goes out.
+   */
+  private async privateAskRefusal(entry: TaskEntry, action: AgentAction | undefined): Promise<string | undefined> {
+    if (!entry.private || !action) return undefined;
+    const str = (v: unknown) => (typeof v === 'string' ? v : '');
+    const verb = str(action.action);
+    if (verb !== 'ask' && !(verb === 'call' && str(action.method) === 'ask')) return undefined;
+    const target = str(action.object) || str(action.target) || str(action.agent);
+    if (!target) return undefined;
+    const agent = this.registeredAgents.get(target as AbjectId) ?? [...this.registeredAgents.values()].find(a => a.name === target);
+    const targetId = agent?.agentId ?? (await this.discoverDep(target)) ?? (target as AbjectId);
+    if (!(await this.isBuiltInCaller(targetId))) {
+      return `This task is private, so its questions go only to built-in objects, and "${target}" is not one. `
+        + 'Ask a built-in object, or finish with what you have.';
+    }
+    const goalId = entry.goalId ?? entry.incomingGoalId;
+    if (agent && goalId) await this.addCrew(goalId, agent.agentId);
+    return undefined;
+  }
+
   /** Whether a name or id belongs to a registered agent (a question to one can set it to work). */
   private isRegisteredAgent(nameOrId: string): boolean {
     if (this.registeredAgents.has(nameOrId as AbjectId)) return true;
@@ -6309,7 +6632,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const learned = typeof (raw as { learned?: unknown }).learned === 'string' ? ((raw as { learned: string }).learned).trim().slice(0, 500) : undefined;
     last.selfAssessment = { verdict, ...(learned ? { learned } : {}), at: Date.now() };
     const goalId = entry.goalId ?? entry.incomingGoalId;
-    if (goalId && this.goalManagerId) {
+    if (goalId && this.goalManagerId && !entry.private) {
       await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
         goalId, operationId: `${entry.state.id}:${last.step}:self`,
         observation: { taskId: entry.state.id, kind: 'self-assessment', step: last.step, expect: last.expect, ...last.selfAssessment },
@@ -6338,6 +6661,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       const applied: NonNullable<PredictionRecord['patterns']>[number] = { id: p.id, why: p.why.slice(0, 1000) };
       applications.push(applied);
       try {
+        if (entry.private) throw new Error('A private task records no pattern application');
         const receipt = entry.patternSelections?.[p.id];
         if (!receipt || !goalId) throw new Error('No captured selection or goal; application provenance is unresolved');
         const kbId = await this.discoverDep('KnowledgeBase');
@@ -6363,7 +6687,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const expectText = typeof action.expect === 'string' ? action.expect.trim() : '';
     const candidates = expectText && !action.basis.length ? this.basisCandidatesFor(entry, expectText, applications.map(a => a.id)) : [];
     if (candidates.length) pending.basisCandidates = candidates;
-    if (goalId && this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
+    if (goalId && this.goalManagerId && !entry.private) await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
       goalId, operationId: `${task.id}:${task.step + 1}:prediction`,
       observation: { taskId: task.id, kind: 'prediction', step: task.step + 1, action: task.action?.action,
         expect: task.action?.expect ?? null, expectOutcome: task.action?.expectOutcome ?? null,
@@ -6402,7 +6726,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       ...(predicted?.basisCandidates?.length ? { basisCandidates: predicted.basisCandidates } : {}),
     });
     const goalId = entry.goalId ?? entry.incomingGoalId;
-    if (goalId && this.goalManagerId) {
+    if (goalId && this.goalManagerId && !entry.private) {
       await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
         goalId, operationId: `${task.id}:${task.step + 1}`,
         observation: { taskId: task.id, ...entry.predictions!.at(-1), execution: task.execution, actual },
@@ -6671,6 +6995,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
           messages: task.llmMessages,
           onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
           goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id,
+          ...(entry.private ? { private: true } : {}),
           options: {
             targetChars: hardBudget,
             pinnedCount,
@@ -7058,7 +7383,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       // making a recurring per-turn reparse (e.g. a reasoning model prefixing
       // prose before its JSON) impossible to diagnose from the logs.
       const failKind = hallucinatedTools ? 'xml-tool-calls' : pureProse ? 'pure-prose' : 'malformed-json';
-      log.warn(`[parse] unparseable LLM response (${failKind}, attempt ${entry.parseFailures}/${AgentAbject.MAX_PARSE_FAILURES}): "${content.trim().replace(/\s+/g, ' ').slice(0, 240)}${content.trim().length > 240 ? '…' : ''}"`);
+      log.warn(`[parse] unparseable LLM response (${failKind}, attempt ${entry.parseFailures}/${AgentAbject.MAX_PARSE_FAILURES}): "${shown(`${content.trim().replace(/\s+/g, ' ').slice(0, 240)}${content.trim().length > 240 ? '…' : ''}`, entry.private)}"`);
       return { action: '_reparse', reasoning: `Retrying after unparseable response (attempt ${entry.parseFailures}/${AgentAbject.MAX_PARSE_FAILURES})` };
     }
 

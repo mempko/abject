@@ -16,6 +16,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import { isPrivatePayload } from '../core/privacy.js';
 import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
 
 const log = new Log('TupleSpace');
@@ -51,6 +52,13 @@ export class TupleSpace extends Abject {
   private storageId?: AbjectId;
   private localPeerId = '';
   private activeNamespaces = new Set<string>();
+  /**
+   * Private namespaces (ensured with `private: true`), by SharedState name,
+   * and the object that owns each. Backed by a private SharedState instance
+   * this TupleSpace owns, kept out of the persisted namespace index, used
+   * only by the owner, and its tuple events go to the owner alone.
+   */
+  private privateOwners = new Map<string, AbjectId>();
 
   constructor() {
     super({
@@ -137,12 +145,13 @@ export class TupleSpace extends Abject {
               description: 'Create and subscribe to a namespace if not already active',
               parameters: [
                 { name: 'namespace', type: { kind: 'primitive', primitive: 'string' }, description: 'Namespace to ensure (top-level goal ID)' },
+                { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, a private namespace owned by the caller: memory only, never synced or persisted, used only by the caller, and its tuple events go to the caller alone (optional, default false)', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
             {
               name: 'removeNamespace',
-              description: 'Remove a namespace and stop tracking it',
+              description: 'Remove a namespace and stop tracking it (a private namespace: only its owner, and all its tuples go with it)',
               parameters: [
                 { name: 'namespace', type: { kind: 'primitive', primitive: 'string' }, description: 'Namespace to remove' },
               ],
@@ -266,13 +275,51 @@ namespace; peers see its tuples after subscribing to the same name.
 
   private async doEnsureNamespace(namespace: string): Promise<void> {
     const ns = stateName(namespace);
-    if (this.activeNamespaces.has(ns)) return;
+    if (this.activeNamespaces.has(ns) || this.privateOwners.has(ns)) return;
     if (!this.sharedStateId) return;
     await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
     await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
     this.activeNamespaces.add(ns);
     await this.saveNamespaceIndex();
     log.info(`Namespace created: ${ns}`);
+  }
+
+  /** A private namespace: a private SharedState instance owned by this TupleSpace, never in the index. */
+  private async ensurePrivateNamespace(namespace: string, owner: AbjectId): Promise<void> {
+    const ns = stateName(namespace);
+    const current = this.privateOwners.get(ns);
+    if (current !== undefined) {
+      if (current !== owner) throw new Error(`TupleSpace: namespace '${namespace}' already exists`);
+      return;
+    }
+    if (this.activeNamespaces.has(ns)) throw new Error(`TupleSpace: namespace '${namespace}' already exists`);
+    if (!this.sharedStateId) throw new Error('SharedState unavailable; private namespace not created');
+    await this.request(request(this.id, this.sharedStateId, 'create', { name: ns, private: true }));
+    await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
+    this.privateOwners.set(ns, owner);
+  }
+
+  /** Whether the sender may use `namespace`: anyone for a normal one, the owner for a private one. */
+  private admits(namespace: string, msg: AbjectMessage): boolean {
+    const owner = this.privateOwners.get(stateName(namespace));
+    return owner === undefined || owner === msg.routing.from;
+  }
+
+  /**
+   * Tell watchers about a tuple. A normal namespace tells every dependent
+   * (changed()); a private one tells its owner alone, directly, in the same
+   * two shapes changed() sends.
+   */
+  private tell(namespace: string, aspect: string, value: unknown): void {
+    const owner = this.privateOwners.get(stateName(namespace));
+    if (owner === undefined) { this.changed(aspect, value); return; }
+    this.send(event(this.id, owner, 'changed', { aspect, value }));
+    this.send(event(this.id, owner, aspect, value ?? {}));
+  }
+
+  /** The namespace (without `ts-`) behind a SharedState instance name. */
+  private namespaceOf(ns: string): string {
+    return ns.slice('ts-'.length);
   }
 
   private async saveNamespaceIndex(): Promise<void> {
@@ -338,6 +385,7 @@ namespace; peers see its tuples after subscribing to the same name.
     this.on('put', async (msg: AbjectMessage) => {
       const {namespace,fields,operationId}=msg.payload as {namespace:string;fields:Record<string,unknown>;operationId?:string};
       requireNonEmpty(namespace,'namespace');precondition(fields&&typeof fields==='object','fields must be an object');
+      if(!this.admits(namespace,msg))throw new Error('TupleSpace: this namespace admits only its owner');
       const id=operationId?uuidv5(`${namespace}:${operationId}`,uuidv5.URL):uuidv4();
       return withKeyedLock(`${this.id}:${namespace}:${id}`,async()=>{
         const fingerprint=JSON.stringify(fields);
@@ -347,7 +395,7 @@ namespace; peers see its tuples after subscribing to the same name.
           return {tupleId:id,duplicate:true};
         }
         const tuple:TupleEntry={id,fields,admissionFingerprint:fingerprint,createdAt:Date.now(),createdBy:this.localPeerId||this.id};
-        await this.writeTuple(tuple,namespace);this.changed('tuplePut',tuple);
+        await this.writeTuple(tuple,namespace);this.tell(namespace,'tuplePut',tuple);
         return {tupleId:id};
       });
     });
@@ -355,6 +403,7 @@ namespace; peers see its tuples after subscribing to the same name.
     this.on('read', async (msg: AbjectMessage) => {
       const { namespace, pattern } = msg.payload as { namespace: string; pattern: TuplePattern };
       requireNonEmpty(namespace, 'namespace');
+      if (!this.admits(namespace, msg)) return null;
       const tuples = await this.getAllTuples(namespace);
       for (const tuple of tuples.values()) {
         if (this.matchesPattern(tuple, pattern)) return tuple;
@@ -365,6 +414,7 @@ namespace; peers see its tuples after subscribing to the same name.
     this.on('scan', async (msg: AbjectMessage) => {
       const { namespace, pattern, limit } = msg.payload as { namespace: string; pattern: TuplePattern; limit?: number };
       requireNonEmpty(namespace, 'namespace');
+      if (!this.admits(namespace, msg)) return [];
       const tuples = await this.getAllTuples(namespace);
       const results: TupleEntry[] = [];
       for (const tuple of tuples.values()) {
@@ -379,12 +429,13 @@ namespace; peers see its tuples after subscribing to the same name.
     this.on('claim', async msg => {
       const {namespace,pattern}=msg.payload as {namespace:string;pattern:TuplePattern};
       requireNonEmpty(namespace,'namespace');
+      if(!this.admits(namespace,msg))return null;
       for(const candidate of (await this.getAllTuples(namespace)).values()){
         const result=await withKeyedLock(`${this.id}:${namespace}:${candidate.id}`,async()=>{
           const tuple=(await this.getAllTuples(namespace)).get(candidate.id);
           if(!tuple || !this.matchesPattern(tuple,pattern) || !this.isUnclaimed(tuple))return null;
           tuple.claimedBy=this.localPeerId||this.id;tuple.claimedAt=Date.now();
-          await this.writeTuple(tuple,namespace);this.changed('tupleClaimed',tuple);
+          await this.writeTuple(tuple,namespace);this.tell(namespace,'tupleClaimed',tuple);
           return {tuple,claimed:true};
         });
         if(result)return result;
@@ -396,6 +447,7 @@ namespace; peers see its tuples after subscribing to the same name.
       const { namespace, tupleId } = msg.payload as { namespace: string; tupleId: string };
       requireNonEmpty(namespace, 'namespace');
       requireNonEmpty(tupleId, 'tupleId');
+      if (!this.admits(namespace, msg)) return false;
       return withKeyedLock(`${this.id}:${namespace}:${tupleId}`,async()=>{
 
       const tuples = await this.getAllTuples(namespace);
@@ -416,7 +468,7 @@ namespace; peers see its tuples after subscribing to the same name.
       await this.writeTuple(tuple, namespace);
       log.info(`RELEASED ${tupleId} status=${tuple.fields.status ?? '?'} attempts=${tuple.fields.attempts ?? 0}`);
       // Emit tupleUpdated so watchers (AgentAbject) can re-dispatch retried tasks
-      this.changed('tupleUpdated', tuple);
+      this.tell(namespace, 'tupleUpdated', tuple);
       return true;
       });
     });
@@ -425,6 +477,7 @@ namespace; peers see its tuples after subscribing to the same name.
       const { namespace, tupleId } = msg.payload as { namespace: string; tupleId: string };
       requireNonEmpty(namespace, 'namespace');
       requireNonEmpty(tupleId, 'tupleId');
+      if (!this.admits(namespace, msg)) return false;
       return withKeyedLock(`${this.id}:${namespace}:${tupleId}`,async()=>{
 
       if (!this.sharedStateId) return false;
@@ -434,7 +487,7 @@ namespace; peers see its tuples after subscribing to the same name.
       }));
       const tupleCount = (await this.getAllTuples(namespace)).size;
       log.info(`REMOVED ${tupleId} (${tupleCount} remaining in ns=${namespace.slice(0, 8)})`);
-      this.changed('tupleRemoved', { tupleId });
+      this.tell(namespace, 'tupleRemoved', { tupleId });
       return true;
       });
     });
@@ -444,6 +497,7 @@ namespace; peers see its tuples after subscribing to the same name.
       requireNonEmpty(namespace, 'namespace');
       requireNonEmpty(tupleId, 'tupleId');
       precondition(fields && typeof fields === 'object', 'fields must be an object');
+      if (!this.admits(namespace, msg)) return false;
 
       return withKeyedLock(`${this.id}:${namespace}:${tupleId}`, async () => {
       const tuples = await this.getAllTuples(namespace);
@@ -457,7 +511,7 @@ namespace; peers see its tuples after subscribing to the same name.
       Object.assign(tuple.fields, fields);
       await this.writeTuple(tuple, namespace);
       log.info(`UPDATED ${tupleId} status=${tuple.fields.status ?? '?'} attempts=${tuple.fields.attempts ?? 0} claimedBy=${tuple.claimedBy ?? 'none'}`);
-      this.changed('tupleUpdated', tuple);
+      this.tell(namespace, 'tupleUpdated', tuple);
       return true;
       });
     });
@@ -465,6 +519,11 @@ namespace; peers see its tuples after subscribing to the same name.
     this.on('ensureNamespace', async (msg: AbjectMessage) => {
       const { namespace } = msg.payload as { namespace: string };
       requireNonEmpty(namespace, 'namespace');
+      if (isPrivatePayload(msg.payload)) {
+        await this.ensurePrivateNamespace(namespace, msg.routing.from);
+        return true;
+      }
+      if (!this.admits(namespace, msg)) throw new Error(`TupleSpace: namespace '${namespace}' already exists`);
       await this.doEnsureNamespace(namespace);
       return true;
     });
@@ -473,6 +532,15 @@ namespace; peers see its tuples after subscribing to the same name.
       const { namespace } = msg.payload as { namespace: string };
       requireNonEmpty(namespace, 'namespace');
       const ns = stateName(namespace);
+      if (this.privateOwners.has(ns)) {
+        // Only the owner removes a private namespace, and its tuples go with it.
+        if (!this.admits(namespace, msg)) return false;
+        this.privateOwners.delete(ns);
+        if (this.sharedStateId) {
+          await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: ns }));
+        }
+        return true;
+      }
       this.activeNamespaces.delete(ns);
       await this.saveNamespaceIndex();
       log.info(`Namespace removed: ${ns}`);
@@ -485,6 +553,11 @@ namespace; peers see its tuples after subscribing to the same name.
         const { aspect, value } = msg.payload as { aspect: string; value: { name?: string; key?: string; value?: unknown } };
         if (aspect === 'stateChanged' && value?.name && (value.name as string).startsWith('ts-')) {
           const entry = value.value as TupleEntry | undefined;
+          if (this.privateOwners.has(value.name)) {
+            // A private namespace: no log line with its contents, and only its owner hears.
+            if (entry) this.tell(this.namespaceOf(value.name), 'tupleUpdated', entry);
+            return;
+          }
           log.info(`SHARED-STATE-CHANGE ns=${value.name} key=${value.key ?? '?'} status=${entry?.fields?.status ?? '?'} claimedBy=${entry?.claimedBy ?? 'none'}`);
           // Emit tupleUpdated so dependents (GoalManager) can react to remote status changes
           if (entry) {

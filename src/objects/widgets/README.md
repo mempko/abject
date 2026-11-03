@@ -66,6 +66,21 @@ WidgetManager (`admitsToWindow`) about any other sender once and remembers
 the answer. Anything else is refused with a contract error, so an object
 cannot add to, read, click or tear down another object's window.
 
+**Private windows.** `createWindowAbject { ..., private: true }` (a private
+conversation's window, `src/core/privacy.ts`) marks a window private. The
+person sees it as usual. To other objects its title reads as `PRIVATE_TITLE`
+(in `getTitle`, WidgetManager's `listWindows` and `windowCreated`, and what
+WindowManager's switcher lists); only its owner, WidgetManager and the
+person's built-in chat views read the real one. Only its owner, its widgets
+and objects the owner granted access may become its dependents, since its
+events carry unconsumed keys and uploaded files (`admitsToWindow` with
+`asDependent`). The window creates its surface with `private: true` and its
+owner, so UIServer refuses `captureScreenshot` of it to anyone but the owner
+(Screenshot passes the real requester as `onBehalfOf`), refuses
+`captureDesktop` while it is on the active desktop, lists it untitled, and
+takes synthetic input into it (`injectInput`, `click`, `type`, `keyPress`)
+only from the window and its owner (the person's own input arrives as usual).
+
 **3D.** A window fronts the scene vocabulary for its surface: `scene { ops }`
 adds retained nodes to the window's subtree (any Abject may contribute; UIServer
 routes those nodes' input back to the contributor and removes them when it

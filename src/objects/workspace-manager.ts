@@ -232,6 +232,11 @@ export class WorkspaceManager extends Abject {
   private display = true;
   private workspaces: Map<string, WorkspaceInfo> = new Map();
   /**
+   * Children whose manifest says `sharing: 'user-local'` (a private
+   * conversation's Chat, say): never exposed to peers, curated or not.
+   */
+  private userLocalChildren = new Set<AbjectId>();
+  /**
    * Each caller's edits of workspace names, descriptions and tags, for this
    * session. A name, description and tags saved together (one Save in a
    * settings window) merge into one step. Access mode, whitelist, exposure
@@ -725,7 +730,8 @@ export class WorkspaceManager extends Abject {
     // newly spawned, cloned, or restored child with its WorkspaceRegistry.
     this.on('objectRegistered', async (msg: AbjectMessage) => {
       const registryId = msg.routing.from;
-      const { id: objectId, typeId } = msg.payload as { id: string; typeId?: string };
+      const { id: objectId, typeId, manifest } = msg.payload as { id: string; typeId?: string; manifest?: { sharing?: string } };
+      if (manifest?.sharing === 'user-local') this.userLocalChildren.add(objectId as AbjectId);
       for (const ws of this.workspaces.values()) {
         if (ws.registryId !== registryId) continue;
 
@@ -745,7 +751,7 @@ export class WorkspaceManager extends Abject {
         // deliberately narrow default until explicitly curated.
         const autoExpose = ws.curated !== true
           && (ws.accessMode === 'shared' || ws.joined === true);
-        if (autoExpose && !ws.exposedObjectIds.includes(childId)) {
+        if (autoExpose && !ws.exposedObjectIds.includes(childId) && !this.userLocalChildren.has(childId)) {
           ws.exposedObjectIds.push(childId);
           workspaceChanged = true;
         }
@@ -2302,7 +2308,7 @@ export class WorkspaceManager extends Abject {
     // against the WorkspaceRegistry's local-only catalog after persisted policy
     // (especially curated/joined) has been restored.
     try {
-      const registrations = await this.request<Array<{ id: string; typeId?: string }>>(
+      const registrations = await this.request<Array<{ id: string; typeId?: string; manifest?: { sharing?: string } }>>(
         request(this.id, info.registryId, 'listLocal', {})
       );
       let reconciled = false;
@@ -2310,6 +2316,7 @@ export class WorkspaceManager extends Abject {
         && (info.accessMode === 'shared' || info.joined === true);
       for (const registration of registrations) {
         const childId = registration.id as AbjectId;
+        if (registration.manifest?.sharing === 'user-local') this.userLocalChildren.add(childId);
         if (!info.childIds.includes(childId)) {
           info.childIds.push(childId);
           reconciled = true;
@@ -2318,7 +2325,7 @@ export class WorkspaceManager extends Abject {
           info.childTypeIds.set(childId, registration.typeId as TypeId);
           reconciled = true;
         }
-        if (autoExpose && !info.exposedObjectIds.includes(childId)) {
+        if (autoExpose && !info.exposedObjectIds.includes(childId) && !this.userLocalChildren.has(childId)) {
           info.exposedObjectIds.push(childId);
           reconciled = true;
         }
@@ -2606,9 +2613,9 @@ export class WorkspaceManager extends Abject {
    * the owner and fellow participants must reach for replication, and nothing
    * else from the mirror.
    *
-   * Note the residual: an object marked `sharing: 'user-local'` is still kept
-   * out of the catalog by `WorkspaceShareRegistry.isShareable`, so a peer can
-   * never discover its id here, but this gate no longer refuses it on id alone.
+   * An object marked `sharing: 'user-local'` is kept out of the catalog by
+   * `WorkspaceShareRegistry.isShareable`, and this gate refuses it too once
+   * its registration has been seen here (userLocalChildren).
    */
   private effectiveExposedIds(ws: WorkspaceInfo): AbjectId[] {
     const uncurated = ws.curated !== true;
@@ -2631,6 +2638,8 @@ export class WorkspaceManager extends Abject {
       // directions). Curated and local workspaces expose exactly their list.
       ids = [...ws.exposedObjectIds];
     }
+    // A user-local child stays on this host whatever the curation says.
+    ids = ids.filter(id => !this.userLocalChildren.has(id));
     if (!ids.includes(ws.registryId)) ids.push(ws.registryId);
     return [...new Set(ids)];
   }

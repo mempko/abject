@@ -77,7 +77,9 @@ object in `error` keeps sending, and the next successful handler clears it.
 
 **Built-in handlers** (installed by `init()`): `describe`, `ask`, `ping`,
 `addDependent`, `removeDependent`, `getRegistry`, `getResultContract`, and
-`progress`. A subclass's own `ping` handler is kept, and its own `progress`
+`progress`. `addDependent` asks `admitsDependent(callerId)` first (everyone
+by default); an object whose events carry content only some callers should
+see narrows it and the request answers false. A subclass's own `ping` handler is kept, and its own `progress`
 handler runs after the built-in one; the others are overwritten, so customize
 `ask` and `describe` through the hooks below (`handleAsk()`,
 `handleDescribe()`).
@@ -143,8 +145,9 @@ the workspace Console (never throws); `setTimer()`, `setRecurringTimer()`,
 `cancelTimer()` (timers that `stop()` cancels, preferred over raw
 `setTimeout` for anything that sends); `resolveCallerName()` /
 `resolveCallerIdentity()` (who sent this, from the Registry: name, typeId,
-`builtIn`) and `isBuiltInCaller()` (the admission check privileged handlers
-make);
+`builtIn`; for an object still in its onInit, which no registry knows yet,
+from the built-in Factory's `describeBuilding`) and `isBuiltInCaller()` (the
+admission check privileged handlers make);
 `capabilityCaller()` and `requireTaskRuntime()` (recover the real caller
 behind JobManager or AgentAbject); `retainTaskResult()` / `takeTaskResult()`;
 `undoCallerKey()` (whose undo history a sender writes to: its durable typeId)
@@ -222,6 +225,25 @@ learning shows as being surprised less in repeated contexts.
   (recorded and counted, never refused). `BELIEF_SOURCES` are the ones the
   system can correct; knowledge entries keep `EntryEvidence` counters
   (`observe_entry` in `learning.ts`).
+
+## Private conversations
+
+`privacy.ts` is the vocabulary of private conversations. A conversation made
+private when ChatManager creates it keeps its contents to a small circle: its
+Chat, that Chat's window, ChatManager, the person's own views of it
+(ChatBrowser, the `abject` terminal), and for each goal it starts, the agents
+working on that goal. Nothing in it is learned, and its goals live in memory
+only and are deleted once their outcome reaches the Chat.
+
+Most stores answer any caller (Storage, SharedState, TupleSpace, the LLM
+ledger), so privacy keeps private content out of them rather than gating
+every reader. The few places it must live admit only their owners: Storage
+keys under `PRIVATE_KEY_PREFIX` (`private:`) are readable only by ChatManager
+and Chat, and a SharedState or TupleSpace namespace created `private: true`
+lives in memory, never syncs, and answers only the object that made it. The
+`private: true` flag on a payload only takes access away, so any caller may
+set it; widening access still goes through `isBuiltInCaller`. Logs and
+notices show `shown(text, isPrivate)`, which is `[private]` for private text.
 
 ## Files
 
@@ -436,6 +458,19 @@ All but `file-edit.ts` and `tool-output.ts` import Node built-ins (`fs`,
   `QUESTION_BUDGET`, `CHECK_TASKS_PER_GOAL`, `Reaction` and
   `ReactionKind`, `contextKey()`, `occurrenceBucket()`, `weekOf()`, and
   `isReadOperation()` for read-only check steps.
+- **privacy.ts**: the vocabulary of private conversations (see Private
+  conversations): `PRIVATE_KEY_PREFIX`, `isPrivateKey()`,
+  `privateHistoryKey()`, `PRIVATE_STORAGE_READERS`, `shown()`,
+  `PrivateGoalOutcome`, `isPrivatePayload()`, and the texts a private chat
+  shows (`PRIVATE_BANNER`, `PRIVATE_REMEMBER_REFUSAL`). Two prompt texts
+  are shared too: `PRIVATE_ELSEWHERE_CHAT_PROMPT`, which every Chat's routing
+  prompt carries (another private conversation is read only in its own
+  window, so answer instead of starting a goal, also when asked again or for
+  a screenshot), `PRIVATE_AUDIT_EXCEPTION`, which the routing self-audit
+  carries so that answer is not re-prompted into a goal, and
+  `PRIVATE_REFUSAL_GUIDANCE`, which the planner and every agent task carry
+  (a refusal naming private content is final; report it rather than look for
+  another route).
 - **evidence.ts**: learning evidence by reference. A decision or knowledge
   receipt cites a record as `{hash, digest}` (`evidenceReference()`,
   `evidenceDigest()`: expectation, outcome, verdict, explanation, attribution,

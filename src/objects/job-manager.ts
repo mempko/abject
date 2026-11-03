@@ -13,6 +13,7 @@ import { Sandbox, SandboxTimeLimitError } from '../core/sandbox.js';
 import { Log } from '../core/timed-log.js';
 import { levenshtein } from './source-diff.js';
 import { isReadOperation } from '../core/surprise.js';
+import { isPrivatePayload, shown, PRIVATE_TEXT } from '../core/privacy.js';
 
 const log = new Log('JobManager');
 
@@ -56,6 +57,12 @@ export interface Job {
   context?: Record<string, unknown>;
   /** Stop the job when it goes this long without progress (ms). Unset: no limit. */
   timeoutMs?: number;
+  /**
+   * Work for a private conversation's goal: its description, code and result
+   * reach only its submitter, AgentAbject and GoalManager, never a log, and
+   * the job is dropped once its answer is delivered.
+   */
+  private?: boolean;
   status: 'queued' | 'running' | 'completed' | 'failed';
   result?: unknown;
   error?: string;
@@ -98,6 +105,9 @@ const RESERVED_CONTEXT_KEYS = new Set<string>([
   'ask', 'decide', 'call', 'dep', 'find', 'id', 'progress', 'console',
 ]);
 
+/** Besides its submitter, the built-in objects that may see a private job. */
+const PRIVATE_JOB_READERS = ['AgentAbject', 'GoalManager'] as const;
+
 export class JobManager extends Abject {
   private invocationContexts = new Map<string,{callerId?:AbjectId;taskId?:string;target:AbjectId}>();
   private jobs: Map<string, Job> = new Map();
@@ -107,6 +117,8 @@ export class JobManager extends Abject {
   private pendingResolvers: Map<string, (job: Job) => void> = new Map();
   private running: Map<string, RunningJob> = new Map();
   private consoleId?: AbjectId;
+  /** Whether an agent task is private, by AgentAbject's word; bounded, a task's privacy never changes. */
+  private taskPrivacy = new Map<string, boolean>();
 
   constructor() {
     super({
@@ -130,18 +142,19 @@ export class JobManager extends Abject {
                   { name: 'timeoutMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Stop the job when it goes this long without progress: no call answered, no progress reported. At most a day; unset: no limit.', optional: true },
                   { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'The agent task this job works for. When that task is a read-only check step (AgentAbject getTaskStatus readOnly), the job may only make calls that read.', optional: true },
                   { name: 'runtimeStep', type: { kind: 'primitive', primitive: 'boolean' }, description: 'AgentAbject only: the job is its own observe/think/act dispatch for taskId.', optional: true },
+                  { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'The job works for a private conversation (also when AgentAbject getTaskStatus says taskId is private): nothing of it is logged, listings show it only to its submitter, AgentAbject and GoalManager, its LLM calls are private, and it is dropped once delivered.', optional: true },
                 ],
                 returns: { kind: 'reference', reference: 'JobResult' },
               },
               {
                 name: 'listJobs',
-                description: 'Return all jobs, most recent first.',
+                description: 'Return all jobs, most recent first. A private job is listed only to its submitter, AgentAbject and GoalManager.',
                 parameters: [],
                 returns: { kind: 'array', elementType: { kind: 'reference', reference: 'Job' } },
               },
               {
                 name: 'getJob',
-                description: 'Return a single job by ID.',
+                description: 'Return a single job by ID (null for a private job asked by anyone but its submitter, AgentAbject or GoalManager).',
                 parameters: [
                   { name: 'jobId', type: { kind: 'primitive', primitive: 'string' }, description: 'Job ID' },
                 ],
@@ -166,6 +179,15 @@ export class JobManager extends Abject {
                 description: 'Return names of all active queues.',
                 parameters: [],
                 returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              },
+              {
+                name: 'forgetPrivateGoal',
+                description: 'A private goal has ended: drop every job of its tasks (queued ones are cancelled). Taken from GoalManager only.',
+                parameters: [
+                  { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'The private root goal' },
+                  { name: 'taskIds', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Every task of the goal and its children' },
+                ],
+                returns: { kind: 'object', properties: { dropped: { kind: 'primitive', primitive: 'number' } } },
               },
             ],
           },
@@ -218,13 +240,16 @@ export class JobManager extends Abject {
       };
       requireNonEmpty(description, 'description');
       requireNonEmpty(code, 'code');
+      const taskId = typeof (msg.payload as any)?.taskId === 'string' ? (msg.payload as any).taskId as string : undefined;
+      // Private work: flagged by its submitter, or a private task by AgentAbject's word.
+      const isPrivate = isPrivatePayload(msg.payload) || (!!taskId && await this.taskIsPrivate(taskId));
 
       // Refuse at once what could never run, with the reason.
       try {
         Sandbox.checkSource(code, 'body');
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
-        log.info(`Rejected job from ${msg.routing.from}: ${reason}`);
+        log.info(`Rejected job from ${msg.routing.from}: ${shown(reason, isPrivate)}`);
         throw new Error(`Job code rejected: ${reason}`);
       }
 
@@ -240,7 +265,6 @@ export class JobManager extends Abject {
 
       const callerId = msg.routing.from;
       const jobId = `job-${++this.jobCounter}`;
-      const taskId = typeof (msg.payload as any)?.taskId === 'string' ? (msg.payload as any).taskId as string : undefined;
       // The exemption is AgentAbject's alone; the flag from anyone else is ignored.
       const runtimeStep = !!taskId && (msg.payload as { runtimeStep?: unknown }).runtimeStep === true
         && await this.isBuiltInCaller(callerId, ['AgentAbject']);
@@ -257,6 +281,7 @@ export class JobManager extends Abject {
         requestMessageId: msg.header.messageId,
         context: sanitisedContext,
         ...(typeof timeoutMs === 'number' && timeoutMs > 0 ? { timeoutMs: Math.min(timeoutMs, JOB_WAIT_MS) } : {}),
+        ...(isPrivate ? { private: true } : {}),
         status: 'queued',
         queuedAt: Date.now(),
       };
@@ -265,8 +290,10 @@ export class JobManager extends Abject {
       const q = this.getOrCreateQueue(resolvedQueue);
       q.queue.push(jobId);
 
-      // Broadcast jobQueued to dependents (JobBrowser)
-      this.changed('jobQueued', { jobId, description, queue: resolvedQueue, position: q.queue.length });
+      // Broadcast jobQueued to dependents (JobBrowser); a private job's carries no text.
+      this.changed('jobQueued', isPrivate
+        ? { jobId, description: PRIVATE_TEXT, queue: resolvedQueue, position: q.queue.length, private: true }
+        : { jobId, description, queue: resolvedQueue, position: q.queue.length });
 
       // Create a Promise that resolves when the job finishes
       const jobDone = new Promise<Job>((resolve) => {
@@ -288,28 +315,36 @@ export class JobManager extends Abject {
         } catch (err) {
           this.log('warn', `Deferred reply for ${finished.id} failed (caller may be gone): ${err instanceof Error ? err.message : String(err)}`);
         }
+        // A private job is kept only until its answer is delivered.
+        if (finished.private) this.jobs.delete(finished.id);
       });
 
       // Return DEFERRED_REPLY to suppress auto-reply and free the processing loop
       return DEFERRED_REPLY;
     });
 
-    this.on('listJobs', async () => {
+    this.on('listJobs', async (msg: AbjectMessage) => {
       const allJobs = Array.from(this.jobs.values());
       allJobs.sort((a, b) => b.queuedAt - a.queuedAt);
-      return allJobs;
+      if (!allJobs.some(j => j.private)) return allJobs;
+      // Private jobs are listed to their submitter, AgentAbject and GoalManager only.
+      if (await this.isBuiltInCaller(msg.routing.from, PRIVATE_JOB_READERS)) return allJobs;
+      return allJobs.filter(j => !j.private || j.callerId === msg.routing.from);
     });
 
     this.on('getJob', async (msg: AbjectMessage) => {
       const { jobId } = msg.payload as { jobId: string };
-      return this.jobs.get(jobId) ?? null;
+      const job = this.jobs.get(jobId);
+      if (job && !(await this.seesJob(job, msg.routing.from))) return null;
+      return job ?? null;
     });
 
     this.on('cancelJob', async (msg: AbjectMessage) => {
       const { jobId } = msg.payload as { jobId: string };
       const job = this.jobs.get(jobId);
       if (!job || job.status !== 'queued') return false;
-      this.log('info', `cancelJob ${jobId} (${job.description})`);
+      if (!(await this.seesJob(job, msg.routing.from))) return false;
+      this.log('info', `cancelJob ${jobId} (${shown(job.description, job.private)})`);
 
       // Remove from the job's named queue
       const q = this.queues.get(job.queue);
@@ -329,8 +364,18 @@ export class JobManager extends Abject {
         resolver(job);
       }
 
-      this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: 'Cancelled' });
+      this.changed('jobFailed', job.private
+        ? { jobId, description: PRIVATE_TEXT, queue: job.queue, error: 'Cancelled', private: true }
+        : { jobId, description: job.description, queue: job.queue, error: 'Cancelled' });
       return true;
+    });
+
+    // A private goal ended: GoalManager names its tasks, and their jobs go.
+    this.on('forgetPrivateGoal', async (msg: AbjectMessage) => {
+      contractRequire(await this.isBuiltInCaller(msg.routing.from, ['GoalManager']),
+        'JobManager takes forgetPrivateGoal from GoalManager only');
+      const { taskIds } = msg.payload as { goalId?: string; taskIds?: string[] };
+      return { dropped: this.forgetPrivateTasks(new Set(Array.isArray(taskIds) ? taskIds : [])) };
     });
 
     this.on('clearHistory', async () => {
@@ -367,20 +412,33 @@ export class JobManager extends Abject {
         job.startedAt = Date.now();
         q.currentJobId = jobId;
 
-        this.changed('jobStarted', { jobId, description: job.description, queue: job.queue });
-        await this.log('info', `Job started: ${job.description}`, { jobId, queue: job.queue });
+        // A private job's events and log lines carry no text of it.
+        this.changed('jobStarted', job.private
+          ? { jobId, description: PRIVATE_TEXT, queue: job.queue, private: true }
+          : { jobId, description: job.description, queue: job.queue });
+        await this.log('info', `Job started: ${shown(job.description, job.private)}`, { jobId, queue: job.queue });
 
         try {
           const result = await this.executeJob(job);
           job.status = 'completed';
           job.result = result;
-          this.changed('jobCompleted', { jobId, description: job.description, queue: job.queue, result });
-          await this.log('info', `Job completed: ${job.description}`, { jobId, queue: job.queue, result });
+          if (job.private) {
+            this.changed('jobCompleted', { jobId, description: PRIVATE_TEXT, queue: job.queue, private: true });
+            await this.log('info', `Job completed: ${PRIVATE_TEXT}`, { jobId, queue: job.queue });
+          } else {
+            this.changed('jobCompleted', { jobId, description: job.description, queue: job.queue, result });
+            await this.log('info', `Job completed: ${job.description}`, { jobId, queue: job.queue, result });
+          }
         } catch (err) {
           job.status = 'failed';
           job.error = err instanceof Error ? err.message : String(err);
-          this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: job.error, requestMessageId: job.requestMessageId });
-          await this.log('error', `Job failed: ${job.description}`, { jobId, queue: job.queue, error: job.error });
+          if (job.private) {
+            this.changed('jobFailed', { jobId, description: PRIVATE_TEXT, queue: job.queue, error: PRIVATE_TEXT, requestMessageId: job.requestMessageId, private: true });
+            await this.log('error', `Job failed: ${PRIVATE_TEXT}`, { jobId, queue: job.queue });
+          } else {
+            this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: job.error, requestMessageId: job.requestMessageId });
+            await this.log('error', `Job failed: ${job.description}`, { jobId, queue: job.queue, error: job.error });
+          }
 
           // Notify the caller directly so it can recover immediately
           // instead of waiting for its own request timeout to fire.
@@ -466,7 +524,7 @@ export class JobManager extends Abject {
   private async executeJob(job: Job): Promise<unknown> {
     const callerId = job.callerId;
     const userContext = job.context;
-    log.info(`Executing job code (queue: ${job.queue}):\n${job.code}`);
+    log.info(`Executing job code (queue: ${job.queue}):\n${shown(job.code, job.private)}`);
 
     // Names resolved during this job. Scoped to the run rather than to the
     // object: an id belongs to one object for its lifetime, but a respawn
@@ -529,9 +587,20 @@ export class JobManager extends Abject {
       return readOnlyTask ??= this.taskIsReadOnly(job.taskId);
     };
 
+    /**
+     * The LLM's id, for a private job only: its calls to the LLM are marked
+     * private, so the ledger keeps no text of them.
+     */
+    let privateLlm: Promise<AbjectId | null> | undefined;
+    const markedPrivate = async (resolved: AbjectId, payload: unknown): Promise<unknown> => {
+      if (!job.private || !payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+      if (resolved !== await (privateLlm ??= this.discoverDep('LLM'))) return payload;
+      return { ...(payload as Record<string, unknown>), private: true };
+    };
+
     /** Send one call for the job; the helpers below decide whether it may go. */
     const sendCall = async (resolved: AbjectId, actualMethod: string, actualPayload: unknown) => {
-      const msg = request(this.id, resolved as AbjectId, actualMethod, actualPayload);
+      const msg = request(this.id, resolved as AbjectId, actualMethod, await markedPrivate(resolved, actualPayload));
       this.invocationContexts.set(msg.header.messageId, { callerId, taskId: job.taskId, target: resolved as AbjectId });
       running.awaiting.set(resolved, (running.awaiting.get(resolved) ?? 0) + 1);
       try {
@@ -675,6 +744,72 @@ export class JobManager extends Abject {
       this.running.delete(job.id);
       sandbox.dispose(`${job.id} finished`);
     }
+  }
+
+  /** Whether a caller may see a job: any job but a private one, which only its submitter, AgentAbject and GoalManager see. */
+  private async seesJob(job: Job, callerId: AbjectId): Promise<boolean> {
+    if (!job.private || job.callerId === callerId) return true;
+    return this.isBuiltInCaller(callerId, PRIVATE_JOB_READERS);
+  }
+
+  /**
+   * Whether an agent task is private, by AgentAbject's getTaskStatus. A task
+   * keeps its privacy for life, so an answer is remembered. No AgentAbject
+   * means no private task; an AgentAbject that does not answer leaves the
+   * job private, since the rule only restricts.
+   */
+  private async taskIsPrivate(taskId: string): Promise<boolean> {
+    const known = this.taskPrivacy.get(taskId);
+    if (known !== undefined) return known;
+    const agents = await this.discoverDep('AgentAbject');
+    if (!agents) return false;
+    try {
+      const status = await this.request<{ private?: boolean } | null>(request(this.id, agents, 'getTaskStatus', { taskId }), 10_000);
+      const isPrivate = status?.private === true;
+      if (status) this.rememberTaskPrivacy(taskId, isPrivate);
+      return isPrivate;
+    } catch {
+      return true;
+    }
+  }
+
+  private rememberTaskPrivacy(taskId: string, isPrivate: boolean): void {
+    this.taskPrivacy.set(taskId, isPrivate);
+    while (this.taskPrivacy.size > 1000) this.taskPrivacy.delete(this.taskPrivacy.keys().next().value!);
+  }
+
+  /**
+   * Drop the jobs of a private goal's tasks. A queued one is cancelled (its
+   * submitter gets the cancellation); a running one is marked private, so it
+   * is dropped once it ends and answers; a finished one goes now.
+   */
+  private forgetPrivateTasks(taskIds: Set<string>): number {
+    let dropped = 0;
+    for (const taskId of taskIds) this.rememberTaskPrivacy(taskId, true);
+    for (const [jobId, job] of [...this.jobs]) {
+      if (!job.taskId || !taskIds.has(job.taskId)) continue;
+      job.private = true;
+      dropped++;
+      if (job.status === 'running') continue;
+      if (job.status === 'queued') {
+        const q = this.queues.get(job.queue);
+        const idx = q ? q.queue.indexOf(jobId) : -1;
+        if (q && idx >= 0) q.queue.splice(idx, 1);
+        job.status = 'failed';
+        job.error = 'Cancelled';
+        job.completedAt = Date.now();
+        this.changed('jobFailed', { jobId, description: PRIVATE_TEXT, queue: job.queue, error: 'Cancelled', private: true });
+        const resolver = this.pendingResolvers.get(jobId);
+        if (resolver) {
+          // The delivered cancellation drops the job.
+          this.pendingResolvers.delete(jobId);
+          resolver(job);
+          continue;
+        }
+      }
+      this.jobs.delete(jobId);
+    }
+    return dropped;
   }
 
   /**

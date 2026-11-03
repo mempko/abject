@@ -102,3 +102,40 @@ export function clientOriginsFromEnv(env: Record<string, string | undefined>): C
 
   return { origins: [...new Set(origins)], ignored };
 }
+
+/** Hostnames that name this machine itself. */
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  return h === 'localhost' || h.endsWith('.localhost') || h === '::1' || h === '0.0.0.0' || h === '::'
+    || /^127(\.\d{1,3}){3}$/.test(h) || h === '0:0:0:0:0:0:0:1';
+}
+
+/**
+ * Whether a URL is this instance's own desktop: a page the UI socket would
+ * take as the person's (`clientOriginsFromEnv`), or any loopback address on
+ * the port of one of those pages or of the UI socket and CLI gateway
+ * themselves. An agent's browser opening it would become a desktop client,
+ * see every window (private conversations too) and type into them, so the
+ * agent browser never opens it.
+ */
+export function isOwnDesktopUrl(value: string, env: Record<string, string | undefined>): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  const origin = canonicalOrigin(url.href);
+  const pages = clientOriginsFromEnv(env).origins;
+  if (origin && pages.includes(origin)) return true;
+  if (!isLoopbackHost(url.hostname)) return false;
+  const wsPort = parseInt(env.WS_PORT ?? '7719', 10);
+  const cliPort = parseInt(env.CLI_PORT ?? String(wsPort + 4), 10);
+  const ports = new Set<number>([wsPort, cliPort]);
+  for (const page of pages) {
+    const p = new URL(page);
+    if (isLoopbackHost(p.hostname)) ports.add(parseInt(p.port || (p.protocol === 'https:' ? '443' : '80'), 10));
+  }
+  const port = parseInt(url.port || (url.protocol === 'https:' || url.protocol === 'wss:' ? '443' : '80'), 10);
+  return ports.has(port);
+}

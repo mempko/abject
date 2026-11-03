@@ -24,6 +24,8 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { describeMessages, protocolText } from '../core/protocol-description.js';
+import { shown } from '../core/privacy.js';
 import { goalHealthQuestions } from '../core/decision-questions.js';
 import { choiceOf } from '../llm/decision.js';
 
@@ -54,6 +56,12 @@ export class GoalObserver extends Abject {
   private stallWakes = new Map<string, number>();
   /** Stalled goals the planner does not plan (a peer's, a sub-goal): left to the stale backstop. */
   private stallDeclined = new Set<string>();
+  /**
+   * Active goals last listed as private. The observer is in a private goal's
+   * circle and watches it like any other, but its decisions are private and
+   * its warnings stay here (they would name the goal to every subscriber).
+   */
+  private privateGoals = new Set<string>();
 
   constructor() {
     super({
@@ -201,6 +209,15 @@ decisions belong to ScrumMaster.
       return this.failAllActiveGoals();
     });
 
+    describeMessages(this.manifest, [
+      { name: 'forgetPrivateGoal', description: 'GoalManager deleted a private goal: drop everything watched about it and its sub-goals.', parameters: { goalId: protocolText, taskIds: { kind: 'array', elementType: protocolText } } },
+    ]);
+    this.on('forgetPrivateGoal', async (msg: AbjectMessage) => {
+      if (!await this.isBuiltInCaller(msg.routing.from, ['GoalManager'])) return;
+      const { goalId } = msg.payload as { goalId?: string };
+      if (typeof goalId === 'string' && goalId) this.forgetGoal(goalId);
+    });
+
     this.on('configure', async (msg: AbjectMessage) => {
       const { staleWarnMs, staleFailMs } = msg.payload as {
         staleWarnMs?: number; staleFailMs?: number;
@@ -216,7 +233,7 @@ decisions belong to ScrumMaster.
   private async sweep(): Promise<void> {
     if (!this.goalManagerId) return;
 
-    let goals: Array<{ id: string; status: string; updatedAt: number; createdAt?:number; lastMeaningfulProgressAt?:number; title?: string; progress?: Array<{ timestamp: number; agentName: string; message: string; phase?: string }> }>;
+    let goals: Array<{ id: string; status: string; updatedAt: number; createdAt?:number; lastMeaningfulProgressAt?:number; title?: string; private?: boolean; progress?: Array<{ timestamp: number; agentName: string; message: string; phase?: string }> }>;
     try {
       goals = await this.request<Array<{ id: string; status: string; updatedAt: number }>>(
         request(this.id, this.goalManagerId, 'listGoals', { status: 'active' })
@@ -237,6 +254,7 @@ decisions belong to ScrumMaster.
     for (const id of this.stalledSince.keys()) if (!activeIds.has(id)) this.stalledSince.delete(id);
     for (const id of this.stallWakes.keys()) if (!activeIds.has(id)) this.stallWakes.delete(id);
     for (const id of this.stallDeclined) if (!activeIds.has(id)) this.stallDeclined.delete(id);
+    this.privateGoals = new Set(goals.filter(g => g.private === true).map(g => g.id));
 
     for (const goal of goals) {
       const age = now - (goal.lastMeaningfulProgressAt ?? goal.createdAt ?? goal.updatedAt);
@@ -252,7 +270,7 @@ decisions belong to ScrumMaster.
         const runtime=await this.discoverDep('AgentAbject');
         const health=runtime?await this.request<{ownedWorkActive:boolean}>(request(this.id,runtime,'getGoalExecutionHealth',{goalId:goal.id})).catch(()=>null):null;
         if (health?.ownedWorkActive) {
-          if(!this.warningsIssued.has(goal.id)){this.warningsIssued.add(goal.id);this.changed('goalWarning',{goalId:goal.id,reason:'No recent accepted evidence; runtime still owns active work',health});}
+          if(!this.warningsIssued.has(goal.id)){this.warningsIssued.add(goal.id);this.warn(goal.id,{goalId:goal.id,reason:'No recent accepted evidence; runtime still owns active work',health});}
           continue;
         }
         // The time backstop stands, but a confident "progressing" or
@@ -271,7 +289,7 @@ decisions belong to ScrumMaster.
         if (judged?.hold) continue;
         log.info(`sweep: goal ${goal.id.slice(0, 8)} stale for ${Math.round(age / 60000)} min — warning${judged ? ` (${judged.health})` : ''}`);
         this.warningsIssued.add(goal.id);
-        this.changed('goalWarning', { goalId: goal.id, reason: judged?.health === 'looping' ? 'looping' : 'stale' });
+        this.warn(goal.id, { goalId: goal.id, reason: judged?.health === 'looping' ? 'looping' : 'stale' });
         continue;
       }
 
@@ -332,7 +350,7 @@ decisions belong to ScrumMaster.
     log.info(`sweep: goal ${goalId.slice(0, 8)} stalled (${reason}) — review scrum started (${wakes + 1}/${MAX_STALL_WAKES})`);
     if (!this.warningsIssued.has(goalId)) {
       this.warningsIssued.add(goalId);
-      this.changed('goalWarning', { goalId, reason: `Stalled: ${reason}` });
+      this.warn(goalId, { goalId, reason: `Stalled: ${reason}` });
     }
     return true;
   }
@@ -380,12 +398,13 @@ decisions belong to ScrumMaster.
       const action = t.operation?.action;
       return { phase: t.phase, step: t.step, ...(action ? { action: JSON.stringify(action).slice(0, 300) } : {}) };
     });
+    const isPrivate = this.privateGoals.has(goal.id);
     const outcome = await this.askDecision('goal.health', {
       title: goal.title ?? '',
       quiet_minutes: Math.round(age / 60000),
       progress: (goal.progress ?? []).slice(-10).map(p => ({ agent: p.agentName, phase: p.phase, message: p.message.slice(0, 200), minutes_ago: Math.round((now - p.timestamp) / 60000) })),
       running,
-    }, goalHealthQuestions(), { goalId: goal.id, onBehalfOf: 'GoalObserver', timeoutMs: 20000 });
+    }, goalHealthQuestions(), { goalId: goal.id, onBehalfOf: 'GoalObserver', timeoutMs: 20000, ...(isPrivate ? { private: true } : {}) });
     const health = choiceOf(outcome, 'health');
     if (!outcome || !health) return undefined;
     const p = health.probabilities[health.choice] ?? 0;
@@ -400,7 +419,8 @@ decisions belong to ScrumMaster.
   private async autoFailGoal(goalId: string, reason: string): Promise<void> {
     if (!this.goalManagerId) return;
 
-    log.info(`Auto-failing goal ${goalId}: ${reason}`);
+    const isPrivate = this.privateGoals.has(goalId);
+    log.info(`Auto-failing goal ${goalId}: ${shown(reason, isPrivate)}`);
     this.autoFailedCount++;
     this.warningsIssued.delete(goalId);
 
@@ -420,7 +440,27 @@ decisions belong to ScrumMaster.
       );
     } catch { /* best effort */ }
 
-    this.changed('goalAutoFailed', { goalId, reason });
+    if (!isPrivate) this.changed('goalAutoFailed', { goalId, reason });
+    else this.forgetGoal(goalId);
+  }
+
+  /** Warn subscribers about a goal; a private goal's warning stays in the log. */
+  private warn(goalId: string, value: Record<string, unknown>): void {
+    if (this.privateGoals.has(goalId)) {
+      log.info(`private goal ${goalId.slice(0, 8)} needs attention`);
+      return;
+    }
+    this.changed('goalWarning', value);
+  }
+
+  /** Drop everything watched about one goal. */
+  private forgetGoal(goalId: string): void {
+    this.warningsIssued.delete(goalId);
+    this.healthCheckedAt.delete(goalId);
+    this.stalledSince.delete(goalId);
+    this.stallWakes.delete(goalId);
+    this.stallDeclined.delete(goalId);
+    this.privateGoals.delete(goalId);
   }
 
   /**

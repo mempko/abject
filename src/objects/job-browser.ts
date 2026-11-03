@@ -479,6 +479,8 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
     if (fromId === this.jobManagerId) {
       const data = value as Record<string, unknown> | undefined;
       if (!data) return;
+      // A private conversation's jobs are not listed here; their events carry no text.
+      if (data.private === true) return;
       const jobId = data.jobId as string;
 
       switch (aspect) {

@@ -26,6 +26,8 @@ export interface ConversationRow {
   lastActiveAt: number;
   /** True when this chat's window is currently on the desktop. */
   open: boolean;
+  /** A private conversation: nothing in it is learned, its goals are deleted when they finish. */
+  private?: boolean;
 }
 
 export interface HistoryEntry {
@@ -320,8 +322,12 @@ export class AbjectClient {
     return this.request('listChats', { workspaceId });
   }
 
-  newChat(workspaceId: string, title?: string): Promise<{ conversationId: string; chatId: string }> {
-    return this.request('newChat', title ? { workspaceId, title } : { workspaceId });
+  newChat(workspaceId: string, title?: string, opts: { private?: boolean } = {}): Promise<{ conversationId: string; chatId: string }> {
+    return this.request('newChat', {
+      workspaceId,
+      ...(title ? { title } : {}),
+      ...(opts.private ? { private: true } : {}),
+    });
   }
 
   openChat(workspaceId: string, conversationId: string): Promise<{ conversationId: string; chatId: string }> {

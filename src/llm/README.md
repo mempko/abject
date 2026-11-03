@@ -8,6 +8,14 @@ calls. Every other abject reaches a model only by messaging `LLM`
 fallbacks, the call ledger, spend, prompt-cache keepalive and goal budgets all
 live in `LLMObject`, not in this directory.
 
+A call is private when its payload carries `private: true` or its goal or task
+was marked with `markPrivate` (built-in goal, agent and chat objects only;
+memory only). It is metered, budgeted and counted toward daily spend like any
+other, but its ledger entry is marked `private` and keeps no prompt or output
+text and no goal or task id, its decision answers are not logged or memoized,
+and it never enters the cache keepalive registry. The prompt still goes to the
+provider that runs it (for an abject-backed provider, that abject).
+
 ## Architecture
 
 ```

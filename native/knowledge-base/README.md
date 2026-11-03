@@ -97,6 +97,12 @@ TypeScript callers read its message shapes from `src/core/knowledge.ts`
   `includeLearning: true` asks for the whole history. `recall` with
   `minGoals` keeps only entries met in at least that many goals: knowledge
   that keeps recurring, which is what a pattern grows from.
+- **Untracked reads.** `recall`, `weave`, `match`, `get`, `list` and
+  `listTags` take `track: false` for a read that leaves no trace: no
+  `accessCount` bump, and the log line names neither the query nor any
+  entry title (`Recall (untracked) => 3 entries`). Private conversations and
+  their goals read existing knowledge this way; the default stays
+  `track: true`.
 - **Distillation** runs on load and at most every 30 minutes, piggybacked on
   writes rather than a timer. It archives `learned` entries never accessed
   within 7 days, `learned`/`reference` entries idle for 30 days, and the least

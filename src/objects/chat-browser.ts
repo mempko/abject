@@ -8,6 +8,8 @@
  * browser auto-open once on a fresh workspace so users discover the feature.
  * Ctrl+Z in its window undoes the last deletion made here: ChatManager keeps
  * the step (this browser is the caller that made it), the browser forwards.
+ * Private conversations show a Private mark, search matches only their
+ * titles (their history is never fetched for it), and toasts never name them.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -18,6 +20,7 @@ import { undoMethods, type UndoAction, type UndoResult, type UndoState } from '.
 import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { PersistedConversation } from './chat-manager.js';
+import { PRIVATE_TITLE } from '../core/privacy.js';
 
 const log = new Log('ChatBrowser');
 
@@ -38,6 +41,7 @@ export class ChatBrowser extends Abject {
   private rootLayoutId?: AbjectId;
   private listWidgetId?: AbjectId;
   private newChatBtnId?: AbjectId;
+  private newPrivateChatBtnId?: AbjectId;
   /** Section header ("N chats"), restyled while a chat is working. */
   private headerLabelId?: AbjectId;
   /** Conversation count behind the header text. */
@@ -54,6 +58,8 @@ export class ChatBrowser extends Abject {
   private refreshPending = false;
   /** Conversation titles as last listed, for the delete toast. */
   private titles = new Map<string, string>();
+  /** Private conversations as last listed. */
+  private privateIds = new Set<string>();
 
   constructor() {
     super({
@@ -140,6 +146,10 @@ export class ChatBrowser extends Abject {
         await this.requestNewConversation();
         return;
       }
+      if (aspect === 'click' && fromId === this.newPrivateChatBtnId) {
+        await this.requestNewConversation(true);
+        return;
+      }
 
       // Rich list events: clicking a row opens it; the inline Delete action
       // removes it. Both carry the conversationId in the item's `value`.
@@ -195,10 +205,10 @@ export class ChatBrowser extends Abject {
 
   // ─── Dispatchers to ChatManager ────────────────────────────────────
 
-  private async requestNewConversation(): Promise<void> {
+  private async requestNewConversation(isPrivate = false): Promise<void> {
     if (!this.chatManagerId) return;
     try {
-      await this.request(request(this.id, this.chatManagerId, 'newConversation', {}), 5000);
+      await this.request(request(this.id, this.chatManagerId, 'newConversation', isPrivate ? { private: true } : {}), 5000);
     } catch (err) {
       log.warn(`newConversation failed: ${String(err)}`);
       this.playEffect('shake');
@@ -221,7 +231,9 @@ export class ChatBrowser extends Abject {
     try {
       // Generous: the conversation's cards are set aside with it.
       await this.request(request(this.id, this.chatManagerId, 'deleteConversation', { conversationId }), 60_000);
-      await this.notify(`Deleted ${title ? `"${title}"` : 'the conversation'}. Ctrl+Z to undo`, 'success');
+      // A toast is seen beyond this window: a private chat is named only as one.
+      const named = this.privateIds.has(conversationId) ? PRIVATE_TITLE : title;
+      await this.notify(`Deleted ${named ? `"${named}"` : 'the conversation'}. Ctrl+Z to undo`, 'success');
     } catch (err) {
       log.warn(`deleteConversation failed: ${String(err)}`);
       this.playEffect('shake');
@@ -357,6 +369,7 @@ export class ChatBrowser extends Abject {
     this.rootLayoutId = undefined;
     this.listWidgetId = undefined;
     this.newChatBtnId = undefined;
+    this.newPrivateChatBtnId = undefined;
     this.headerLabelId = undefined;
     this.changed('visibility', false);
     return true;
@@ -410,6 +423,7 @@ export class ChatBrowser extends Abject {
         } catch { /* best effort */ }
         this.listWidgetId = undefined;
         this.newChatBtnId = undefined;
+        this.newPrivateChatBtnId = undefined;
         this.headerLabelId = undefined;
         await this.populate(rows, items);
       }
@@ -425,7 +439,7 @@ export class ChatBrowser extends Abject {
     // Rows first, so the list goes on screen already filled.
     const items = prepared ?? await this.listItems(rows);
 
-    // Header row: section header with the count, and "+ New chat"
+    // Header row: section header with the count, "+ New chat" and "+ Private chat"
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
@@ -450,6 +464,15 @@ export class ChatBrowser extends Abject {
           fontSize: 13,
         },
       },
+      {
+        type: 'button', windowId: this.windowId, text: '+ Private chat',
+        style: {
+          background: this.theme.buttonBg,
+          color: this.theme.buttonText,
+          borderColor: this.theme.actionBorder,
+          fontSize: 13,
+        },
+      },
     ];
     const { widgetIds: headerIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: headerSpecs })
@@ -457,11 +480,13 @@ export class ChatBrowser extends Abject {
     const titleLabelId = headerIds[0];
     this.headerLabelId = titleLabelId;
     this.newChatBtnId = headerIds[1];
+    this.newPrivateChatBtnId = headerIds[2];
 
     await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
       children: [
         { widgetId: titleLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: HEADER_BTN_H } },
         { widgetId: this.newChatBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 120, height: HEADER_BTN_H } },
+        { widgetId: this.newPrivateChatBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 130, height: HEADER_BTN_H } },
       ],
     }));
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
@@ -470,6 +495,7 @@ export class ChatBrowser extends Abject {
       preferredSize: { height: HEADER_BTN_H },
     }));
     this.send(request(this.id, this.newChatBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.newPrivateChatBtnId, 'addDependent', {}));
 
     if (rows.length === 0) {
       await this.renderEmptyState();
@@ -493,11 +519,17 @@ export class ChatBrowser extends Abject {
     this.send(request(this.id, this.listWidgetId, 'addDependent', {}));
   }
 
-  /** One list row per conversation, with its history as searchable text. */
+  /**
+   * One list row per conversation, with its history as searchable text. A
+   * private conversation is searched by its title alone: its history is not
+   * fetched into the list.
+   */
   private async listItems(rows: PersistedConversation[]): Promise<ListItem[]> {
     this.titles = new Map(rows.map(c => [c.conversationId, c.title]));
+    this.privateIds = new Set(rows.filter(c => c.private).map(c => c.conversationId));
     return Promise.all(
       rows.map(async (c) => {
+        if (c.private) return this.toListItem(c);
         const historyText = await this.fetchConversationHistory(c.conversationId);
         return this.toListItem(c, historyText);
       })
@@ -536,6 +568,7 @@ export class ChatBrowser extends Abject {
       value: c.conversationId,
       detail: formatRelativeTime(c.lastActiveAt),
       secondary: searchableContent || undefined,
+      ...(c.private ? { badge: { text: 'Private', color: this.theme.buttonBg, textColor: this.theme.buttonText } } : {}),
       actions: [
         {
           id: 'delete',
@@ -551,7 +584,7 @@ export class ChatBrowser extends Abject {
     if (!this.rootLayoutId || !this.windowId) return;
     const text = emptyStateMarkdown(
       'Start a conversation',
-      'Each chat is its own window and keeps its own history. Click **+ New chat** above to begin.',
+      'Each chat is its own window and keeps its own history. Click **+ New chat** above to begin, or **+ Private chat** for one nothing is learned from.',
     );
     const { widgetIds: [cardId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {

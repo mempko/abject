@@ -26,6 +26,7 @@ import { error, request } from '../../core/message.js';
 import { require as requireContract } from '../../core/contracts.js';
 import { PermissionDenied, refusalMessage, type PermissionReceipt } from '../../core/permission-outcome.js';
 import { Log } from '../../core/timed-log.js';
+import { isOwnDesktopUrl } from '../../network/origin-policy.js';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -2456,6 +2457,7 @@ export class WebBrowser extends Abject {
   ): Promise<{ pageId: string }> {
     const profileKey = await this.resolveProfileKey(owner, options?.profile);
     const page = await this.createPage(owner, options) as PlaywrightPage;
+    await WebBrowser.keepOffOwnDesktop(page);
     const pageId = this.generatePageId();
 
     const tracked: TrackedPage = {
@@ -2841,6 +2843,21 @@ export class WebBrowser extends Abject {
   }
 
   /**
+   * Keep a page off this instance's own desktop (isOwnDesktopUrl): every
+   * request to it, from a navigation, a link, a redirect, a frame or script,
+   * is aborted. A browser on the desktop's page is a desktop client: it sees
+   * every window, private conversations included, and can type into them.
+   */
+  private static async keepOffOwnDesktop(page: unknown): Promise<void> {
+    const routable = page as { route?: (match: (url: URL) => boolean, handler: (route: { abort: (code?: string) => Promise<void> }) => Promise<void>) => Promise<void> };
+    if (typeof routable.route !== 'function') return;
+    await routable.route(
+      (url: URL) => isOwnDesktopUrl(url.href, process.env),
+      async (route) => { await route.abort('blockedbyclient').catch(() => undefined); },
+    );
+  }
+
+  /**
    * Navigate a page to a URL and wait for content.
    */
   private async navigatePage(
@@ -2848,6 +2865,9 @@ export class WebBrowser extends Abject {
     url: string,
     options?: BrowseOptions,
   ): Promise<void> {
+    if (isOwnDesktopUrl(url, process.env)) {
+      throw new Error(`${url} is this Abjects instance's own desktop, which the browser does not open: it shows the person's windows, private conversations included.`);
+    }
     const timeout = options?.timeout ?? 30000;
     try {
       await page.goto(url, {

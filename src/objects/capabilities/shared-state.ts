@@ -13,6 +13,7 @@ import { require as precondition } from '../../core/contracts.js';
 import { runBounded } from '../../core/bounded.js';
 import { request as createRequest, event as createEvent } from '../../core/message.js';
 import { Log } from '../../core/timed-log.js';
+import { isPrivatePayload } from '../../core/privacy.js';
 
 const log = new Log('SharedState');
 
@@ -142,6 +143,14 @@ export class SharedState extends Abject {
   // Track which keys are persisted — maps state name → set of persisted key names
   private persistedKeys: Map<string, Set<string>> = new Map();
 
+  /**
+   * Private namespaces (created with `private: true`) and the one object
+   * that owns each. A private namespace lives in memory only: it is never
+   * persisted, synced, announced or listed, only its owner reads, writes
+   * or subscribes to it, and its change events go to the owner alone.
+   */
+  private privateOwners: Map<string, AbjectId> = new Map();
+
   // Remote SharedState instances discovered via WSR + remote registries
   // Key: remote SharedState AbjectId string, Value: AbjectId
   private remotePeers: Map<string, AbjectId> = new Map();
@@ -186,6 +195,7 @@ export class SharedState extends Abject {
               description: 'Create a named shared state instance',
               parameters: [
                 { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'State instance name' },
+                { name: 'private', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, a private instance owned by the caller: memory only, never synced to peers or listed, and only the caller may read, write or subscribe to it (optional, default false)', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
@@ -279,27 +289,42 @@ export class SharedState extends Abject {
     this.on('create', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
       precondition(name !== '', 'State name must not be empty');
+      // A private instance and a normal one never share a name, either way round.
+      const wantsPrivate = isPrivatePayload(msg.payload);
+      const owner = this.privateOwners.get(name);
+      const exists = this.stateMaps.has(name) || this.persistedKeys.has(name);
+      if (exists && (wantsPrivate !== (owner !== undefined) || (owner !== undefined && owner !== msg.routing.from))) {
+        throw new Error(`SharedState: a state instance named '${name}' already exists`);
+      }
       if (!this.stateMaps.has(name)) {
         this.stateMaps.set(name, new LWWMap());
         this.subscribers.set(name, new Set());
+        if (wantsPrivate) this.privateOwners.set(name, msg.routing.from);
       }
       return true;
     });
 
     this.on('get', async (msg: AbjectMessage) => {
       const { name, key } = msg.payload as { name: string; key: string };
+      if (!this.admits(name, msg)) return null;
       const map = this.stateMaps.get(name);
       return map?.get(key) ?? null;
     });
 
     this.on('getAll', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
+      if (!this.admits(name, msg)) return {};
       const map = this.stateMaps.get(name);
       return map?.getAll() ?? {};
     });
 
     this.on('set', async (msg: AbjectMessage) => {
       const { name, key, value, persist } = msg.payload as { name: string; key: string; value: unknown; persist?: boolean };
+      if (this.privateOwners.has(name)) {
+        // Memory only: `persist` is ignored for a private instance.
+        this.requireOwner(name, msg);
+        return this.setValueLocal(name, key, value);
+      }
       log.info(`[${this.id.slice(0, 8)}] set name='${name}' key='${key}' persist=${persist ?? false} remotePeers=${this.remotePeers.size}`);
       if (persist) {
         if (!this.persistedKeys.has(name)) this.persistedKeys.set(name, new Set());
@@ -318,6 +343,10 @@ export class SharedState extends Abject {
 
     this.on('delete', async (msg: AbjectMessage) => {
       const { name, key } = msg.payload as { name: string; key: string };
+      if (this.privateOwners.has(name)) {
+        this.requireOwner(name, msg);
+        return this.deleteValueLocal(name, key);
+      }
       const result = this.deleteValueLocal(name, key);
       // Clean up persistence tracking for deleted keys
       const persisted = this.persistedKeys.get(name);
@@ -332,6 +361,12 @@ export class SharedState extends Abject {
 
     this.on('subscribe', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
+      if (this.privateOwners.has(name)) {
+        // The owner hears its own changes; nothing about it leaves this host.
+        if (!this.admits(name, msg)) return false;
+        this.subscribers.get(name)!.add(msg.routing.from);
+        return true;
+      }
       log.info(`[${this.id.slice(0, 8)}] subscribe '${name}' from=${msg.routing.from.slice(0, 8)}`);
       const isNewName = !this.stateMaps.has(name);
       // Auto-create state map if it doesn't exist
@@ -362,6 +397,7 @@ export class SharedState extends Abject {
 
     this.on('unsubscribe', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
+      if (!this.admits(name, msg)) return false;
       const subs = this.subscribers.get(name);
       if (!subs) return false;
       subs.delete(msg.routing.from);
@@ -379,11 +415,19 @@ export class SharedState extends Abject {
       // list, and enumerating names would only help a peer go looking.
       precondition(!msg.routing.authenticatedPeerId, 'listNamespaces answers local callers only');
       const { prefix } = (msg.payload ?? {}) as { prefix?: string };
-      return [...this.stateMaps.keys()].filter(name => !prefix || name.startsWith(prefix));
+      return [...this.stateMaps.keys()].filter(name => !this.privateOwners.has(name) && (!prefix || name.startsWith(prefix)));
     });
 
     this.on('removeNamespace', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
+      if (this.privateOwners.has(name)) {
+        // Only the owner drops a private instance; nothing of it is stored.
+        if (!this.admits(name, msg)) return false;
+        this.privateOwners.delete(name);
+        this.stateMaps.delete(name);
+        this.subscribers.delete(name);
+        return true;
+      }
       // Delete all persisted entries from storage
       const persisted = this.persistedKeys.get(name);
       if (persisted && this.storageId) {
@@ -409,6 +453,7 @@ export class SharedState extends Abject {
       };
       const fromId = msg.routing.from;
       if (!this.acceptsSyncFrom(msg, '_syncEntry')) return;
+      if (this.privateOwners.has(name)) return;
       log.info(`[${this.id.slice(0, 8)}] _syncEntry from=${fromId.slice(0, 8)} name='${name}' key='${key}'`);
 
       // Add the sender as a known remote peer (bidirectional link)
@@ -450,6 +495,7 @@ export class SharedState extends Abject {
       };
       const fromId = msg.routing.from;
       if (!this.acceptsSyncFrom(msg, '_syncFull')) return;
+      if (this.privateOwners.has(name)) return;
       log.info(`[${this.id.slice(0, 8)}] _syncFull from=${fromId.slice(0, 8)} name='${name}' entries=${entries.length}`);
 
       // Add the sender as a known remote peer (bidirectional link)
@@ -587,12 +633,24 @@ export class SharedState extends Abject {
   }
 
   private namespaceAllowedForSync(name: string): boolean {
+    // A private instance never crosses the wire, whatever the policy says.
+    if (this.privateOwners.has(name)) return false;
     if (this._sharedNamespaces.length === 0) return true;
     for (const pattern of this._sharedNamespaces) {
       if (pattern === name) return true;
       if (pattern.endsWith('*') && name.startsWith(pattern.slice(0, -1))) return true;
     }
     return false;
+  }
+
+  /** Whether the sender may use `name`: anyone for a normal instance, the owner for a private one. */
+  private admits(name: string, msg: AbjectMessage): boolean {
+    const owner = this.privateOwners.get(name);
+    return owner === undefined || owner === msg.routing.from;
+  }
+
+  private requireOwner(name: string, msg: AbjectMessage): void {
+    if (!this.admits(name, msg)) throw new Error('SharedState: this state instance admits only its owner');
   }
 
   protected override async onInit(): Promise<void> {
@@ -836,6 +894,7 @@ export class SharedState extends Abject {
   private getSubscribedStateNames(): string[] {
     const names: string[] = [];
     for (const [name, subs] of this.subscribers) {
+      if (this.privateOwners.has(name)) continue;
       if (subs.size > 0 || this.stateMaps.has(name)) {
         names.push(name);
       }
@@ -973,6 +1032,14 @@ export class SharedState extends Abject {
   private notifySubscribers(name: string, key: string, value: unknown): void {
     const subs = this.subscribers.get(name);
     if (!subs || subs.size === 0) return;
+    const owner = this.privateOwners.get(name);
+    if (owner !== undefined) {
+      // A private instance tells its owner alone, directly.
+      if (subs.has(owner)) {
+        this.send(createEvent(this.id, owner, 'changed', { aspect: 'stateChanged', value: { name, key, value } }));
+      }
+      return;
+    }
     for (const subId of subs) {
       this.send(createEvent(this.id, subId, 'changed', {
         aspect: 'stateChanged',
@@ -983,6 +1050,7 @@ export class SharedState extends Abject {
 
   private broadcastEntry(name: string, key: string, entry: LWWEntry): void {
     if (this._accessMode === 'local') return;
+    // namespaceAllowedForSync also refuses every private instance.
     if (!this.namespaceAllowedForSync(name)) return;
 
     // Only broadcast to peers allowed under the current access mode. In private
@@ -1019,6 +1087,7 @@ export class SharedState extends Abject {
 
   private async persistEntry(name: string, key: string, entry: LWWEntry | undefined): Promise<void> {
     if (!this.storageId) return;
+    if (this.privateOwners.has(name)) return;
     const persisted = this.persistedKeys.get(name);
     if (!persisted?.has(key)) return;
     const storageKey = `shared-state:${name}:${key}`;
@@ -1035,6 +1104,7 @@ export class SharedState extends Abject {
     if (!this.storageId) return;
     const manifest: Record<string, string[]> = {};
     for (const [name, keys] of this.persistedKeys) {
+      if (this.privateOwners.has(name)) continue;
       manifest[name] = [...keys];
     }
     try {

@@ -33,6 +33,7 @@ function helpLines(p: string): string[] {
   return [
     'commands:',
     '  /new [title]      new chat in this tab\'s workspace (opens a tab)',
+    '  /private [title]  new private chat: nothing in it is learned, its goals are deleted when done',
     '  /open             pick a workspace and chat to open in a new tab',
     '  /tabs             list open tabs',
     `  /tab N|next|prev  switch tab        (also ${P} 1..9, ${P} n/p, ${P} arrows)`,
@@ -54,6 +55,10 @@ function helpLines(p: string): string[] {
 }
 
 /** Parse ABJECT_PREFIX ("ctrl+a", "C-x", "^b") down to its letter; default 'a'. */
+/** How listings mark a private conversation (the tab bar uses PRIVATE_TAB_MARK). */
+const PRIVATE_MARK = ' [private]';
+const PRIVATE_TAB_MARK = '[p] ';
+
 function parsePrefixKey(spec?: string): string {
   const m = /(?:ctrl\+|c-|\^)?([a-z])$/i.exec((spec ?? '').trim());
   const ch = m ? m[1].toLowerCase() : 'a';
@@ -146,6 +151,8 @@ interface Tab {
   scroll: number;
   unread: boolean;
   busy: boolean;
+  /** A private conversation (marked in the tab bar and listings). */
+  private?: boolean;
   /**
    * The running goal's live panel — the terminal counterpart of the visual
    * chat's goal tree. Rendered under the transcript while a goal runs:
@@ -306,7 +313,7 @@ class TuiApp {
     ws: WorkspaceRow | { id: string; name: string },
     conversationId?: string,
     title?: string,
-    opts: { focus?: boolean } = {},
+    opts: { focus?: boolean; private?: boolean } = {},
   ): Promise<void> {
     const focus = opts.focus !== false;
     // Guard against a concurrent open of the same conversation (e.g. our own
@@ -319,7 +326,7 @@ class TuiApp {
     try {
       const opened = conversationId
         ? await this.client.openChat(ws.id, conversationId)
-        : await this.client.newChat(ws.id, title);
+        : await this.client.newChat(ws.id, title, { private: opts.private === true });
       if (!key) {
         key = `${ws.id}:${opened.conversationId}`;
         this.pendingOpens.add(key);
@@ -344,6 +351,7 @@ class TuiApp {
         scroll: 0,
         unread: !focus,
         busy: false,
+        ...(row?.private || (!conversationId && opts.private) ? { private: true } : {}),
       };
       await this.loadHistory(tab);
       this.tabs.push(tab);
@@ -981,7 +989,7 @@ class TuiApp {
     const lines: Line[] = [{ text: 'open tabs:', color: 'bold' }];
     this.tabs.forEach((tab, i) => {
       const marker = i === this.active ? '*' : ' ';
-      lines.push({ text: ` ${marker}${i + 1}: ${tab.wsName}/${tab.title}`, color: 'normal' });
+      lines.push({ text: ` ${marker}${i + 1}: ${tab.wsName}/${tab.title}${tab.private ? PRIVATE_MARK : ''}`, color: 'normal' });
     });
     const tab = this.tab();
     if (tab) this.appendTo(tab, lines);
@@ -1033,6 +1041,11 @@ class TuiApp {
         void this.openTab(ws).catch(err => this.note(String(err), 'red'));
         return;
       }
+      if (ch === 'p') {
+        this.mode = { kind: 'normal' };
+        void this.openTab(ws, undefined, undefined, { private: true }).catch(err => this.note(String(err), 'red'));
+        return;
+      }
       const index = ch.charCodeAt(0) - '1'.charCodeAt(0);
       const row = items[index];
       if (!row) return;
@@ -1050,11 +1063,12 @@ class TuiApp {
       return lines;
     }
     if (this.mode.kind === 'pickChat') {
-      const lines: Line[] = [{ text: `chats in ${this.mode.ws.name} — pick one, or n for new (Esc to cancel):`, color: 'bold' }];
+      const lines: Line[] = [{ text: `chats in ${this.mode.ws.name}: pick one, n for new, p for private (Esc to cancel):`, color: 'bold' }];
       this.mode.items.slice(0, 9).forEach((c, i) => {
-        lines.push({ text: ` ${i + 1}: ${c.title}${c.open ? ' (open)' : ''}`, color: 'normal' });
+        lines.push({ text: ` ${i + 1}: ${c.title}${c.private ? PRIVATE_MARK : ''}${c.open ? ' (open)' : ''}`, color: 'normal' });
       });
       lines.push({ text: ' n: new chat', color: 'cyan' });
+      lines.push({ text: ' p: new private chat', color: 'cyan' });
       return lines;
     }
     return [];
@@ -1089,6 +1103,10 @@ class TuiApp {
         case 'new':
           if (!tab) { void this.startPicker(); break; }
           await this.openTab({ id: tab.workspaceId, name: tab.wsName }, undefined, arg || undefined);
+          break;
+        case 'private':
+          if (!tab) { void this.startPicker(); break; }
+          await this.openTab({ id: tab.workspaceId, name: tab.wsName }, undefined, arg || undefined, { private: true });
           break;
         case 'open':
           await this.startPicker();
@@ -1446,7 +1464,7 @@ class TuiApp {
   private render(): void {
     const tab = this.tab();
     const tabs: TabInfo[] = this.tabs.map((t, i) => ({
-      label: `${t.wsName}/${t.title}`.slice(0, 24),
+      label: `${t.private ? PRIVATE_TAB_MARK : ''}${t.wsName}/${t.title}`.slice(0, 24),
       active: i === this.active,
       unread: t.unread,
       busy: t.busy,
@@ -1570,7 +1588,8 @@ export async function runPlain(target: BackendTarget): Promise<void> {
       for (const line of formatMessage(entry.error ? 'error' : entry.role, entry.sender ?? entry.role, entry.content,
         isMarkdownMessage(entry.role), art, entry.answered ? undefined : entry.choices, entry.card?.text)) print(line);
     }
-    print({ text: `— ${workspace!.name} / ${chats.find(c => c.conversationId === conversationId)?.title ?? 'new chat'} —`, color: 'dim' });
+    const row = chats.find(c => c.conversationId === conversationId);
+    print({ text: `— ${workspace!.name} / ${row?.title ?? 'new chat'}${row?.private ? PRIVATE_MARK : ''} —`, color: 'dim' });
   };
   await openLatestOrNew();
 
@@ -1584,7 +1603,7 @@ export async function runPlain(target: BackendTarget): Promise<void> {
         if (text === '/quit' || text === '/exit') { rl.close(); return; }
         if (text === '/chats') {
           const chats = await client.listChats(workspace!.id);
-          chats.forEach((c, i) => print({ text: ` ${i + 1}: ${c.title}`, color: 'normal' }));
+          chats.forEach((c, i) => print({ text: ` ${i + 1}: ${c.title}${c.private ? PRIVATE_MARK : ''}`, color: 'normal' }));
         } else if (text.startsWith('/open ')) {
           const n = parseInt(text.slice(6).trim(), 10);
           const chats = await client.listChats(workspace!.id);
@@ -1593,8 +1612,13 @@ export async function runPlain(target: BackendTarget): Promise<void> {
           else {
             const opened = await client.openChat(workspace!.id, row.conversationId);
             conversationId = opened.conversationId;
-            print({ text: `opened: ${row.title}`, color: 'dim' });
+            print({ text: `opened: ${row.title}${row.private ? PRIVATE_MARK : ''}`, color: 'dim' });
           }
+        } else if (text === '/private' || text.startsWith('/private ')) {
+          const title = text.slice(8).trim() || undefined;
+          const opened = await client.newChat(workspace!.id, title, { private: true });
+          conversationId = opened.conversationId;
+          print({ text: 'new private chat opened: nothing in it is learned', color: 'dim' });
         } else if (text.startsWith('/new')) {
           const title = text.slice(4).trim() || undefined;
           const opened = await client.newChat(workspace!.id, title);
@@ -1646,7 +1670,7 @@ export async function runPlain(target: BackendTarget): Promise<void> {
             pendingDialog = null;
           }
         } else if (text === '/help') {
-          print({ text: 'plain mode: /chats /open N /new [title] /ws [n|name] /use N /stop /yes /no /answer <text> /quit — anything else is sent to the chat. /ws N sets the active workspace; /use N only retargets this REPL', color: 'dim' });
+          print({ text: 'plain mode: /chats /open N /new [title] /private [title] /ws [n|name] /use N /stop /yes /no /answer <text> /quit; anything else is sent to the chat. /ws N sets the active workspace; /use N only retargets this REPL', color: 'dim' });
           for (const line of SETTINGS_HELP.filter(l => !l.includes('/settings'))) print({ text: line, color: 'dim' });
         } else if (text.startsWith('/') && isSettingsCommand(text.slice(1).split(/\s+/)[0])) {
           const [cmd, ...args] = text.slice(1).split(/\s+/);
