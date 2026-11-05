@@ -18,17 +18,159 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { require as requireContract, requireNonEmpty } from '../core/contracts.js';
+import { require as requireContract, requireNonEmpty, requirePositive } from '../core/contracts.js';
 import { chromeCase } from '../core/theme-data.js';
 import { fontStacks } from './widgets/widget-types.js';
+import {
+  DEFAULT_FRAME_POLL_MS,
+  DEFAULT_KEY_FRAME_INTERVAL_MS,
+  dataUriBytes,
+  needsResync,
+} from './frame-diff.js';
+import type { ViewerFramePatch, ViewerFrameReply } from './frame-diff.js';
 
 const WEB_BROWSER_VIEWER_INTERFACE: InterfaceId = 'abjects:web-browser-viewer';
 
+/** The rectangle on the canvas a page frame is fitted into (letterboxed). */
+export interface ViewerFitRect {
+  drawX: number;
+  drawY: number;
+  drawW: number;
+  drawH: number;
+}
+
+/** What one viewerFrame reply asks the viewer to do. */
+export interface ViewerFrameDecision {
+  action: 'ignore' | 'key' | 'delta' | 'resync';
+  reason: string;
+  patches: ViewerFramePatch[];
+}
+
+/** What the picture on the canvas currently is. */
+export interface ViewerFrameScreenState {
+  lastDrawnSeq?: number;
+  lastFit?: ViewerFitRect;
+}
+
+/**
+ * Decide what to do with one `viewerFrame` reply given what is already on
+ * screen. `ignore` means send no draw call at all. `resync` means the reply is
+ * a patch against a frame this viewer no longer holds, so the next poll must
+ * ask for a fresh key frame instead of patching.
+ */
+export function decideViewerFrameAction(
+  reply: ViewerFrameReply,
+  state: ViewerFrameScreenState,
+): ViewerFrameDecision {
+  requireContract(reply !== undefined && reply !== null, 'viewerFrame reply is required');
+
+  if (reply.kind === 'unchanged') {
+    return { action: 'ignore', reason: 'identical to the frame on screen', patches: [] };
+  }
+  if (reply.kind === 'key') {
+    return { action: 'key', reason: 'whole frame', patches: [] };
+  }
+  if (!state.lastFit) {
+    return { action: 'resync', reason: 'no frame on screen to patch', patches: [] };
+  }
+  if (needsResync(reply.baseSeq, state.lastDrawnSeq)) {
+    return {
+      action: 'resync',
+      reason: `patch bases on seq ${reply.baseSeq} but the screen holds ${state.lastDrawnSeq ?? 'nothing'}`,
+      patches: [],
+    };
+  }
+  if (reply.patches.length === 0) {
+    return { action: 'ignore', reason: 'patch batch carried nothing', patches: [] };
+  }
+  return { action: 'delta', reason: `${reply.patches.length} patch(es)`, patches: reply.patches };
+}
+
+/**
+ * Map one page-pixel patch rectangle through the fit transform onto the
+ * canvas. The rect is widened to whole pixels (never narrowed) so adjacent
+ * patches cannot leave a one-pixel seam between them.
+ */
+export function mapPatchToCanvas(
+  patch: ViewerFramePatch,
+  fit: ViewerFitRect,
+  shotW: number,
+  shotH: number,
+): { x: number; y: number; width: number; height: number } {
+  requirePositive(shotW, 'mapPatchToCanvas needs the page frame width');
+  requirePositive(shotH, 'mapPatchToCanvas needs the page frame height');
+  requireContract(patch.width > 0 && patch.height > 0, 'a patch must have a non-empty rect');
+
+  const scaleX = fit.drawW / shotW;
+  const scaleY = fit.drawH / shotH;
+  const left = Math.floor(fit.drawX + patch.x * scaleX);
+  const top = Math.floor(fit.drawY + patch.y * scaleY);
+  const right = Math.ceil(fit.drawX + (patch.x + patch.width) * scaleX);
+  const bottom = Math.ceil(fit.drawY + (patch.y + patch.height) * scaleY);
+  return {
+    x: left,
+    y: top,
+    width: Math.max(1, right - left),
+    height: Math.max(1, bottom - top),
+  };
+}
+
+/** Counters for the change-driven frame feed. */
+export interface ViewerFrameCounters {
+  updatesSent: number;
+  bytesSent: number;
+  keyFrames: number;
+  deltas: number;
+  patches: number;
+  unchangedTicks: number;
+  resyncs: number;
+}
+
+export function emptyFrameCounters(): ViewerFrameCounters {
+  return {
+    updatesSent: 0, bytesSent: 0, keyFrames: 0, deltas: 0,
+    patches: 0, unchangedTicks: 0, resyncs: 0,
+  };
+}
+
+/**
+ * Fold one poll's outcome into the counters. Pure — returns a new object — so
+ * the counting rules are unit-testable without a bus or a canvas.
+ */
+export function accumulateFrameStats(
+  counters: ViewerFrameCounters,
+  reply: ViewerFrameReply,
+  decision: ViewerFrameDecision,
+): ViewerFrameCounters {
+  const next = { ...counters };
+  switch (decision.action) {
+    case 'ignore':
+      next.unchangedTicks += 1;
+      break;
+    case 'resync':
+      next.resyncs += 1;
+      break;
+    case 'key':
+      if (reply.kind === 'key') {
+        next.keyFrames += 1;
+        next.updatesSent += 1;
+        next.bytesSent += dataUriBytes(reply.dataUri);
+      }
+      break;
+    case 'delta':
+      if (reply.kind === 'delta') {
+        next.deltas += 1;
+        next.patches += reply.patches.length;
+        next.updatesSent += 1;
+        for (const patch of reply.patches) next.bytesSent += dataUriBytes(patch.dataUri);
+      }
+      break;
+  }
+  return next;
+}
+
 const WIN_W = 640;
 const WIN_H = 480;
-const REFRESH_INTERVAL_MS = 1000;
-/** Faster screenshot cadence while the user is driving the page. */
-const CONTROL_REFRESH_INTERVAL_MS = 250;
 /** Coalescing window for mousemove trails before a viewerInput flush. */
 const FLUSH_INTERVAL_MS = 40;
 /** How long a requestControl handoff waits for the user by default. */
@@ -98,13 +240,24 @@ export class WebBrowserViewer extends Abject {
   private pages: PageInfo[] = [];
   private selectedPageIndex = 0;
   private refreshTimerId?: string;
-  private refreshIntervalMs = REFRESH_INTERVAL_MS;
+  private refreshIntervalMs = DEFAULT_FRAME_POLL_MS;
   /** Anti-flicker state: skip redraws when the frame hasn't changed, keep the
    *  last good frame through transient screenshot failures, and never run two
    *  refreshes concurrently (out-of-order draws). */
   private refreshing = false;
-  private lastShotDataUri?: string;
-  private lastCanvasSize = { width: 0, height: 0 };
+  /** Seq of the frame the pixels on the canvas correspond to. */
+  private lastDrawnSeq?: number;
+  /** baseSeq of the last applied patch batch (diagnostics). */
+  private lastBaseSeq?: number;
+  /** Seq of the newest frame the server has (diagnostics). */
+  private lastFrameSeq?: number;
+  /** Set when the picture on screen can no longer be patched (resync). */
+  private needsKeyFrame = false;
+  /** Poll cadence for the change-driven feed, and the key-frame cadence. */
+  private framePollMs = DEFAULT_FRAME_POLL_MS;
+  private keyFrameIntervalMs = DEFAULT_KEY_FRAME_INTERVAL_MS;
+  /** What this viewer actually sent, exposed through getState. */
+  private frameStats: ViewerFrameCounters = emptyFrameCounters();
   /** Geometry + control-mode of the last drawn frame. When these are
    *  unchanged, the new screenshot fully overwrites the old one in place, so
    *  we skip the background clear — the previous frame stays on screen until
@@ -157,6 +310,18 @@ export class WebBrowserViewer extends Abject {
                   pageCount: { kind: 'primitive', primitive: 'number' },
                   controlling: { kind: 'primitive', primitive: 'boolean' },
                   handoffPending: { kind: 'primitive', primitive: 'boolean' },
+                  updatesSent: { kind: 'primitive', primitive: 'number' },
+                  bytesSent: { kind: 'primitive', primitive: 'number' },
+                  keyFrames: { kind: 'primitive', primitive: 'number' },
+                  deltas: { kind: 'primitive', primitive: 'number' },
+                  patches: { kind: 'primitive', primitive: 'number' },
+                  unchangedTicks: { kind: 'primitive', primitive: 'number' },
+                  resyncs: { kind: 'primitive', primitive: 'number' },
+                  lastSeq: { kind: 'primitive', primitive: 'number' },
+                  baseSeq: { kind: 'primitive', primitive: 'number' },
+                  lastFrameSeq: { kind: 'primitive', primitive: 'number' },
+                  pollMs: { kind: 'primitive', primitive: 'number' },
+                  keyFrameIntervalMs: { kind: 'primitive', primitive: 'number' },
                 },
               },
             },
@@ -175,6 +340,22 @@ export class WebBrowserViewer extends Abject {
                 properties: {
                   completed: { kind: 'primitive', primitive: 'boolean' },
                   reason: { kind: 'primitive', primitive: 'string' },
+                },
+              },
+            },
+            {
+              name: 'configure',
+              description:
+                'Adjust the frame feed at runtime. pollMs caps how often the viewer asks for pixels (the update rate); lower is more responsive and costs a busy page more messages. keyFrameIntervalMs is how often a whole frame is re-sent so clients can resync and patch drift cannot accumulate.',
+              parameters: [
+                { name: 'pollMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Poll cadence in ms (default 33, i.e. ~30fps); minimum 1', optional: true },
+                { name: 'keyFrameIntervalMs', type: { kind: 'primitive', primitive: 'number' }, description: 'How often a whole key frame is re-sent in ms (default 2000)', optional: true },
+              ],
+              returns: {
+                kind: 'object',
+                properties: {
+                  pollMs: { kind: 'primitive', primitive: 'number' },
+                  keyFrameIntervalMs: { kind: 'primitive', primitive: 'number' },
                 },
               },
             },
@@ -248,6 +429,19 @@ export class WebBrowserViewer extends Abject {
         pageCount: this.pages.length,
         controlling: this.controlMode,
         handoffPending: !!this.pendingHandoff,
+        // Frame transport counters: what this viewer has actually sent.
+        updatesSent: this.frameStats.updatesSent,
+        bytesSent: this.frameStats.bytesSent,
+        keyFrames: this.frameStats.keyFrames,
+        deltas: this.frameStats.deltas,
+        patches: this.frameStats.patches,
+        unchangedTicks: this.frameStats.unchangedTicks,
+        resyncs: this.frameStats.resyncs,
+        lastSeq: this.lastDrawnSeq ?? -1,
+        baseSeq: this.lastBaseSeq ?? -1,
+        lastFrameSeq: this.lastFrameSeq ?? -1,
+        pollMs: this.framePollMs,
+        keyFrameIntervalMs: this.keyFrameIntervalMs,
       };
     });
 
@@ -281,6 +475,12 @@ export class WebBrowserViewer extends Abject {
       this.playEffect('pulse', '$accent');
       this.changed('humanControlRequested', { pageId, reason });
       return DEFERRED_REPLY;
+    });
+
+    this.on('configure', async (msg: AbjectMessage) => {
+      const opts = (msg.payload ?? {}) as { pollMs?: number; keyFrameIntervalMs?: number };
+      const { pollMs, keyFrameIntervalMs } = opts;
+      return this.configureFrameFeed({ pollMs, keyFrameIntervalMs });
     });
 
     this.on('windowCloseRequested', async () => { await this.hide(); });
@@ -461,8 +661,9 @@ export class WebBrowserViewer extends Abject {
     await this.updateNavButtons();
     await this.updateToolbarVisibility();
 
-    // Start refresh timer
-    await this.startRefreshTimer(REFRESH_INTERVAL_MS);
+    // Start the change-driven frame feed (~30fps by default; nothing crosses
+    // the bus on a tick where the page did not change).
+    await this.startRefreshTimer(this.framePollMs);
 
     // Populate initial page list
     await this.refreshPageList();
@@ -515,7 +716,10 @@ export class WebBrowserViewer extends Abject {
     this.pages = [];
     this.selectedPageIndex = 0;
     this.lastTransform = undefined;
-    this.lastShotDataUri = undefined;
+    this.lastDrawnSeq = undefined;
+    this.lastBaseSeq = undefined;
+    this.lastFrameSeq = undefined;
+    this.needsKeyFrame = false;
     this.lastDrawRect = undefined;
     this.lastDrawControlMode = false;
 
@@ -555,6 +759,47 @@ export class WebBrowserViewer extends Abject {
     await this.startRefreshTimer(intervalMs);
   }
 
+  /**
+   * Adjust the frame feed at runtime. `pollMs` caps how often the viewer polls
+   * for pixels (the update rate); `keyFrameIntervalMs` is how often a whole
+   * frame is re-sent so a client can resync and patch drift cannot accumulate
+   * forever.
+   */
+  async configureFrameFeed(
+    opts: { pollMs?: number; keyFrameIntervalMs?: number } = {},
+  ): Promise<{ pollMs: number; keyFrameIntervalMs: number }> {
+    if (opts.pollMs !== undefined) {
+      requirePositive(opts.pollMs, 'pollMs must be positive');
+      this.framePollMs = Math.max(1, Math.round(opts.pollMs));
+    }
+    if (opts.keyFrameIntervalMs !== undefined) {
+      requirePositive(opts.keyFrameIntervalMs, 'keyFrameIntervalMs must be positive');
+      this.keyFrameIntervalMs = Math.max(1, Math.round(opts.keyFrameIntervalMs));
+    }
+
+    // Keep the browser side's key-frame cadence in step with ours. A
+    // WebBrowser predating this method is fine: the per-poll option still
+    // carries the interval.
+    if (this.webBrowserId) {
+      try {
+        await this.request(
+          request(this.id, this.webBrowserId, 'configureViewerFrame', {
+            pollMs: this.framePollMs,
+            keyFrameIntervalMs: this.keyFrameIntervalMs,
+          })
+        );
+      } catch { /* not supported by this WebBrowser */ }
+    }
+
+    if (this.windowId) {
+      this.needsKeyFrame = true;
+      await this.restartRefreshTimer(this.framePollMs);
+      await this.refreshScreenshot();
+    }
+    await this.updateStatusLabel();
+    return { pollMs: this.framePollMs, keyFrameIntervalMs: this.keyFrameIntervalMs };
+  }
+
   // ── Event Handling ──
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
@@ -562,7 +807,7 @@ export class WebBrowserViewer extends Abject {
     if (fromId === this.tabBarId && aspect === 'change') {
       this.selectedPageIndex = value as number;
       this.clearInputQueue();
-      this.lastShotDataUri = undefined; // force a redraw for the new page
+      this.needsKeyFrame = true; // a new page must not be patched over the old one
       await this.updateUrlLabel();
       await this.refreshScreenshot();
       return;
@@ -640,7 +885,7 @@ export class WebBrowserViewer extends Abject {
     // The WebBrowser pageClosed event also refreshes, but do it now so the tab
     // disappears immediately.
     if (idx < this.selectedPageIndex && this.selectedPageIndex > 0) this.selectedPageIndex--;
-    this.lastShotDataUri = undefined;
+    this.needsKeyFrame = true;
     await this.refreshPageList();
     await this.refreshScreenshot();
   }
@@ -661,7 +906,7 @@ export class WebBrowserViewer extends Abject {
       // shakes so the press visibly registered.
       this.playEffect('shake');
     }
-    this.lastShotDataUri = undefined;
+    this.needsKeyFrame = true;
     await this.refreshScreenshot();
   }
 
@@ -677,8 +922,9 @@ export class WebBrowserViewer extends Abject {
       await this.resolveHandoff(true, 'the user took control');
     }
     await this.updateControlUi();
-    await this.restartRefreshTimer(CONTROL_REFRESH_INTERVAL_MS);
-    this.lastShotDataUri = undefined; // redraw so the control-mode border appears
+    // A takeover changes the reserved border frame, so the next frame must be
+    // a whole key frame: patches alone would not repaint the border.
+    this.needsKeyFrame = true;
     await this.refreshScreenshot();
     // The human hand takes the page.
     this.playEffect('flash', '$accent');
@@ -698,8 +944,7 @@ export class WebBrowserViewer extends Abject {
     const hadHandoff = !!this.pendingHandoff;
     await this.resolveHandoff(true); // emits humanControlEnded when it settles a handoff
     await this.updateControlUi();
-    await this.restartRefreshTimer(REFRESH_INTERVAL_MS);
-    this.lastShotDataUri = undefined; // redraw so the control-mode border clears
+    this.needsKeyFrame = true; // redraw so the control-mode border clears
     await this.refreshScreenshot();
     // Control returns to the live feed (and to the waiting agent, if any).
     this.playEffect('flash');
@@ -1041,7 +1286,8 @@ export class WebBrowserViewer extends Abject {
       statusText = 'No browser pages open';
       color = this.theme.textMeta;
     } else {
-      statusText = `${this.pages.length} page${this.pages.length > 1 ? 's' : ''} open | Refresh ${this.refreshIntervalMs / 1000}s`;
+      const fps = Math.max(1, Math.round(1000 / this.framePollMs));
+      statusText = `${this.pages.length} page${this.pages.length > 1 ? 's' : ''} open | Live ~${fps} fps`;
       color = this.theme.accentSecondary;
     }
     try {
@@ -1070,39 +1316,62 @@ export class WebBrowserViewer extends Abject {
     if (this.refreshing) return;
     this.refreshing = true;
     try {
-      await this.doRefreshScreenshot();
+      await this.doRefreshFrame();
     } finally {
       this.refreshing = false;
     }
   }
 
-  private async doRefreshScreenshot(): Promise<void> {
+  private async doRefreshFrame(): Promise<void> {
     if (!this.canvasId) return;
     const page = this.pages[this.selectedPageIndex];
     if (!page || !this.webBrowserId) {
       // Show placeholder
       this.lastTransform = undefined;
-      this.lastShotDataUri = undefined;
-      this.lastDrawRect = undefined; // next screenshot repaints over the text
+      this.lastDrawnSeq = undefined;
+      this.lastBaseSeq = undefined;
+      this.lastDrawRect = undefined; // next frame repaints over the text
+      this.needsKeyFrame = false;
       await this.drawPlaceholder();
       return;
     }
 
+    const forceKey = this.needsKeyFrame;
+
     try {
-      const shot = await this.request<{ dataUri: string; width: number; height: number; url?: string; title?: string }>(
-        request(this.id, this.webBrowserId, 'viewerScreenshot', {
+      const reply = await this.request<ViewerFrameReply>(
+        request(this.id, this.webBrowserId, 'viewerFrame', {
           pageId: page.pageId,
+          options: { forceKey, keyFrameIntervalMs: this.keyFrameIntervalMs },
         })
       );
 
       // Track in-page navigation (link clicks during takeover) cheaply
-      if (shot.url && shot.url !== page.url) {
-        page.url = shot.url;
-        if (shot.title) page.title = shot.title;
+      if (reply.url && reply.url !== page.url) {
+        page.url = reply.url;
+        if (reply.title) page.title = reply.title;
         await this.updateUrlLabel();
       }
+      this.lastFrameSeq = reply.seq;
 
-      // Get canvas size to scale the screenshot
+      const decision = decideViewerFrameAction(reply, {
+        lastDrawnSeq: this.lastDrawnSeq,
+        lastFit: this.lastDrawRect,
+      });
+      this.frameStats = accumulateFrameStats(this.frameStats, reply, decision);
+
+      // An identical frame draws nothing at all: no clear, no re-submitted
+      // image. This is where the bandwidth saving lives.
+      if (decision.action === 'ignore') return;
+
+      if (decision.action === 'resync') {
+        // The patch bases on a frame this viewer no longer holds. Keep the
+        // picture that is up and ask for a whole frame on the next poll.
+        this.needsKeyFrame = true;
+        return;
+      }
+
+      // Get canvas size to scale the frame
       const canvasSize = await this.request<{ width: number; height: number }>(
         request(this.id, this.canvasId, 'getCanvasSize', {})
       );
@@ -1110,14 +1379,6 @@ export class WebBrowserViewer extends Abject {
       const cw = canvasSize.width;
       const ch = canvasSize.height;
       if (cw <= 0 || ch <= 0) return;
-
-      // Unchanged frame on an unchanged canvas — skip the redraw entirely.
-      // Re-submitting an identical frame as a fresh data URI forces the
-      // client to re-decode it, which is what flickers.
-      if (shot.dataUri === this.lastShotDataUri
-        && cw === this.lastCanvasSize.width && ch === this.lastCanvasSize.height) {
-        return;
-      }
 
       // Available draw area. In control mode reserve a small frame around the
       // image for the takeover border, so the border (a) stays fully on-canvas
@@ -1130,7 +1391,13 @@ export class WebBrowserViewer extends Abject {
       if (availW <= 0 || availH <= 0) return;
 
       // Scale to fit within the available area, preserving aspect ratio
-      const imgAspect = shot.width / shot.height;
+      // Both frame-bearing replies report the page frame's own pixel size; a
+      // patch maps through the same fit transform as the key frame it bases on.
+      if (reply.kind !== 'key' && reply.kind !== 'delta') return;
+      const shotW = reply.width;
+      const shotH = reply.height;
+      if (shotW <= 0 || shotH <= 0) return;
+      const imgAspect = shotW / shotH;
       const availAspect = availW / availH;
       let drawW: number, drawH: number, drawX: number, drawY: number;
 
@@ -1151,12 +1418,38 @@ export class WebBrowserViewer extends Abject {
       const dw = Math.floor(drawW), dh = Math.floor(drawH);
 
       // Remember the fit transform so control-mode input can be mapped back
-      // into page coordinates
-      this.lastTransform = { drawX, drawY, drawW: dw, drawH: dh, shotW: shot.width, shotH: shot.height };
+      // into page coordinates, and so patches map through the same transform.
+      this.lastTransform = { drawX, drawY, drawW: dw, drawH: dh, shotW, shotH };
+      const fit = { drawX, drawY, drawW: dw, drawH: dh };
 
-      // Clear only when the geometry or control border changes. On an unchanged
-      // rect the opaque screenshot overwrites the previous frame pixel-for-pixel,
-      // so skipping the clear removes the background-flash that caused flicker.
+      if (decision.action === 'delta' && reply.kind === 'delta') {
+        // Patches only: no clear (the surface keeps the rest of the picture,
+        // so earlier patches are not lost) and no key-frame data URI (re-sending
+        // it every tick would cross the whole image again and defeat the
+        // purpose). Each rect is widened to whole pixels so neighbouring
+        // patches cannot leave a seam between them.
+        const commands: unknown[] = [];
+        for (const patch of reply.patches) {
+          const rect = mapPatchToCanvas(patch, fit, shotW, shotH);
+          commands.push({
+            type: 'imageUrl',
+            params: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, url: patch.dataUri },
+          });
+        }
+        await this.request(request(this.id, this.canvasId, 'draw', { commands }));
+        this.lastDrawnSeq = reply.seq;
+        this.lastBaseSeq = reply.baseSeq;
+        this.lastDrawRect = fit;
+        this.lastDrawControlMode = this.controlMode;
+        this.needsKeyFrame = false;
+        return;
+      }
+
+      if (reply.kind !== 'key') return;
+
+      // A whole frame. Clear only when the geometry or control border changes:
+      // on an unchanged rect the opaque frame overwrites the old one
+      // pixel-for-pixel, so skipping the clear removes the background flash.
       const rectChanged = !this.lastDrawRect
         || this.lastDrawRect.drawX !== drawX || this.lastDrawRect.drawY !== drawY
         || this.lastDrawRect.drawW !== dw || this.lastDrawRect.drawH !== dh;
@@ -1168,7 +1461,7 @@ export class WebBrowserViewer extends Abject {
       }
       commands.push({
         type: 'imageUrl',
-        params: { x: drawX, y: drawY, width: dw, height: dh, url: shot.dataUri },
+        params: { x: drawX, y: drawY, width: dw, height: dh, url: reply.dataUri },
       });
       if (this.controlMode) {
         // Border stroke centered in the reserved frame, just outside the image:
@@ -1182,16 +1475,18 @@ export class WebBrowserViewer extends Abject {
         });
       }
 
-      await this.request(request(this.id, this.canvasId!, 'draw', { commands }));
-      this.lastShotDataUri = shot.dataUri;
-      this.lastCanvasSize = { width: cw, height: ch };
-      this.lastDrawRect = { drawX, drawY, drawW: dw, drawH: dh };
+      await this.request(request(this.id, this.canvasId, 'draw', { commands }));
+      this.lastDrawnSeq = reply.seq;
+      this.lastBaseSeq = reply.seq;
+      this.lastDrawRect = fit;
       this.lastDrawControlMode = this.controlMode;
+      this.needsKeyFrame = false;
     } catch {
-      // Screenshot failed. If a frame is already on screen, keep it — a
+      // The frame request failed. If a frame is already on screen, keep it — a
       // transient failure (page mid-navigation) must not flash a placeholder.
-      if (this.lastShotDataUri) return;
+      if (this.lastDrawnSeq !== undefined) return;
       this.lastTransform = undefined;
+      this.needsKeyFrame = true;
       await this.drawPlaceholder('Screenshot unavailable');
     }
   }

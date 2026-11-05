@@ -30,6 +30,15 @@ import { isOwnDesktopUrl } from '../../network/origin-policy.js';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import {
+  decodePng,
+  DEFAULT_FRAME_POLL_MS,
+  DEFAULT_KEY_FRAME_INTERVAL_MS,
+  ViewerFrameSession,
+  type RgbaFrame,
+  type ViewerFrameOptions,
+  type ViewerFrameReply,
+} from '../frame-diff.js';
 
 const log = new Log('WebBrowser');
 
@@ -1041,6 +1050,152 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
     },
   },
   {
+    name: 'viewerFrame',
+    description: 'One poll of the change-driven viewer transport. Returns exactly one of three things: { kind: \'unchanged\' } when the freshly captured pixels are identical to the frame the client already holds — no image bytes cross the bus; { kind: \'delta\' } with only the changed rectangles, each a data:image/png;base64 URI, against the frame numbered baseSeq; or { kind: \'key\' } with a whole image, sent on the first poll, on a size change, when forceKey is set (a client that is out of sync asks for this) and once the key-frame interval has elapsed. Poll it no faster than the configured poll cadence (~30fps by default) and only while the view is visible. No ownership check — read-only viewer method.',
+    parameters: [
+      {
+        name: 'pageId',
+        type: { kind: 'primitive', primitive: 'string' },
+        description: 'Page handle',
+      },
+      {
+        name: 'options',
+        type: {
+          kind: 'object',
+          properties: {
+            forceKey: { kind: 'primitive', primitive: 'boolean' },
+            keyFrameIntervalMs: { kind: 'primitive', primitive: 'number' },
+          },
+        },
+        description: 'Per-poll options: { forceKey? — ask for a whole frame, keyFrameIntervalMs? — override the key-frame cadence for this poll }',
+        optional: true,
+      },
+    ],
+    returns: {
+      kind: 'union',
+      variants: [
+        {
+          kind: 'object',
+          properties: {
+            kind: { kind: 'primitive', primitive: 'string' },
+            seq: { kind: 'primitive', primitive: 'number' },
+            url: { kind: 'primitive', primitive: 'string' },
+            title: { kind: 'primitive', primitive: 'string' },
+          },
+        },
+        {
+          kind: 'object',
+          properties: {
+            kind: { kind: 'primitive', primitive: 'string' },
+            seq: { kind: 'primitive', primitive: 'number' },
+            dataUri: { kind: 'primitive', primitive: 'string' },
+            width: { kind: 'primitive', primitive: 'number' },
+            height: { kind: 'primitive', primitive: 'number' },
+            url: { kind: 'primitive', primitive: 'string' },
+            title: { kind: 'primitive', primitive: 'string' },
+          },
+        },
+        {
+          kind: 'object',
+          properties: {
+            kind: { kind: 'primitive', primitive: 'string' },
+            seq: { kind: 'primitive', primitive: 'number' },
+            baseSeq: { kind: 'primitive', primitive: 'number' },
+            width: { kind: 'primitive', primitive: 'number' },
+            height: { kind: 'primitive', primitive: 'number' },
+            patches: {
+              kind: 'array',
+              elementType: {
+                kind: 'object',
+                properties: {
+                  x: { kind: 'primitive', primitive: 'number' },
+                  y: { kind: 'primitive', primitive: 'number' },
+                  width: { kind: 'primitive', primitive: 'number' },
+                  height: { kind: 'primitive', primitive: 'number' },
+                  dataUri: { kind: 'primitive', primitive: 'string' },
+                },
+              },
+            },
+            url: { kind: 'primitive', primitive: 'string' },
+            title: { kind: 'primitive', primitive: 'string' },
+          },
+        },
+      ],
+    },
+  },
+  {
+    name: 'viewerFrameStats',
+    description: 'Readable counters for the viewer frame transport, per page and in total: frames served, unchanged ticks, key frames, deltas, patches, bytes sent and the last seq, plus the configured poll and key-frame cadences. Omit pageId for every page with a session. No ownership check — read-only viewer method.',
+    parameters: [
+      {
+        name: 'pageId',
+        type: { kind: 'primitive', primitive: 'string' },
+        description: 'Page handle; omit for every page that has a frame session',
+        optional: true,
+      },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        pages: {
+          kind: 'array',
+          elementType: {
+            kind: 'object',
+            properties: {
+              pageId: { kind: 'primitive', primitive: 'string' },
+              framesServed: { kind: 'primitive', primitive: 'number' },
+              unchangedTicks: { kind: 'primitive', primitive: 'number' },
+              keyFrames: { kind: 'primitive', primitive: 'number' },
+              deltas: { kind: 'primitive', primitive: 'number' },
+              patches: { kind: 'primitive', primitive: 'number' },
+              bytesSent: { kind: 'primitive', primitive: 'number' },
+              lastSeq: { kind: 'primitive', primitive: 'number' },
+              keyFrameIntervalMs: { kind: 'primitive', primitive: 'number' },
+            },
+          },
+        },
+        pollMs: { kind: 'primitive', primitive: 'number' },
+        keyFrameIntervalMs: { kind: 'primitive', primitive: 'number' },
+        totals: {
+          kind: 'object',
+          properties: {
+            framesServed: { kind: 'primitive', primitive: 'number' },
+            unchangedTicks: { kind: 'primitive', primitive: 'number' },
+            keyFrames: { kind: 'primitive', primitive: 'number' },
+            deltas: { kind: 'primitive', primitive: 'number' },
+            patches: { kind: 'primitive', primitive: 'number' },
+            bytesSent: { kind: 'primitive', primitive: 'number' },
+          },
+        },
+      },
+    },
+  },
+  {
+    name: 'configureViewerFrame',
+    description: 'Adjust the viewer frame transport: pollMs is the fastest cadence a viewer should poll at (default ~33ms, about 30fps), keyFrameIntervalMs how often a whole key frame is re-sent so clients resync (default 2000ms). Omit a value to leave it as it is. No ownership check — viewer configuration method.',
+    parameters: [
+      {
+        name: 'pollMs',
+        type: { kind: 'primitive', primitive: 'number' },
+        description: 'Fastest poll cadence in ms',
+        optional: true,
+      },
+      {
+        name: 'keyFrameIntervalMs',
+        type: { kind: 'primitive', primitive: 'number' },
+        description: 'How often a whole key frame is re-sent, in ms',
+        optional: true,
+      },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        pollMs: { kind: 'primitive', primitive: 'number' },
+        keyFrameIntervalMs: { kind: 'primitive', primitive: 'number' },
+      },
+    },
+  },
+  {
     name: 'viewerNavigate',
     description: 'Navigate any page through its history: back, forward, or reload. No ownership check — viewer navigation method.',
     parameters: [
@@ -1232,6 +1387,18 @@ export class WebBrowser extends Abject {
   private ephemeralBrowsers: Map<string, unknown> = new Map();
   private chromium: unknown = null;
   private pages: Map<string, TrackedPage> = new Map();
+
+  /**
+   * Reference frame per page for the change-driven viewer transport
+   * (viewerFrame): the frame that page's client already holds, so a poll can
+   * answer with nothing at all, with the rectangles that differ, or with a
+   * whole key frame.
+   */
+  private viewerSessions: Map<string, ViewerFrameSession> = new Map();
+  /** How often a viewer may poll viewerFrame, in ms (~30fps by default). */
+  private viewerPollMs = DEFAULT_FRAME_POLL_MS;
+  /** How often a whole key frame is re-sent, in ms. */
+  private viewerKeyFrameIntervalMs = DEFAULT_KEY_FRAME_INTERVAL_MS;
   private pageCounter = 0;
 
   /** Cached persistent contexts keyed by `{workspaceId}/{profileName}`. */
@@ -2203,6 +2370,89 @@ export class WebBrowser extends Abject {
       return DEFERRED_REPLY;
     });
 
+    // -- viewerFrame: no ownership check — the change-driven viewer transport --
+    //
+    // One poll of the live view. The capture is compared here, in the process
+    // that took it, against the frame this page's client already holds: a still
+    // page costs nothing on the bus, a moving page sends only the rectangles
+    // that differ, and a whole key frame goes out on the first poll, on a size
+    // change, when the client asks for one, or once the key-frame interval has
+    // elapsed so a client that fell behind can catch up.
+    this.on('viewerFrame', (msg: AbjectMessage) => {
+      const { pageId, options } = msg.payload as {
+        pageId: string; options?: ViewerFrameOptions;
+      };
+      requireContract(typeof pageId === 'string' && pageId.length > 0,
+        'viewerFrame requires a pageId');
+      const tracked = this.pages.get(pageId);
+      if (!tracked) {
+        this.send(error(msg, 'BROWSER_ERROR', `Unknown page handle: ${pageId}`));
+        return DEFERRED_REPLY;
+      }
+      tracked.page.screenshot({ type: 'png', fullPage: false })
+        .then(async (buffer: Buffer) => {
+          const reply = this.nextViewerFrame(pageId, decodePng(buffer), options);
+          const url = tracked.page.url();
+          const title = await this.safeTitle(tracked.page, url);
+          this.sendDeferredReply(msg, { ...reply, url, title });
+        })
+        .catch((err: unknown) => {
+          this.send(error(msg, 'BROWSER_ERROR',
+            err instanceof Error ? err.message : String(err)
+          ));
+        });
+      return DEFERRED_REPLY;
+    });
+
+    // -- viewerFrameStats: no ownership check — what the transport has sent --
+    this.on('viewerFrameStats', (msg: AbjectMessage) => {
+      const { pageId } = msg.payload as { pageId?: string };
+      const ids = pageId ? [pageId] : [...this.viewerSessions.keys()];
+      const pages = ids.map((id) => this.viewerFrameStatsFor(id));
+      const totals = {
+        framesServed: 0, unchangedTicks: 0, keyFrames: 0,
+        deltas: 0, patches: 0, bytesSent: 0,
+      };
+      for (const page of pages) {
+        totals.framesServed += page.framesServed;
+        totals.unchangedTicks += page.unchangedTicks;
+        totals.keyFrames += page.keyFrames;
+        totals.deltas += page.deltas;
+        totals.patches += page.patches;
+        totals.bytesSent += page.bytesSent;
+      }
+      return {
+        pages,
+        pollMs: this.viewerPollMs,
+        keyFrameIntervalMs: this.viewerKeyFrameIntervalMs,
+        totals,
+      };
+    });
+
+    // -- configureViewerFrame: no ownership check — the cadences are tunable --
+    this.on('configureViewerFrame', (msg: AbjectMessage) => {
+      const { pollMs, keyFrameIntervalMs } = msg.payload as {
+        pollMs?: number; keyFrameIntervalMs?: number;
+      };
+      if (pollMs !== undefined) {
+        requireContract(Number.isFinite(pollMs) && pollMs >= 0,
+          'configureViewerFrame pollMs must be a non-negative number');
+        this.viewerPollMs = pollMs;
+      }
+      if (keyFrameIntervalMs !== undefined) {
+        requireContract(Number.isFinite(keyFrameIntervalMs) && keyFrameIntervalMs >= 0,
+          'configureViewerFrame keyFrameIntervalMs must be a non-negative number');
+        this.viewerKeyFrameIntervalMs = keyFrameIntervalMs;
+        for (const session of this.viewerSessions.values()) {
+          session.setKeyFrameInterval(keyFrameIntervalMs);
+        }
+      }
+      return {
+        pollMs: this.viewerPollMs,
+        keyFrameIntervalMs: this.viewerKeyFrameIntervalMs,
+      };
+    });
+
     // -- viewerNavigate: no ownership check — history navigation from the viewer --
     this.on('viewerNavigate', (msg: AbjectMessage) => {
       const { pageId, nav } = msg.payload as { pageId: string; nav: string };
@@ -2497,6 +2747,9 @@ export class WebBrowser extends Abject {
     const tracked = this.pages.get(pageId);
     if (!tracked) return;
     this.pages.delete(pageId);
+    // Its reference frame goes with it: a new page with the same handle must
+    // not be diffed against the old page's pixels.
+    this.viewerSessions.delete(pageId);
     if (tracked.profileKey) {
       const ctx = this.profileContexts.get(tracked.profileKey);
       if (ctx && ctx.openPages > 0) ctx.openPages--;
@@ -2612,6 +2865,7 @@ export class WebBrowser extends Abject {
       // If the browser disconnects unexpectedly, clear its tracked pages
       (browser as { on: (event: string, fn: () => void) => void }).on('disconnected', () => {
         this.pages.clear();
+        this.viewerSessions.clear();
         if (this.ephemeralBrowsers.get(key) === browser) this.ephemeralBrowsers.delete(key);
       });
 
@@ -2840,6 +3094,52 @@ export class WebBrowser extends Abject {
     } catch {
       return { width: 1280, height: 720 };
     }
+  }
+
+  /**
+   * Decide what one captured frame becomes for the viewer transport, keeping
+   * the frame this page's client already holds as the reference: identical
+   * pixels send nothing, a change sends only the differing rectangles, and the
+   * first frame, a size change, a forced request or an elapsed key-frame
+   * interval sends a whole frame.
+   */
+  private nextViewerFrame(
+    pageId: string, frame: RgbaFrame, options?: ViewerFrameOptions,
+  ): ViewerFrameReply {
+    let session = this.viewerSessions.get(pageId);
+    if (!session) {
+      session = new ViewerFrameSession({ keyFrameIntervalMs: this.viewerKeyFrameIntervalMs });
+      this.viewerSessions.set(pageId, session);
+    }
+    return session.next(frame, Date.now(), options);
+  }
+
+  /** Counters for one page's viewer transport, readable from outside. */
+  private viewerFrameStatsFor(pageId: string): {
+    pageId: string; framesServed: number; unchangedTicks: number;
+    keyFrames: number; deltas: number; patches: number;
+    bytesSent: number; lastSeq: number; keyFrameIntervalMs: number;
+  } {
+    const session = this.viewerSessions.get(pageId);
+    if (!session) {
+      return {
+        pageId, framesServed: 0, unchangedTicks: 0, keyFrames: 0, deltas: 0,
+        patches: 0, bytesSent: 0, lastSeq: 0,
+        keyFrameIntervalMs: this.viewerKeyFrameIntervalMs,
+      };
+    }
+    const s = session.stats;
+    return {
+      pageId,
+      framesServed: s.keyFrames + s.deltas,
+      unchangedTicks: s.unchangedTicks,
+      keyFrames: s.keyFrames,
+      deltas: s.deltas,
+      patches: s.patches,
+      bytesSent: s.bytesSent,
+      lastSeq: session.currentSeq,
+      keyFrameIntervalMs: session.keyFrameInterval,
+    };
   }
 
   /**
