@@ -41,9 +41,16 @@ import {
   type ViewerFrameReply,
 } from '../frame-diff.js';
 import {
+  DEFAULT_VIDEO_HEIGHT,
+  DEFAULT_VIDEO_WIDTH,
+  MAX_VIDEO_HEIGHT,
+  MAX_VIDEO_WIDTH,
   fitFrameToVideo,
+  videoBitrateFor,
+  videoTargetFor,
   Vp8Encoder,
   VP8_CODEC,
+  type ViewerVideoPollOptions,
   type ViewerVideoReply,
   type ViewerVideoStreamState,
 } from '../video-encoder.js';
@@ -51,9 +58,12 @@ import { ScreencastSource, type PushedFrame, type ScreencastCdp } from '../scree
 
 const log = new Log('WebBrowser');
 
-/** Cap on the encoded picture's size: what the viewer can actually display. */
-const VIEWER_VIDEO_MAX_WIDTH = 960;
-const VIEWER_VIDEO_MAX_HEIGHT = 540;
+/**
+ * How much larger than the page's layout the viewer's window must be before the
+ * page is laid out again to match. A pin-prick more is not worth a reflow of a
+ * page the person did not touch; a genuinely bigger window is worth the pixels.
+ */
+const VIEWER_VIEWPORT_GROW_RATIO = 1.15;
 
 /**
  * Decode a frame the renderer pushed, by the frame's own magic rather than by
@@ -1173,7 +1183,7 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
   },
   {
     name: 'viewerVideoFrame',
-    description: 'One poll of the live view as a VP8 video stream. The pixels are pushed, not captured per poll: the first poll starts a Page.startScreencast and each later poll drains the newest frame the renderer painted since, dropping any that arrive mid-encode. Returns { kind: \'unchanged\' } when nothing was painted and the pixels match the frame last encoded — nothing crosses the bus — or { kind: \'video\' } with the VP8 packets that continue the stream (key frames restart it, deltas continue it) for the client to decode with WebCodecs. Poll it no faster than the configured cadence and only while the view is visible. No ownership check — read-only viewer method.',
+    description: 'One poll of the live view as a VP8 video stream. The pixels are pushed, not captured per poll: the first poll starts a Page.startScreencast and each later poll drains the newest frame the renderer painted since, dropping any that arrive mid-encode. Returns { kind: \'unchanged\' } when nothing was painted and the pixels match the frame last encoded — nothing crosses the bus — or { kind: \'video\' } with the VP8 packets that continue the stream (key frames restart it, deltas continue it) for the client to decode with WebCodecs. The encoded picture follows the display size the poll names, so a window resized larger gets the pixels it shows instead of an upscaled small picture. Poll it no faster than the configured cadence and only while the view is visible. No ownership check — read-only viewer method.',
     parameters: [
       { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle' },
       {
@@ -1183,9 +1193,16 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
           properties: {
             forceKey: { kind: 'primitive', primitive: 'boolean' },
             keyFrameIntervalMs: { kind: 'primitive', primitive: 'number' },
+            display: {
+              kind: 'object',
+              properties: {
+                width: { kind: 'primitive', primitive: 'number' },
+                height: { kind: 'primitive', primitive: 'number' },
+              },
+            },
           },
         },
-        description: 'Per-poll options: { forceKey? — restart the stream with a key frame, keyFrameIntervalMs? — override the key-frame cadence }',
+        description: 'Per-poll options: { forceKey? — restart the stream with a key frame, keyFrameIntervalMs? — override the key-frame cadence, display? — the pixels the viewer will paint the picture into, which sets the encode size so a large window is sharp and a small one stays cheap }',
         optional: true,
       },
     ],
@@ -1545,6 +1562,16 @@ export class WebBrowser extends Abject {
   private screencastRefused: Set<string> = new Set();
   /** The last pushed frame decoded, so an idle poll still has pixels to compare. */
   private lastPushedFrames: Map<string, RgbaFrame> = new Map();
+
+  /**
+   * The last display size each page was asked for, so a size has to hold for
+   * two polls before the page is laid out again: dragging a window edge
+   * reports a new size every poll, and reflowing that often is not a resize.
+   */
+  private pendingDisplaySizes: Map<string, { width: number; height: number }> = new Map();
+
+  /** Pages that refused a layout change; their own layout is used instead. */
+  private layoutFixed: Set<string> = new Set();
 
   private pageCounter = 0;
 
@@ -2562,7 +2589,7 @@ export class WebBrowser extends Abject {
     this.on('viewerVideoFrame', (msg: AbjectMessage) => {
       const { pageId, options } = msg.payload as {
         pageId: string;
-        options?: { forceKey?: boolean; keyFrameIntervalMs?: number };
+        options?: ViewerVideoPollOptions;
       };
       requireContract(typeof pageId === 'string' && pageId.length > 0,
         'viewerVideoFrame requires a pageId');
@@ -2583,6 +2610,13 @@ export class WebBrowser extends Abject {
           ));
         });
       return DEFERRED_REPLY;
+    });
+
+    // -- viewerVideoStats: no ownership check — what the codec stream has sent --
+    this.on('viewerVideoStats', (msg: AbjectMessage) => {
+      const { pageId } = msg.payload as { pageId?: string };
+      const ids = pageId ? [pageId] : [...this.viewerVideoStreams.keys()];
+      return ids.map((id) => this.viewerVideoStatsFor(id));
     });
 
     // -- viewerFrameStats: no ownership check — what the transport has sent --
@@ -3341,8 +3375,9 @@ export class WebBrowser extends Abject {
   private async nextViewerVideoReply(
     pageId: string,
     tracked: TrackedPage,
-    options?: { forceKey?: boolean; keyFrameIntervalMs?: number },
+    options?: ViewerVideoPollOptions,
   ): Promise<ViewerVideoReply> {
+    await this.followDisplaySize(pageId, tracked, options?.display);
     const source = await this.ensureScreencast(pageId, tracked);
     if (!source) return this.captureViewerVideoFrame(pageId, tracked, options);
 
@@ -3397,7 +3432,7 @@ export class WebBrowser extends Abject {
   private async captureViewerVideoFrame(
     pageId: string,
     tracked: TrackedPage,
-    options?: { forceKey?: boolean; keyFrameIntervalMs?: number },
+    options?: ViewerVideoPollOptions,
   ): Promise<ViewerVideoReply> {
     const buffer = await tracked.page.screenshot({ type: 'png', fullPage: false });
     const frame = decodePng(buffer);
@@ -3466,6 +3501,50 @@ export class WebBrowser extends Abject {
     }
   }
 
+  /**
+   * Give the page the viewer window's own size, so a large window is captured
+   * with enough pixels to fill it rather than upscaling a small capture.
+   *
+   * Only ever grows a page's layout. A window smaller than the layout is served
+   * by a downscaled picture, which stays sharp, while shrinking the layout
+   * would reflow a page the person did not resize. The requested size must hold
+   * for two polls before it is applied, because a window being dragged reports
+   * a new size on every frame. A page that refuses is not asked again: its own
+   * layout is used and the picture is encoded from what it has.
+   */
+  private async followDisplaySize(
+    pageId: string,
+    tracked: TrackedPage,
+    display?: { width: number; height: number },
+  ): Promise<void> {
+    if (!display || !(display.width > 0) || !(display.height > 0)) {
+      this.pendingDisplaySizes.delete(pageId);
+      return;
+    }
+    if (this.layoutFixed.has(pageId)) return;
+    const width = Math.min(MAX_VIDEO_WIDTH, Math.ceil(display.width));
+    const height = Math.min(MAX_VIDEO_HEIGHT, Math.ceil(display.height));
+    const previous = this.pendingDisplaySizes.get(pageId);
+    this.pendingDisplaySizes.set(pageId, { width, height });
+    if (!previous || previous.width !== width || previous.height !== height) return;
+
+    const current = this.safeViewportSize(tracked.page);
+    if (!(current.width > 0) || !(current.height > 0)) return;
+    const grows = width > current.width * VIEWER_VIEWPORT_GROW_RATIO
+      || height > current.height * VIEWER_VIEWPORT_GROW_RATIO;
+    if (!grows) return;
+
+    try {
+      await tracked.page.setViewportSize({ width, height });
+      this.pendingDisplaySizes.delete(pageId);
+      log.info(`page laid out at ${width}x${height} to match the viewer window (${pageId})`);
+    } catch (err) {
+      this.pendingDisplaySizes.delete(pageId);
+      this.layoutFixed.add(pageId);
+      log.info(`cannot lay ${pageId} out at the viewer window; encoding from its own layout: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /** Stop one page's push and forget everything held for it. */
   private stopScreencast(pageId: string): void {
     const source = this.screencastSources.get(pageId);
@@ -3477,6 +3556,8 @@ export class WebBrowser extends Abject {
     this.captureSessions.delete(pageId);
     this.screencastRefused.delete(pageId);
     this.lastPushedFrames.delete(pageId);
+    this.pendingDisplaySizes.delete(pageId);
+    this.layoutFixed.delete(pageId);
   }
 
   /** Stop every push — nothing may outlive the capability. */
@@ -3487,6 +3568,8 @@ export class WebBrowser extends Abject {
     this.captureSessions.clear();
     this.lastPushedFrames.clear();
     this.screencastRefused.clear();
+    this.pendingDisplaySizes.clear();
+    this.layoutFixed.clear();
     for (const source of sources) await source.stop().catch(() => undefined);
   }
 
@@ -3502,12 +3585,21 @@ export class WebBrowser extends Abject {
   private async nextViewerVideoFrame(
     pageId: string,
     frame: RgbaFrame,
-    options?: { forceKey?: boolean; keyFrameIntervalMs?: number },
+    options?: ViewerVideoPollOptions,
   ): Promise<ViewerVideoReply> {
     const interval = options?.keyFrameIntervalMs ?? this.viewerKeyFrameIntervalMs;
+    // Encode for the window the picture is going into: a small one is cheap, a
+    // large one gets its own pixels instead of an upscaled small picture. A
+    // poll that names no display size keeps the encode this transport shipped
+    // with, so an older caller sees exactly what it saw before.
+    const target = videoTargetFor(
+      frame.width, frame.height,
+      options?.display?.width ?? DEFAULT_VIDEO_WIDTH,
+      options?.display?.height ?? DEFAULT_VIDEO_HEIGHT,
+    );
     const fitted = fitFrameToVideo(
       frame.data, frame.width, frame.height,
-      VIEWER_VIDEO_MAX_WIDTH, VIEWER_VIDEO_MAX_HEIGHT,
+      target.width, target.height,
     );
     const pixels = fitted.data instanceof Uint8Array ? fitted.data : new Uint8Array(fitted.data.buffer, fitted.data.byteOffset, fitted.data.byteLength);
 
@@ -3516,7 +3608,10 @@ export class WebBrowser extends Abject {
     if (!stream || sizeChanged) {
       if (stream) await stream.encoder.close().catch(() => undefined);
       stream = {
-        encoder: await Vp8Encoder.create({ width: fitted.width, height: fitted.height }),
+        encoder: await Vp8Encoder.create({
+          width: fitted.width, height: fitted.height,
+          bitrate: videoBitrateFor(fitted.width, fitted.height),
+        }),
         width: fitted.width,
         height: fitted.height,
         seq: 0,

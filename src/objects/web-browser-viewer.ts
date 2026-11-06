@@ -1360,10 +1360,31 @@ export class WebBrowserViewer extends Abject {
     const forceKey = this.needsKeyFrame;
 
     try {
+      // Available draw area, read before the pixels are asked for so the encode
+      // is sized for the window the picture will be shown in. In control mode
+      // reserve a small frame around the image for the takeover border, so the
+      // border (a) stays fully on-canvas instead of being clipped at the edges,
+      // and (b) sits OUTSIDE the image rect the compositor re-blits
+      // asynchronously, which would otherwise repaint over it every frame.
+      const canvasSize = await this.request<{ width: number; height: number }>(
+        request(this.id, this.canvasId, 'getCanvasSize', {})
+      );
+      const cw = canvasSize.width;
+      const ch = canvasSize.height;
+      if (cw <= 0 || ch <= 0) return;
+      const FRAME = this.controlMode ? 4 : 0;
+      const availW = cw - FRAME * 2;
+      const availH = ch - FRAME * 2;
+      if (availW <= 0 || availH <= 0) return;
+
       const reply = await this.request<ViewerVideoReply>(
         request(this.id, this.webBrowserId, 'viewerVideoFrame', {
           pageId: page.pageId,
-          options: { forceKey, keyFrameIntervalMs: this.keyFrameIntervalMs },
+          options: {
+            forceKey,
+            keyFrameIntervalMs: this.keyFrameIntervalMs,
+            display: { width: availW, height: availH },
+          },
         })
       );
 
@@ -1381,25 +1402,6 @@ export class WebBrowserViewer extends Abject {
         this.frameStats.unchangedTicks += 1;
         return;
       }
-
-      // Get canvas size to scale the frame
-      const canvasSize = await this.request<{ width: number; height: number }>(
-        request(this.id, this.canvasId, 'getCanvasSize', {})
-      );
-
-      const cw = canvasSize.width;
-      const ch = canvasSize.height;
-      if (cw <= 0 || ch <= 0) return;
-
-      // Available draw area. In control mode reserve a small frame around the
-      // image for the takeover border, so the border (a) stays fully on-canvas
-      // instead of being clipped at the edges, and (b) sits OUTSIDE the image
-      // rect the compositor re-blits asynchronously — otherwise that blit
-      // repaints over the border every frame and it flickers.
-      const FRAME = this.controlMode ? 4 : 0;
-      const availW = cw - FRAME * 2;
-      const availH = ch - FRAME * 2;
-      if (availW <= 0 || availH <= 0) return;
 
       // Scale to fit within the available area, preserving aspect ratio
       // The page's own pixel size, before the codec's downscale, so pointer

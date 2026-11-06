@@ -364,3 +364,66 @@ export function fitFrameToVideo(
   }
   return { data: out, width: w, height: h };
 }
+
+/** Ceiling on the encoded picture, however large a window asks for it. */
+export const MAX_VIDEO_WIDTH = 1920;
+export const MAX_VIDEO_HEIGHT = 1080;
+
+/** The encode size a poll that names no display size still gets. */
+export const DEFAULT_VIDEO_WIDTH = 960;
+export const DEFAULT_VIDEO_HEIGHT = 540;
+
+/** No picture is encoded at less than this fraction of its capture. */
+const MIN_VIDEO_SCALE = 0.25;
+
+/** One poll's request from the viewer. */
+export interface ViewerVideoPollOptions {
+  /** Restart the stream with a key frame on this poll. */
+  forceKey?: boolean;
+  /** Override the configured key-frame cadence. */
+  keyFrameIntervalMs?: number;
+  /**
+   * The pixels the viewer will paint the picture into — its canvas draw area.
+   * The encode follows it, so a large window is sharp instead of an upscaled
+   * small picture, and a small window stays cheap.
+   */
+  display?: { width: number; height: number };
+}
+
+/**
+ * The size to encode a page frame at for a picture the viewer will paint into
+ * `displayWidth` x `displayHeight` of its own pixels.
+ *
+ * The page's aspect ratio is kept, so the shape the client contain-fits into
+ * its draw rect still matches the capture. The result never exceeds the
+ * capture's own pixel count — upscaling in the encoder buys bits, not detail —
+ * and never falls below a quarter of it, so a sliver of a window still gets a
+ * decodable picture. Dimensions are even throughout: VP8 requires them.
+ */
+export function videoTargetFor(
+  sourceWidth: number,
+  sourceHeight: number,
+  displayWidth: number,
+  displayHeight: number,
+): { width: number; height: number } {
+  requirePositive(sourceWidth, 'a frame needs a positive width');
+  requirePositive(sourceHeight, 'a frame needs a positive height');
+  const fitW = Math.max(1, Math.min(displayWidth, MAX_VIDEO_WIDTH)) / sourceWidth;
+  const fitH = Math.max(1, Math.min(displayHeight, MAX_VIDEO_HEIGHT)) / sourceHeight;
+  const scale = Math.min(1, Math.max(MIN_VIDEO_SCALE, Math.min(fitW, fitH)));
+  const width = Math.max(2, Math.round((sourceWidth * scale) / 2) * 2);
+  const height = Math.max(2, Math.round((sourceHeight * scale) / 2) * 2);
+  return { width, height };
+}
+
+/**
+ * A bitrate that holds quality steady as the picture grows: about four bits per
+ * pixel, which is the 2 Mbps the 960x540 stream was tuned at, kept between a
+ * floor so a small window is not starved and a ceiling so a huge one cannot
+ * swamp the connection.
+ */
+export function videoBitrateFor(width: number, height: number): number {
+  requirePositive(width, 'a stream needs a positive width');
+  requirePositive(height, 'a stream needs a positive height');
+  return Math.max(800_000, Math.min(12_000_000, Math.round(width * height * 4)));
+}
