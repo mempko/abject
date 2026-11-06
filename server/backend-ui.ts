@@ -1404,6 +1404,37 @@ export class BackendUI extends Abject {
       return true;
     });
 
+    // ── Live video chunks (WebBrowserViewer → frontend decoder) ──────────
+    //
+    // The viewer's page picture is a real VP8 stream: the capture side
+    // encodes it, and the browser decodes it with WebCodecs. Only the bytes
+    // cross here; the client owns decoding and painting.
+    this.on('viewerVideoChunk', async (msg: AbjectMessage) => {
+      const { videoId, codec, width, height, key, chunks } = msg.payload as {
+        videoId: string; codec: string; width: number; height: number;
+        key: boolean; chunks: Array<{ type: 'key' | 'delta'; timestamp: number; data: string }>;
+      };
+      contractRequire(typeof videoId === 'string' && videoId.length > 0, 'viewerVideoChunk requires videoId');
+      contractRequire(Array.isArray(chunks) && chunks.length > 0, 'viewerVideoChunk requires chunks');
+      // Nothing to decode for and nothing to paint: skip the work entirely
+      // rather than queueing messages at a client that cannot receive them.
+      if (!this.hasReadyClient) return true;
+      this.sendToFrontend({
+        type: 'viewerVideoChunk',
+        videoId,
+        codec,
+        width,
+        height,
+        key,
+        chunks: chunks.map((c) => ({
+          type: c.type,
+          timestamp: c.timestamp,
+          data: Uint8Array.from(Buffer.from(c.data, 'base64')),
+        })),
+      });
+      return true;
+    });
+
     this.on('videoControl', async (msg: AbjectMessage) => {
       const { videoId, action, value } = msg.payload as {
         videoId: string; action: 'play' | 'pause' | 'seek' | 'setMuted' | 'dispose'; value?: number;

@@ -28,6 +28,7 @@ import {
   needsResync,
 } from './frame-diff.js';
 import type { ViewerFramePatch, ViewerFrameReply } from './frame-diff.js';
+import type { ViewerVideoReply } from './video-encoder.js';
 
 const WEB_BROWSER_VIEWER_INTERFACE: InterfaceId = 'abjects:web-browser-viewer';
 
@@ -253,6 +254,8 @@ export class WebBrowserViewer extends Abject {
   private lastFrameSeq?: number;
   /** Set when the picture on screen can no longer be patched (resync). */
   private needsKeyFrame = false;
+  /** Decoder stream id the client uses for this viewer's live page picture. */
+  private readonly videoStreamId = 'viewer-page';
   /** Poll cadence for the change-driven feed, and the key-frame cadence. */
   private framePollMs = DEFAULT_FRAME_POLL_MS;
   private keyFrameIntervalMs = DEFAULT_KEY_FRAME_INTERVAL_MS;
@@ -880,7 +883,10 @@ export class WebBrowserViewer extends Abject {
     if (!confirmed) return;
 
     try {
-      await this.request(request(this.id, this.webBrowserId, 'closePage', { pageId: page.pageId }));
+      // viewerClosePage, not closePage: the tabs list every open page, so the
+      // page is usually another object's and closePage's ownership check would
+      // refuse it — silently, before this fix, because of the catch below.
+      await this.request(request(this.id, this.webBrowserId, 'viewerClosePage', { pageId: page.pageId }));
     } catch { /* already gone */ }
     // The WebBrowser pageClosed event also refreshes, but do it now so the tab
     // disappears immediately.
@@ -1339,8 +1345,8 @@ export class WebBrowserViewer extends Abject {
     const forceKey = this.needsKeyFrame;
 
     try {
-      const reply = await this.request<ViewerFrameReply>(
-        request(this.id, this.webBrowserId, 'viewerFrame', {
+      const reply = await this.request<ViewerVideoReply>(
+        request(this.id, this.webBrowserId, 'viewerVideoFrame', {
           pageId: page.pageId,
           options: { forceKey, keyFrameIntervalMs: this.keyFrameIntervalMs },
         })
@@ -1354,20 +1360,10 @@ export class WebBrowserViewer extends Abject {
       }
       this.lastFrameSeq = reply.seq;
 
-      const decision = decideViewerFrameAction(reply, {
-        lastDrawnSeq: this.lastDrawnSeq,
-        lastFit: this.lastDrawRect,
-      });
-      this.frameStats = accumulateFrameStats(this.frameStats, reply, decision);
-
-      // An identical frame draws nothing at all: no clear, no re-submitted
-      // image. This is where the bandwidth saving lives.
-      if (decision.action === 'ignore') return;
-
-      if (decision.action === 'resync') {
-        // The patch bases on a frame this viewer no longer holds. Keep the
-        // picture that is up and ask for a whole frame on the next poll.
-        this.needsKeyFrame = true;
+      // A still page sends nothing: the capture side compared the pixels and
+      // answered 'unchanged', so there is no packet to decode and no draw.
+      if (reply.kind === 'unchanged') {
+        this.frameStats.unchangedTicks += 1;
         return;
       }
 
@@ -1391,11 +1387,11 @@ export class WebBrowserViewer extends Abject {
       if (availW <= 0 || availH <= 0) return;
 
       // Scale to fit within the available area, preserving aspect ratio
-      // Both frame-bearing replies report the page frame's own pixel size; a
-      // patch maps through the same fit transform as the key frame it bases on.
-      if (reply.kind !== 'key' && reply.kind !== 'delta') return;
-      const shotW = reply.width;
-      const shotH = reply.height;
+      // The page's own pixel size, before the codec's downscale, so pointer
+      // positions map back into page coordinates; the encoded size drives the
+      // region the decoded picture is painted into.
+      const shotW = reply.sourceWidth;
+      const shotH = reply.sourceHeight;
       if (shotW <= 0 || shotH <= 0) return;
       const imgAspect = shotW / shotH;
       const availAspect = availW / availH;
@@ -1422,60 +1418,57 @@ export class WebBrowserViewer extends Abject {
       this.lastTransform = { drawX, drawY, drawW: dw, drawH: dh, shotW, shotH };
       const fit = { drawX, drawY, drawW: dw, drawH: dh };
 
-      if (decision.action === 'delta' && reply.kind === 'delta') {
-        // Patches only: no clear (the surface keeps the rest of the picture,
-        // so earlier patches are not lost) and no key-frame data URI (re-sending
-        // it every tick would cross the whole image again and defeat the
-        // purpose). Each rect is widened to whole pixels so neighbouring
-        // patches cannot leave a seam between them.
-        const commands: unknown[] = [];
-        for (const patch of reply.patches) {
-          const rect = mapPatchToCanvas(patch, fit, shotW, shotH);
-          commands.push({
-            type: 'imageUrl',
-            params: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, url: patch.dataUri },
-          });
-        }
-        await this.request(request(this.id, this.canvasId, 'draw', { commands }));
-        this.lastDrawnSeq = reply.seq;
-        this.lastBaseSeq = reply.baseSeq;
-        this.lastDrawRect = fit;
-        this.lastDrawControlMode = this.controlMode;
-        this.needsKeyFrame = false;
-        return;
-      }
-
-      if (reply.kind !== 'key') return;
-
-      // A whole frame. Clear only when the geometry or control border changes:
-      // on an unchanged rect the opaque frame overwrites the old one
-      // pixel-for-pixel, so skipping the clear removes the background flash.
+      // Register the region the decoded stream paints, and re-emit it when the
+      // geometry or the control border changes. The compositor contain-fits the
+      // decoded frame into this rect, so one videoFrame command is all the
+      // drawing this transport does — no per-tick image traffic at all.
       const rectChanged = !this.lastDrawRect
         || this.lastDrawRect.drawX !== drawX || this.lastDrawRect.drawY !== drawY
         || this.lastDrawRect.drawW !== dw || this.lastDrawRect.drawH !== dh;
       const controlChanged = this.lastDrawControlMode !== this.controlMode;
 
-      const commands: unknown[] = [];
-      if (rectChanged || controlChanged) {
-        commands.push({ type: 'clear', params: { color: this.theme.windowBg } });
-      }
-      commands.push({
-        type: 'imageUrl',
-        params: { x: drawX, y: drawY, width: dw, height: dh, url: reply.dataUri },
-      });
-      if (this.controlMode) {
-        // Border stroke centered in the reserved frame, just outside the image:
-        // fully on-canvas, and clear of the image rect the compositor re-blits.
+      if (rectChanged || controlChanged || this.lastDrawnSeq === undefined) {
+        const commands: unknown[] = [];
+        if (rectChanged || controlChanged) {
+          commands.push({ type: 'clear', params: { color: this.theme.windowBg } });
+        }
         commands.push({
-          type: 'rect',
+          type: 'videoFrame',
           params: {
-            x: drawX - 2, y: drawY - 2, width: dw + 4, height: dh + 4,
-            stroke: this.theme.statusWarning, lineWidth: 2,
+            videoId: this.videoStreamId,
+            x: drawX, y: drawY, width: dw, height: dh,
+            hidden: false,
           },
         });
+        if (this.controlMode) {
+          // Border stroke centered in the reserved frame, just outside the
+          // picture: fully on-canvas, and clear of the region the compositor
+          // re-blits.
+          commands.push({
+            type: 'rect',
+            params: {
+              x: drawX - 2, y: drawY - 2, width: dw + 4, height: dh + 4,
+              stroke: this.theme.statusWarning, lineWidth: 2,
+            },
+          });
+        }
+        await this.request(request(this.id, this.canvasId, 'draw', { commands }));
       }
 
-      await this.request(request(this.id, this.canvasId, 'draw', { commands }));
+      // Hand the packets to the browser, which decodes them with WebCodecs.
+      const uiServerId = await this.requireDep('UIServer');
+      await this.request(request(this.id, uiServerId, 'viewerVideoChunk', {
+        videoId: this.videoStreamId,
+        codec: reply.codec,
+        width: reply.width,
+        height: reply.height,
+        key: reply.key,
+        chunks: reply.chunks,
+      }));
+
+      this.frameStats.updatesSent += 1;
+      this.frameStats.bytesSent += reply.chunks.reduce((n, c) => n + c.data.length, 0);
+      if (reply.key) this.frameStats.keyFrames += 1; else this.frameStats.deltas += 1;
       this.lastDrawnSeq = reply.seq;
       this.lastBaseSeq = reply.seq;
       this.lastDrawRect = fit;

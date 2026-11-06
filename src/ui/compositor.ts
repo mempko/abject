@@ -2971,13 +2971,62 @@ export class Compositor {
   }
 
   /**
+   * Register a canvas that a decoded video stream paints into — the web
+   * viewer's VP8 stream, decoded by WebCodecs into an offscreen canvas. The
+   * stream's videoFrame region blits it whenever a new frame is stamped, so
+   * the decoded picture reaches the surface exactly like a video element's.
+   */
+  registerDecodedCanvas(videoId: string, canvas: HTMLCanvasElement | OffscreenCanvas): void {
+    this.decodedCanvases.set(videoId, { canvas, stamp: 0 });
+    this.decodedStamps.delete(videoId);
+    this.needsRender = true;
+  }
+
+  /** Announce that a newly decoded frame is in the canvas. */
+  stampDecodedCanvas(videoId: string): void {
+    const entry = this.decodedCanvases.get(videoId);
+    if (!entry) return;
+    entry.stamp += 1;
+    this.needsRender = true;
+  }
+
+  unregisterDecodedCanvas(videoId: string): void {
+    this.decodedCanvases.delete(videoId);
+    this.decodedStamps.delete(videoId);
+    this.videoRegions.delete(videoId);
+    for (const [key, region] of this.layerVideoRegions) {
+      if (region.videoId === videoId) this.layerVideoRegions.delete(key);
+    }
+  }
+
+  /** Decoded-stream canvases, keyed by the stream's videoId. */
+  private decodedCanvases: Map<string, { canvas: HTMLCanvasElement | OffscreenCanvas; stamp: number }> = new Map();
+  /** Last frame stamp already painted, per videoId (surface and layer). */
+  private decodedStamps: Map<string, number> = new Map();
+  /**
+   * videoFrame regions on canvas-layer nodes. Surface regions live in
+   * videoRegions; a lesson from the flicker work is that a decoded stream
+   * must be able to paint a canvas layer too (the web viewer's picture is a
+   * layer, not a window surface).
+   */
+  private layerVideoRegions: Map<string, {
+    videoId: string; surfaceId: string; nodeId: string;
+    x: number; y: number; width: number; height: number; hidden: boolean;
+  }> = new Map();
+
+  /**
    * Draw the current frame of every live video region into its surface
    * canvas. Runs every animation frame; cheap when nothing plays because
    * paints are gated on currentTime movement. Returns true when any surface
    * was repainted (its texture re-uploads on the following render).
    */
   private blitVideoFrames(): boolean {
-    if (this.videoRegions.size === 0) return false;
+    // Both kinds of live region matter: surface regions (a video widget) and
+    // canvas-layer regions (the web viewer's decoded page picture). Guarding
+    // on videoRegions alone returned before the layer loop ever ran, so a
+    // stream that paints a canvas layer - the viewer, which registers no
+    // surface region at all - was never blitted and the picture froze.
+    if (this.videoRegions.size === 0 && this.layerVideoRegions.size === 0) return false;
     let painted = false;
     for (const [videoId, region] of this.videoRegions) {
       if (region.hidden || region.width <= 0 || region.height <= 0) continue;
@@ -2985,6 +3034,20 @@ export class Compositor {
       if (!surface || surface.tainted) continue;
       const stamp = this.surfaceVideoStamps.get(region.surfaceId) ?? 0;
       if (region.stamp !== stamp) continue; // stale: last full redraw skipped it
+      const decoded = this.decodedCanvases.get(videoId);
+      if (decoded) {
+        if (this.decodedStamps.get(videoId) === decoded.stamp) continue;
+        this.decodedStamps.set(videoId, decoded.stamp);
+        if (decoded.canvas.width > 0 && decoded.canvas.height > 0) {
+          this.paintFrameInto(
+            surface.ctx, surface.dpr,
+            decoded.canvas.width, decoded.canvas.height, decoded.canvas, region,
+          );
+          surface.dirty = true;
+          painted = true;
+        }
+        continue;
+      }
       const video = this.videoElements.get(videoId);
       if (!video || video.readyState < 2 || video.videoWidth === 0) continue;
       // Repaint when time moved (playing or a paused seek) or on first paint.
@@ -2993,6 +3056,25 @@ export class Compositor {
       region.lastTime = t;
       this.paintVideoRegion(surface, video, region);
       surface.dirty = true;
+      painted = true;
+    }
+
+    // Canvas-layer streams (the web viewer's decoded page picture): painted
+    // straight onto the layer's own canvas, which re-uploads as a texture.
+    for (const [key, region] of this.layerVideoRegions) {
+      if (region.hidden || region.width <= 0 || region.height <= 0) continue;
+      const decoded = this.decodedCanvases.get(region.videoId);
+      if (!decoded || decoded.canvas.width === 0 || decoded.canvas.height === 0) continue;
+      const stampKey = `layer:${key}`;
+      if (this.decodedStamps.get(stampKey) === decoded.stamp) continue;
+      this.decodedStamps.set(stampKey, decoded.stamp);
+      const entry = this.canvasLayers.get(`${region.surfaceId}/${region.nodeId}`);
+      if (!entry) continue;
+      this.paintFrameInto(
+        entry.ctx, 1, decoded.canvas.width, decoded.canvas.height, decoded.canvas, region,
+      );
+      entry.needsUpload = true;
+      if (this.isSurfaceKeyRenderable(region.surfaceId)) this.needsRender = true;
       painted = true;
     }
     return painted;
@@ -3024,6 +3106,46 @@ export class Compositor {
     const dh = video.videoHeight * scale;
     ctx.drawImage(
       video,
+      region.x + (region.width - dw) / 2,
+      region.y + (region.height - dh) / 2,
+      dw, dh,
+    );
+    ctx.restore();
+  }
+
+  /**
+   * Contain-fit any frame source (a decoded canvas) into a region of a 2D
+   * context. Same letterboxing as paintVideoRegion, for sources that are not
+   * HTMLVideoElements.
+   */
+  private paintFrameInto(
+    outerCtx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+    dpr: number,
+    srcW: number,
+    srcH: number,
+    source: CanvasImageSource,
+    region: { x: number; y: number; width: number; height: number; clipTop?: number; clipBottom?: number },
+  ): void {
+    if (srcW <= 0 || srcH <= 0) return;
+    const ctx = outerCtx;
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const top = Math.max(region.y, region.clipTop ?? region.y);
+    const bottom = Math.min(region.y + region.height, region.clipBottom ?? region.y + region.height);
+    if (bottom <= top) {
+      ctx.restore();
+      return;
+    }
+    ctx.beginPath();
+    ctx.rect(region.x, top, region.width, bottom - top);
+    ctx.clip();
+    ctx.fillStyle = '#000';
+    ctx.fillRect(region.x, region.y, region.width, region.height);
+    const scale = Math.min(region.width / srcW, region.height / srcH);
+    const dw = srcW * scale;
+    const dh = srcH * scale;
+    ctx.drawImage(
+      source,
       region.x + (region.width - dw) / 2,
       region.y + (region.height - dh) / 2,
       dw, dh,
@@ -3816,7 +3938,19 @@ export class Compositor {
       }
     } else if (command.type === 'reset') {
       this.resetCtxState(entry.ctx, entry.w, entry.h, 1);
-    } else if (command.type !== 'videoFrame') { // videoFrame is surface-only
+    } else if (command.type === 'videoFrame') {
+      // A decoded stream painting this layer (the web viewer's live page).
+      const p = command.params as VideoFrameParams;
+      if (p?.videoId && typeof p.x === 'number' && typeof p.y === 'number') {
+        this.layerVideoRegions.set(`${surfaceId}/${nodeId}/${p.videoId}`, {
+          videoId: p.videoId, surfaceId, nodeId,
+          x: p.x, y: p.y,
+          width: Math.max(0, p.width), height: Math.max(0, p.height),
+          hidden: p.hidden === true,
+        });
+        this.decodedStamps.delete(`layer:${surfaceId}/${nodeId}/${p.videoId}`);
+      }
+    } else {
       this.execShapeCommand(entry.ctx, `${surfaceId}/${nodeId}`, command, 1);
     }
     entry.needsUpload = true;

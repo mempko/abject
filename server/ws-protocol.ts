@@ -365,6 +365,24 @@ export interface VideoControlMsg extends WsEnvelope {
 }
 
 /**
+ * Encoded video packets for a live stream the client decodes itself. The
+ * viewer's page picture travels this way: VP8 chunks the browser hands to
+ * WebCodecs' VideoDecoder, which is a real codec rather than a patch protocol
+ * the client has to reassemble. `key` restarts decoding; `codec` is the
+ * VideoDecoder codec string ('vp8').
+ */
+export interface ViewerVideoChunkMsg extends WsEnvelope {
+  type: 'viewerVideoChunk';
+  /** Identifies the stream and the canvas it decodes into. */
+  videoId: string;
+  codec: string;
+  width: number;
+  height: number;
+  key: boolean;
+  chunks: Array<{ type: 'key' | 'delta'; timestamp: number; data: Uint8Array }>;
+}
+
+/**
  * Content-addressed image transfer. Draw commands never carry image bytes:
  * a data: URI arriving from an abject is stored server-side by sha256 and
  * rewritten to `abx:sha256:<hex>`; each client receives the bytes once via
@@ -442,6 +460,7 @@ export type BackendToFrontendMsg =
   | SpeechVoicesRequestMsg
   | VideoSetupMsg
   | VideoControlMsg
+  | ViewerVideoChunkMsg
   | AuthRequiredMsg
   | AuthNotRequiredMsg
   | AuthResultMsg;

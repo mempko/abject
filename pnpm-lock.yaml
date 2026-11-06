@@ -32,6 +32,9 @@ importers:
       jsqr:
         specifier: ^1.4.0
         version: 1.4.0
+      libav.js:
+        specifier: 6.10.9
+        version: 6.10.9
       linkedom:
         specifier: ^0.18.0
         version: 0.18.12
@@ -1609,6 +1612,9 @@ packages:
 
   lazy-val@1.0.5:
     resolution: {integrity: sha512-0/BnGCCfyUMkBpeDgWihanIAF9JmZhHBgUhEqzvf+adhNGLoP6TaiI5oF8oyb3I45P+PcnrqihSf01M0l0G5+Q==}
+
+  libav.js@6.10.9:
+    resolution: {integrity: sha512-g1v+2ZWShgAwvJY8t3Q1c7n1XV+7jq/uDdj9Ak+twsgBdSdEGbXhKTHkBBuBW7SbmTH7TpoBaVleRpP+YiCh/Q==}
 
   linkedom@0.18.12:
     resolution: {integrity: sha512-jalJsOwIKuQJSeTvsgzPe9iJzyfVaEJiEXl+25EkKevsULHvMJzpNqwvj1jOESWdmgKDiXObyjOYwlUqG7wo1Q==}
@@ -3816,6 +3822,8 @@ snapshots:
       json-buffer: 3.0.1
 
   lazy-val@1.0.5: {}
+
+  libav.js@6.10.9: {}
 
   linkedom@0.18.12:
     dependencies:

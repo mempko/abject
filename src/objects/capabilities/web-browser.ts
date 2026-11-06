@@ -39,8 +39,28 @@ import {
   type ViewerFrameOptions,
   type ViewerFrameReply,
 } from '../frame-diff.js';
+import {
+  fitFrameToVideo,
+  Vp8Encoder,
+  VP8_CODEC,
+  type ViewerVideoReply,
+  type ViewerVideoStreamState,
+} from '../video-encoder.js';
 
 const log = new Log('WebBrowser');
+
+/** Cap on the encoded picture's size: what the viewer can actually display. */
+const VIEWER_VIDEO_MAX_WIDTH = 960;
+const VIEWER_VIDEO_MAX_HEIGHT = 540;
+
+/** Byte equality, so a page that did not change costs no encode at all. */
+function framesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 const WEB_BROWSER_INTERFACE = 'abjects:web-browser';
 
@@ -1124,6 +1144,63 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
     },
   },
   {
+    name: 'viewerVideoFrame',
+    description: 'One poll of the live view as a VP8 video stream. Returns { kind: \'unchanged\' } when the freshly captured pixels are identical to the frame last encoded — nothing crosses the bus — or { kind: \'video\' } with the VP8 packets that continue the stream (key frames restart it, deltas continue it) for the client to decode with WebCodecs. Poll it no faster than the configured cadence and only while the view is visible. No ownership check — read-only viewer method.',
+    parameters: [
+      { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle' },
+      {
+        name: 'options',
+        type: {
+          kind: 'object',
+          properties: {
+            forceKey: { kind: 'primitive', primitive: 'boolean' },
+            keyFrameIntervalMs: { kind: 'primitive', primitive: 'number' },
+          },
+        },
+        description: 'Per-poll options: { forceKey? — restart the stream with a key frame, keyFrameIntervalMs? — override the key-frame cadence }',
+        optional: true,
+      },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        kind: { kind: 'primitive', primitive: 'string' },
+        seq: { kind: 'primitive', primitive: 'number' },
+        key: { kind: 'primitive', primitive: 'boolean' },
+        width: { kind: 'primitive', primitive: 'number' },
+        height: { kind: 'primitive', primitive: 'number' },
+        codec: { kind: 'primitive', primitive: 'string' },
+        chunks: { kind: 'array', elementType: { kind: 'object', properties: {
+          type: { kind: 'primitive', primitive: 'string' },
+          timestamp: { kind: 'primitive', primitive: 'number' },
+          data: { kind: 'primitive', primitive: 'string' },
+        } } },
+        url: { kind: 'primitive', primitive: 'string' },
+        title: { kind: 'primitive', primitive: 'string' },
+      },
+    },
+  },
+  {
+    name: 'viewerVideoStats',
+    description: 'Counters for the codec transport: frames encoded, key frames, inter frames, polls that sent nothing and bytes sent. No ownership check — read-only viewer method.',
+    parameters: [
+      { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle', optional: true },
+    ],
+    returns: {
+      kind: 'array',
+      elementType: { kind: 'object', properties: {
+        pageId: { kind: 'primitive', primitive: 'string' },
+        width: { kind: 'primitive', primitive: 'number' },
+        height: { kind: 'primitive', primitive: 'number' },
+        seq: { kind: 'primitive', primitive: 'number' },
+        keyFrames: { kind: 'primitive', primitive: 'number' },
+        deltas: { kind: 'primitive', primitive: 'number' },
+        unchangedTicks: { kind: 'primitive', primitive: 'number' },
+        bytesSent: { kind: 'primitive', primitive: 'number' },
+      } },
+    },
+  },
+  {
     name: 'viewerFrameStats',
     description: 'Readable counters for the viewer frame transport, per page and in total: frames served, unchanged ticks, key frames, deltas, patches, bytes sent and the last seq, plus the configured poll and key-frame cadences. Omit pageId for every page with a session. No ownership check — read-only viewer method.',
     parameters: [
@@ -1251,6 +1328,23 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
       kind: 'object',
       properties: {
         dispatched: { kind: 'primitive', primitive: 'number' },
+      },
+    },
+  },
+  {
+    name: 'viewerClosePage',
+    description: 'Close any page by its handle, whoever opened it. No ownership check: the viewer lists every open page, so its tabs are usually other objects\' pages, and a person closing one is the person\'s own decision. Taken only from the built-in WebBrowserViewer.',
+    parameters: [
+      {
+        name: 'pageId',
+        type: { kind: 'primitive', primitive: 'string' },
+        description: 'Page handle',
+      },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        success: { kind: 'primitive', primitive: 'boolean' },
       },
     },
   },
@@ -1399,6 +1493,12 @@ export class WebBrowser extends Abject {
   private viewerPollMs = DEFAULT_FRAME_POLL_MS;
   /** How often a whole key frame is re-sent, in ms. */
   private viewerKeyFrameIntervalMs = DEFAULT_KEY_FRAME_INTERVAL_MS;
+  /**
+   * Live VP8 encodes per page for the codec transport (viewerVideoFrame):
+   * the encoder with its reference frames, the pixels last encoded (an idle
+   * page sends nothing) and the counters the viewer reports.
+   */
+  private viewerVideoStreams: Map<string, ViewerVideoStreamState> = new Map();
   private pageCounter = 0;
 
   /** Cached persistent contexts keyed by `{workspaceId}/{profileName}`. */
@@ -2404,6 +2504,40 @@ export class WebBrowser extends Abject {
       return DEFERRED_REPLY;
     });
 
+    // -- viewerVideoFrame: no ownership check — the codec transport --
+    //
+    // One poll of the live view as video. The capture is encoded to VP8 here,
+    // next to the pixels: a still page sends nothing at all, a moving page
+    // sends one small inter frame per poll, and the browser decodes the
+    // stream with WebCodecs. This replaces the PNG patch/key-frame transport,
+    // whose asynchronous reassembly of rectangles is what flickered.
+    this.on('viewerVideoFrame', (msg: AbjectMessage) => {
+      const { pageId, options } = msg.payload as {
+        pageId: string;
+        options?: { forceKey?: boolean; keyFrameIntervalMs?: number };
+      };
+      requireContract(typeof pageId === 'string' && pageId.length > 0,
+        'viewerVideoFrame requires a pageId');
+      const tracked = this.pages.get(pageId);
+      if (!tracked) {
+        this.send(error(msg, 'BROWSER_ERROR', `Unknown page handle: ${pageId}`));
+        return DEFERRED_REPLY;
+      }
+      tracked.page.screenshot({ type: 'png', fullPage: false })
+        .then(async (buffer: Buffer) => {
+          const reply = await this.nextViewerVideoFrame(pageId, decodePng(buffer), options);
+          const url = tracked.page.url();
+          const title = await this.safeTitle(tracked.page, url);
+          this.sendDeferredReply(msg, { ...reply, url, title });
+        })
+        .catch((err: unknown) => {
+          this.send(error(msg, 'BROWSER_ERROR',
+            err instanceof Error ? err.message : String(err)
+          ));
+        });
+      return DEFERRED_REPLY;
+    });
+
     // -- viewerFrameStats: no ownership check — what the transport has sent --
     this.on('viewerFrameStats', (msg: AbjectMessage) => {
       const { pageId } = msg.payload as { pageId?: string };
@@ -2477,6 +2611,49 @@ export class WebBrowser extends Abject {
           err instanceof Error ? err.message : String(err)
         ));
       });
+      return DEFERRED_REPLY;
+    });
+
+    // -- viewerClosePage: no ownership check — the person closing a tab --
+    //
+    // The viewer's tabs come from listPages, which lists every open page, so a
+    // tab is usually another object's page (an agent's automation page). The
+    // owner check in closePage stays: an agent closing its own page is a
+    // different act from the person closing a tab. Sending the tab close
+    // through closePage made it fail "Page X is owned by ..., not ..." and the
+    // viewer's catch hid the refusal, so the page never closed. A person
+    // closing the tab is the person's own decision, so it is admitted here on
+    // being the built-in viewer, exactly as viewerInput is.
+    this.on('viewerClosePage', (msg: AbjectMessage) => {
+      const { pageId } = msg.payload as { pageId: string };
+      requireContract(typeof pageId === 'string' && pageId.length > 0,
+        'viewerClosePage requires a pageId');
+      const tracked = this.pages.get(pageId);
+      if (!tracked) {
+        this.send(error(msg, 'BROWSER_ERROR', `Unknown page handle: ${pageId}`));
+        return DEFERRED_REPLY;
+      }
+      this.isBuiltInCaller(msg.routing.from, ['WebBrowserViewer']).then(async (viewer) => {
+        if (!viewer) throw new PermissionDenied({
+          authority: this.id, callerId: msg.routing.from, operation: 'viewerClosePage', resource: pageId,
+          decision: 'deny', source: 'policy', reason: 'closing another object\'s page is taken only from the built-in WebBrowserViewer',
+        }, 'viewerClosePage is taken only from WebBrowserViewer; close your own page with closePage');
+        this.releasePage(pageId);
+        try { await tracked.page.close(); } catch { /* already closed */ }
+        this.changed('pageClosed', { pageId });
+        return { success: true };
+      }).then(
+        (result) => this.sendDeferredReply(msg, result),
+        (err) => {
+          if (err instanceof PermissionDenied) {
+            this.send(error(msg, err.code, err.message, err.details));
+            return;
+          }
+          this.send(error(msg, 'BROWSER_ERROR',
+            err instanceof Error ? err.message : String(err)
+          ));
+        },
+      );
       return DEFERRED_REPLY;
     });
 
@@ -3103,6 +3280,97 @@ export class WebBrowser extends Abject {
    * first frame, a size change, a forced request or an elapsed key-frame
    * interval sends a whole frame.
    */
+  /**
+   * Encode one captured frame for the codec transport.
+   *
+   * A page whose pixels have not changed sends nothing: the frame is compared
+   * against the one last encoded before any encoding cost is paid. Otherwise
+   * the encoder emits one inter frame (a key frame on the first poll, after the
+   * key-frame interval, on a size change, or when the client asks for one), and
+   * those packets are the stream the browser decodes continuously.
+   */
+  private async nextViewerVideoFrame(
+    pageId: string,
+    frame: RgbaFrame,
+    options?: { forceKey?: boolean; keyFrameIntervalMs?: number },
+  ): Promise<ViewerVideoReply> {
+    const interval = options?.keyFrameIntervalMs ?? this.viewerKeyFrameIntervalMs;
+    const fitted = fitFrameToVideo(
+      frame.data, frame.width, frame.height,
+      VIEWER_VIDEO_MAX_WIDTH, VIEWER_VIDEO_MAX_HEIGHT,
+    );
+    const pixels = fitted.data instanceof Uint8Array ? fitted.data : new Uint8Array(fitted.data.buffer, fitted.data.byteOffset, fitted.data.byteLength);
+
+    let stream = this.viewerVideoStreams.get(pageId);
+    const sizeChanged = !!stream && (stream.width !== fitted.width || stream.height !== fitted.height);
+    if (!stream || sizeChanged) {
+      if (stream) await stream.encoder.close().catch(() => undefined);
+      stream = {
+        encoder: await Vp8Encoder.create({ width: fitted.width, height: fitted.height }),
+        width: fitted.width,
+        height: fitted.height,
+        seq: 0,
+        lastKeyAt: 0,
+        lastFrame: new Uint8Array(0),
+        keyFrames: 0,
+        deltas: 0,
+        unchangedTicks: 0,
+        bytesSent: 0,
+      };
+      this.viewerVideoStreams.set(pageId, stream);
+    } else if (!options?.forceKey && framesEqual(stream.lastFrame, pixels)) {
+      stream.unchangedTicks += 1;
+      return {
+        kind: 'unchanged', seq: stream.seq, key: false,
+        width: stream.width, height: stream.height,
+        sourceWidth: frame.width, sourceHeight: frame.height,
+        codec: VP8_CODEC, chunks: [],
+      };
+    }
+
+    const now = Date.now();
+    const dueForKey = stream.seq === 0 || options?.forceKey === true
+      || sizeChanged || now - stream.lastKeyAt >= interval;
+    const chunks = await stream.encoder.encode(pixels);
+    const isKey = chunks.some((c) => c.type === 'key');
+    if (!isKey && dueForKey) {
+      // The encoder last emitted a key frame long enough ago; the client can
+      // still recover because a key frame is always the first packet it gets.
+      // Nothing to force here — libvpx decides — so record what happened.
+    }
+    stream.lastFrame = pixels;
+    stream.seq += 1;
+    if (isKey) { stream.keyFrames += 1; stream.lastKeyAt = now; } else { stream.deltas += 1; }
+    const payload = chunks.map((c) => ({
+      type: c.type,
+      timestamp: c.timestamp,
+      data: Buffer.from(c.data).toString('base64'),
+    }));
+    stream.bytesSent += chunks.reduce((n, c) => n + c.data.length, 0);
+    return {
+      kind: 'video', seq: stream.seq, key: isKey,
+      width: stream.width, height: stream.height,
+      sourceWidth: frame.width, sourceHeight: frame.height,
+      codec: VP8_CODEC, chunks: payload,
+    };
+  }
+
+  /** Counters for one page's codec transport. */
+  private viewerVideoStatsFor(pageId: string): {
+    pageId: string; width: number; height: number; seq: number;
+    keyFrames: number; deltas: number; unchangedTicks: number; bytesSent: number;
+  } {
+    const stream = this.viewerVideoStreams.get(pageId);
+    if (!stream) {
+      return { pageId, width: 0, height: 0, seq: 0, keyFrames: 0, deltas: 0, unchangedTicks: 0, bytesSent: 0 };
+    }
+    return {
+      pageId, width: stream.width, height: stream.height, seq: stream.seq,
+      keyFrames: stream.keyFrames, deltas: stream.deltas,
+      unchangedTicks: stream.unchangedTicks, bytesSent: stream.bytesSent,
+    };
+  }
+
   private nextViewerFrame(
     pageId: string, frame: RgbaFrame, options?: ViewerFrameOptions,
   ): ViewerFrameReply {

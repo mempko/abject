@@ -50,6 +50,7 @@ import type {
   SpeechRecognizeRequestMsg,
   SpeechVoicesRequestMsg,
   VideoSetupMsg,
+  ViewerVideoChunkMsg,
   VideoControlMsg,
 } from '../server/ws-protocol.js';
 import type { BackdropControl } from './backdrop.js';
@@ -1460,6 +1461,10 @@ export class FrontendClient {
       case 'videoControl':
         this.handleVideoControl(msg as VideoControlMsg);
         break;
+
+      case 'viewerVideoChunk':
+        this.handleViewerVideoChunk(msg as ViewerVideoChunkMsg);
+        break;
     }
   }
 
@@ -2231,6 +2236,106 @@ export class FrontendClient {
 
   /** Content blobs already requested with needBlob (cleared as each arrives). */
   private requestedContentBlobs = new Set<string>();
+
+  // ── Live video streams (the web viewer's page picture) ───────────────
+  //
+  // A real codec, decoded by the browser: VP8 packets go into WebCodecs'
+  // VideoDecoder and each decoded frame is drawn into an offscreen canvas
+  // that the compositor blits into the viewer's canvas layer. This replaces
+  // the old patch protocol, whose asynchronous rectangle reassembly is what
+  // flickered.
+
+  private videoDecoders: Map<string, {
+    decoder: VideoDecoder;
+    canvas: OffscreenCanvas;
+    ctx: OffscreenCanvasRenderingContext2D;
+    configured: boolean;
+    /** Last timestamp handed to the decoder; VP8 packets must advance. */
+    lastTimestamp: number;
+    width: number;
+    height: number;
+  }> = new Map();
+
+  private handleViewerVideoChunk(msg: ViewerVideoChunkMsg): void {
+    if (typeof VideoDecoder === 'undefined') return;
+    let stream = this.videoDecoders.get(msg.videoId);
+    if (!stream || stream.width !== msg.width || stream.height !== msg.height) {
+      if (stream) {
+        try { stream.decoder.close(); } catch { /* already closed */ }
+      }
+      const canvas = new OffscreenCanvas(Math.max(2, msg.width), Math.max(2, msg.height));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      const entry = {
+        decoder: undefined as unknown as VideoDecoder,
+        canvas, ctx, configured: false, lastTimestamp: -1,
+        width: Math.max(2, msg.width), height: Math.max(2, msg.height),
+      };
+      entry.decoder = new VideoDecoder({
+        output: (frame: VideoFrame) => {
+          try {
+            if (entry.canvas.width !== frame.displayWidth || entry.canvas.height !== frame.displayHeight) {
+              entry.canvas.width = Math.max(2, frame.displayWidth);
+              entry.canvas.height = Math.max(2, frame.displayHeight);
+              entry.width = entry.canvas.width;
+              entry.height = entry.canvas.height;
+            }
+            entry.ctx.drawImage(frame, 0, 0, entry.canvas.width, entry.canvas.height);
+            this.compositor.stampDecodedCanvas(msg.videoId);
+          } finally {
+            frame.close();
+          }
+        },
+        error: () => { /* a bad chunk drops frames; the next key frame recovers */ },
+      });
+      this.videoDecoders.set(msg.videoId, entry);
+      this.compositor.registerDecodedCanvas(msg.videoId, canvas);
+      stream = entry;
+    }
+
+    if (msg.key || !stream.configured) {
+      // A key frame restarts the stream: reset the decoder so no reference
+      // frames from the old geometry or an interrupted chain are reused.
+      try { stream.decoder.reset(); } catch { /* not configured yet */ }
+      try {
+        stream.decoder.configure({
+          codec: msg.codec,
+          codedWidth: stream.width,
+          codedHeight: stream.height,
+          // The stream is shown as it arrives; telling the decoder so stops it
+          // buffering frames ahead of the display and cutting latency.
+          optimizeForLatency: true,
+        });
+        stream.configured = true;
+        // Timestamps are per stream and the encoder restarts its clock when the
+        // codec is recreated, so track the last one seen rather than trusting
+        // the sender's absolute values.
+        stream.lastTimestamp = -1;
+      } catch {
+        return;
+      }
+    }
+    if (!stream.configured) return; // a delta before the first key frame is undecodable
+    for (const chunk of msg.chunks) {
+      try {
+        // A key frame after frames were already shown need not reset the
+        // decoder, but its timestamp still has to move forwards.
+        const timestamp = chunk.timestamp > stream.lastTimestamp
+          ? chunk.timestamp
+          : stream.lastTimestamp + 1;
+        stream.decoder.decode(new EncodedVideoChunk({
+          type: chunk.type === 'key' ? 'key' : 'delta',
+          timestamp,
+          data: chunk.data,
+        }));
+        stream.lastTimestamp = timestamp;
+      } catch {
+        // A rejected chunk leaves the stream waiting for the next key frame.
+        stream.configured = false;
+        break;
+      }
+    }
+  }
 
   private handleImageBlob(msg: ImageBlobMsg): void {
     const bytes = msg.bytes instanceof Uint8Array ? msg.bytes : new Uint8Array(msg.bytes as ArrayBufferLike);
