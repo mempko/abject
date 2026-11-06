@@ -163,6 +163,11 @@ export class ScreencastSource {
     } catch { /* already detached */ }
   }
 
+  /** True once the push has been stopped, so a draining reader can stop too. */
+  get isStopped(): boolean {
+    return this.stopped;
+  }
+
   get stats(): { pushed: number; taken: number; superseded: number; pending: boolean } {
     return {
       pushed: this.pushed,

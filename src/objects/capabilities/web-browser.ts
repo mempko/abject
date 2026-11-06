@@ -33,6 +33,7 @@ import { randomUUID } from 'node:crypto';
 import * as jpeg from 'jpeg-js';
 import {
   decodePng,
+  decodePngFast,
   DEFAULT_FRAME_POLL_MS,
   DEFAULT_KEY_FRAME_INTERVAL_MS,
   ViewerFrameSession,
@@ -72,7 +73,10 @@ const VIEWER_VIEWPORT_GROW_RATIO = 1.15;
  */
 function decodePushedFrame(frame: PushedFrame): RgbaFrame {
   const isJpeg = frame.data[0] === 0xff && frame.data[1] === 0xd8;
-  return isJpeg ? decodeJpeg(frame.data) : decodePng(frame.data);
+  if (isJpeg) return decodeJpeg(frame.data);
+  // The word-at-a-time decoder is 2.4x faster on exactly the shape a screencast
+  // pushes; anything else falls back to the general decoder.
+  return decodePngFast(frame.data) ?? decodePng(frame.data);
 }
 
 /** JPEG frames arrive when a screencast host ignores the requested format. */
@@ -92,6 +96,28 @@ function framesEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+/** Bookkeeping for one page's encode pump. */
+interface ViewerVideoPump {
+  /** A cycle is in flight; a second one is never started. */
+  running: boolean;
+  /** The newest encoded reply waiting for the viewer's next poll. */
+  latest?: ViewerVideoReply;
+  /** The last sequence handed to the client, so nothing is delivered twice. */
+  deliveredSeq: number;
+  /** The client asked for a key frame; the next encode must be one. */
+  forceKey: boolean;
+  /** Resolves when the running cycle finishes. */
+  waiting?: Promise<void>;
+  /** The window size the picture is being encoded for. */
+  display?: { width: number; height: number };
+  /** The client's key-frame cadence, in ms. */
+  keyFrameIntervalMs?: number;
+  /** When the viewer last asked for pixels, so an abandoned page stops burning CPU. */
+  lastPollAt: number;
+  /** Set when the page is released, so the pump stops draining instead of spinning. */
+  stopped?: boolean;
 }
 
 const WEB_BROWSER_INTERFACE = 'abjects:web-browser';
@@ -1528,6 +1554,18 @@ export class WebBrowser extends Abject {
   /** How long a page's first poll waits for the renderer to push a frame. */
   static readonly SCREENCAST_FIRST_FRAME_WAIT_MS = 400;
 
+  /** How long the encode pump waits for a push before looking again, in ms. */
+  static readonly PUMP_IDLE_WAIT_MS = 250;
+
+  /** How long a page's pump keeps draining after the viewer's last poll, in ms. */
+  static readonly PUMP_IDLE_STOP_MS = 3000;
+
+  /** How long the first poll of a page waits for its first encoded picture, in ms. */
+  static readonly PUMP_FIRST_WAIT_MS = 2500;
+
+  /** How long a poll that asked for a key frame waits for it, in ms. */
+  static readonly PUMP_KEY_WAIT_MS = 600;
+
   private pages: Map<string, TrackedPage> = new Map();
 
   /**
@@ -1562,6 +1600,14 @@ export class WebBrowser extends Abject {
   private screencastRefused: Set<string> = new Set();
   /** The last pushed frame decoded, so an idle poll still has pixels to compare. */
   private lastPushedFrames: Map<string, RgbaFrame> = new Map();
+
+  /**
+   * Each page's encode pump: the decode and the VP8 encode run on their own
+   * clock and the viewer's poll answers with the newest picture already encoded.
+   * Without it a poll waited for the whole pipeline, so a 1.7 MP window cost
+   * ~89 ms of decode, scale, colour convert and encode per delivered frame.
+   */
+  private viewerVideoPumps: Map<string, ViewerVideoPump> = new Map();
 
   /**
    * The last display size each page was asked for, so a size has to hold for
@@ -3372,6 +3418,99 @@ export class WebBrowser extends Abject {
    * painted since. A frame that arrives while one is being encoded is
    * superseded — the viewer wants the present picture, not a backlog.
    */
+  /**
+   * Wait, briefly, for the pump to hand over a picture newer than `aboveSeq`.
+   *
+   * Only two polls ever wait: the first one of a page, and the one that asked
+   * for a key frame. Every other poll answers immediately with what the pump has
+   * already encoded, which is what keeps the viewer's draw loop off the encode's
+   * critical path.
+   */
+  private async waitForPumpSeq(
+    pump: ViewerVideoPump,
+    aboveSeq: number,
+    timeoutMs: number,
+  ): Promise<void> {
+    const until = Date.now() + timeoutMs;
+    while ((pump.latest?.seq ?? 0) <= aboveSeq && Date.now() < until) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+  }
+  /** One page's encode pump, created on first use. */
+  private viewerVideoPumpFor(pageId: string): ViewerVideoPump {
+    let pump = this.viewerVideoPumps.get(pageId);
+    if (!pump) {
+      pump = { running: false, deliveredSeq: 0, forceKey: false, lastPollAt: Date.now() };
+      this.viewerVideoPumps.set(pageId, pump);
+    }
+    return pump;
+  }
+
+  /**
+   * Drain whatever the renderer has pushed, encoding it on the pump's own
+   * clock rather than inside the viewer's poll.
+   *
+   * Single-flight and newest-wins: one encode runs at a time, and frames that
+   * arrive meanwhile wait in the source's one-slot buffer and supersede each
+   * other, so the picture delivered is the present one and its age is bounded by
+   * one encode instead of growing with a backlog.
+   */
+  private runViewerVideoPump(
+    pageId: string,
+    source: ScreencastSource,
+    pump: ViewerVideoPump,
+    seed?: PushedFrame,
+  ): void {
+    if (pump.running) return;
+    pump.running = true;
+    pump.waiting = (async () => {
+      try {
+        let next = seed ?? source.takeNewest()
+          ?? (pump.forceKey ? source.lastFrame() : undefined);
+        for (;;) {
+          if (pump.stopped || source.isStopped) break;
+          if (!next) {
+            // A forced key frame on a still page has to re-encode the pixels
+            // already held: waiting for a push that will not come would leave
+            // the client unable to recover.
+            next = pump.forceKey ? source.lastFrame() : undefined;
+          }
+          if (!next) {
+            // Nothing waiting: wait for the renderer rather than for the next
+            // poll, so one encode follows another with no gap. The wait is
+            // bounded and the loop ends once the viewer stops asking for pixels,
+            // so an abandoned page stops burning CPU.
+            if (Date.now() - pump.lastPollAt > WebBrowser.PUMP_IDLE_STOP_MS) break;
+            next = await source.waitForFrame(WebBrowser.PUMP_IDLE_WAIT_MS);
+            if (!next) continue;
+          }
+          const forceKey = pump.forceKey;
+          pump.forceKey = false;
+          const frame = decodePushedFrame(next);
+          this.lastPushedFrames.set(pageId, frame);
+          pump.latest = await this.nextViewerVideoFrame(pageId, frame, {
+            display: pump.display,
+            keyFrameIntervalMs: pump.keyFrameIntervalMs,
+            forceKey,
+          });
+          next = source.takeNewest() ?? (pump.forceKey ? source.lastFrame() : undefined);
+        }
+      } finally {
+        pump.running = false;
+      }
+    })();
+  }
+
+  /**
+   * The pixels for one video poll.
+   *
+   * The capture is pushed, not asked for: the page's first poll starts a
+   * screencast and the encode pump drains whatever the renderer has painted
+   * since. A poll answers with the newest picture already encoded and does not
+   * wait for a decode or an encode, so the viewer's draw loop runs at its own
+   * rate however large the window is. The first poll of a page and a forced key
+   * frame wait for the encode because there is nothing to show yet.
+   */
   private async nextViewerVideoReply(
     pageId: string,
     tracked: TrackedPage,
@@ -3381,47 +3520,62 @@ export class WebBrowser extends Abject {
     const source = await this.ensureScreencast(pageId, tracked);
     if (!source) return this.captureViewerVideoFrame(pageId, tracked, options);
 
-    const pushed = source.takeNewest();
-    if (pushed) {
-      const frame = decodePushedFrame(pushed);
-      this.lastPushedFrames.set(pageId, frame);
-      return this.nextViewerVideoFrame(pageId, frame, options);
-    }
+    const pump = this.viewerVideoPumpFor(pageId);
+    pump.lastPollAt = Date.now();
+    if (options?.display) pump.display = options.display;
+    if (options?.keyFrameIntervalMs !== undefined) pump.keyFrameIntervalMs = options.keyFrameIntervalMs;
+    const previousSeq = pump.latest?.seq ?? 0;
+    if (options?.forceKey) pump.forceKey = true;
 
-    const last = this.lastPushedFrames.get(pageId);
-    if (!last) {
+    if (!pump.latest && !pump.running && !source.stats.pending) {
       // The first poll has no frame yet: wait for the renderer's first push
       // instead of paying for a screenshot of pixels already in flight.
       const first = await source.waitForFrame(WebBrowser.SCREENCAST_FIRST_FRAME_WAIT_MS);
-      if (first) {
-        const frame = decodePushedFrame(first);
-        this.lastPushedFrames.set(pageId, frame);
-        return this.nextViewerVideoFrame(pageId, frame, options);
+      if (!first) {
+        // Accepted the command and pushed nothing: this host will not screencast.
+        this.stopScreencast(pageId);
+        this.screencastRefused.add(pageId);
+        log.info(`screencast pushed nothing for ${pageId}; capturing per poll instead`);
+        return this.captureViewerVideoFrame(pageId, tracked, options);
       }
-      // Accepted the command and pushed nothing: this host will not screencast.
-      this.stopScreencast(pageId);
-      this.screencastRefused.add(pageId);
-      log.info(`screencast pushed nothing for ${pageId}; capturing per poll instead`);
-      return this.captureViewerVideoFrame(pageId, tracked, options);
+      this.runViewerVideoPump(pageId, source, pump, first);
+    } else {
+      this.runViewerVideoPump(pageId, source, pump);
     }
 
-    if (options?.forceKey) {
-      // A key frame has to be encoded, and a still page pushes nothing: the
-      // last frame's pixels are this page's current pixels.
-      return this.nextViewerVideoFrame(pageId, last, options);
+    if (!pump.latest) {
+      // The very first picture of a page has nothing to hand over yet, so this
+      // one poll waits for it (bounded by one encode) instead of drawing an
+      // empty canvas.
+      await this.waitForPumpSeq(pump, 0, WebBrowser.PUMP_FIRST_WAIT_MS);
+    } else if (options?.forceKey) {
+      // The client is restarting its decoder and needs the key frame itself.
+      await this.waitForPumpSeq(pump, previousSeq, WebBrowser.PUMP_KEY_WAIT_MS);
     }
 
-    // Nothing arrived since the last poll, so the page has not painted. Report
-    // the stream as it stands without a decode, a scale or an encode.
-    const stream = this.viewerVideoStreams.get(pageId);
-    if (!stream) return this.nextViewerVideoFrame(pageId, last, options);
-    stream.unchangedTicks += 1;
-    return {
-      kind: 'unchanged', seq: stream.seq, key: false,
-      width: stream.width, height: stream.height,
-      sourceWidth: last.width, sourceHeight: last.height,
-      codec: VP8_CODEC, chunks: [],
-    };
+    const latest = pump.latest;
+    if (!latest) {
+      // Nothing has been encoded for this page yet, so there is no stream to
+      // report: an empty answer the viewer treats as no new picture.
+      return {
+        kind: 'unchanged', seq: 0, key: false, width: 0, height: 0,
+        sourceWidth: 0, sourceHeight: 0, codec: VP8_CODEC, chunks: [],
+      };
+    }
+    if (latest.seq <= pump.deliveredSeq) {
+      // The pump has not finished the next picture yet. The client already has
+      // this one; sending its packets again would only make it decode twice.
+      const stream = this.viewerVideoStreams.get(pageId);
+      if (stream) stream.unchangedTicks += 1;
+      return {
+        kind: 'unchanged', seq: latest.seq, key: false,
+        width: latest.width, height: latest.height,
+        sourceWidth: latest.sourceWidth, sourceHeight: latest.sourceHeight,
+        codec: VP8_CODEC, chunks: [],
+      };
+    }
+    pump.deliveredSeq = latest.seq;
+    return latest;
   }
 
   /**
@@ -3435,7 +3589,7 @@ export class WebBrowser extends Abject {
     options?: ViewerVideoPollOptions,
   ): Promise<ViewerVideoReply> {
     const buffer = await tracked.page.screenshot({ type: 'png', fullPage: false });
-    const frame = decodePng(buffer);
+    const frame = decodePngFast(buffer) ?? decodePng(buffer);
     this.lastPushedFrames.set(pageId, frame);
     return this.nextViewerVideoFrame(pageId, frame, options);
   }
@@ -3558,6 +3712,9 @@ export class WebBrowser extends Abject {
     this.lastPushedFrames.delete(pageId);
     this.pendingDisplaySizes.delete(pageId);
     this.layoutFixed.delete(pageId);
+    const pump = this.viewerVideoPumps.get(pageId);
+    if (pump) pump.stopped = true;
+    this.viewerVideoPumps.delete(pageId);
   }
 
   /** Stop every push — nothing may outlive the capability. */
@@ -3570,6 +3727,7 @@ export class WebBrowser extends Abject {
     this.screencastRefused.clear();
     this.pendingDisplaySizes.clear();
     this.layoutFixed.clear();
+    this.viewerVideoPumps.clear();
     for (const source of sources) await source.stop().catch(() => undefined);
   }
 
@@ -3636,7 +3794,7 @@ export class WebBrowser extends Abject {
     const now = Date.now();
     const dueForKey = stream.seq === 0 || options?.forceKey === true
       || sizeChanged || now - stream.lastKeyAt >= interval;
-    const chunks = await stream.encoder.encode(pixels);
+    const chunks = await stream.encoder.encode(pixels, { keyFrame: dueForKey });
     const isKey = chunks.some((c) => c.type === 'key');
     if (!isKey && dueForKey) {
       // The encoder last emitted a key frame long enough ago; the client can
