@@ -32,6 +32,20 @@ import type { ViewerVideoReply } from './video-encoder.js';
 
 const WEB_BROWSER_VIEWER_INTERFACE: InterfaceId = 'abjects:web-browser-viewer';
 
+/**
+ * How long to wait for the person to answer the close confirmation.
+ *
+ * WidgetManager keeps a dialog up — and its own wait on DialogBroker open — for
+ * ten minutes (its MODAL_STALL_MS), which is deliberately "a stall timer on the
+ * dialog, not a limit on how long the person takes". Asking it with `request`'s
+ * 30 s default made the viewer abandon the question while the dialog was still
+ * on screen: the person then clicked "Close page", DialogBroker answered a
+ * request nobody was waiting on any more, `catch { confirmed = false; }` turned
+ * the confirmation into a decline, and the page stayed open. Match the answering
+ * surface's willingness to wait instead.
+ */
+const CLOSE_CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
+
 /** The rectangle on the canvas a page frame is fitted into (letterboxed). */
 export interface ViewerFitRect {
   drawX: number;
@@ -877,7 +891,8 @@ export class WebBrowserViewer extends Abject {
           confirmLabel: 'Close page',
           cancelLabel: 'Cancel',
           destructive: true,
-        })
+        }),
+        CLOSE_CONFIRM_TIMEOUT_MS,
       );
     } catch { confirmed = false; }
     if (!confirmed) return;
