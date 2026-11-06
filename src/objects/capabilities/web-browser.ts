@@ -30,6 +30,7 @@ import { isOwnDesktopUrl } from '../../network/origin-policy.js';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import * as jpeg from 'jpeg-js';
 import {
   decodePng,
   DEFAULT_FRAME_POLL_MS,
@@ -46,12 +47,33 @@ import {
   type ViewerVideoReply,
   type ViewerVideoStreamState,
 } from '../video-encoder.js';
+import { ScreencastSource, type PushedFrame, type ScreencastCdp } from '../screencast-source.js';
 
 const log = new Log('WebBrowser');
 
 /** Cap on the encoded picture's size: what the viewer can actually display. */
 const VIEWER_VIDEO_MAX_WIDTH = 960;
 const VIEWER_VIDEO_MAX_HEIGHT = 540;
+
+/**
+ * Decode a frame the renderer pushed, by the frame's own magic rather than by
+ * the format that was asked for: hosts differ in what they honour, and a PNG
+ * decoder handed a JPEG throws instead of guessing.
+ */
+function decodePushedFrame(frame: PushedFrame): RgbaFrame {
+  const isJpeg = frame.data[0] === 0xff && frame.data[1] === 0xd8;
+  return isJpeg ? decodeJpeg(frame.data) : decodePng(frame.data);
+}
+
+/** JPEG frames arrive when a screencast host ignores the requested format. */
+function decodeJpeg(bytes: Uint8Array): RgbaFrame {
+  const raw = jpeg.decode(Buffer.from(bytes), { useTArray: true, maxMemoryUsageInMB: 256 });
+  return {
+    width: raw.width,
+    height: raw.height,
+    data: new Uint8ClampedArray(raw.data.buffer, raw.data.byteOffset, raw.data.byteLength),
+  };
+}
 
 /** Byte equality, so a page that did not change costs no encode at all. */
 function framesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -139,6 +161,7 @@ type PlaywrightPage = {
   };
   setContent: (html: string) => Promise<void>;
   setViewportSize: (size: { width: number; height: number }) => Promise<void>;
+  context: () => BrowserContextLike;
   on: (event: string, fn: () => void) => void;
   frames: () => PlaywrightFrame[];
   mainFrame: () => PlaywrightFrame;
@@ -146,6 +169,11 @@ type PlaywrightPage = {
   _snapshotForAI: (opts: { track: string }) => Promise<{ full: string; incremental?: string }>;
   // Locator-based interaction
   locator: (selector: string) => PlaywrightLocator;
+};
+
+/** The slice of a Playwright BrowserContext the screencast capture needs. */
+type BrowserContextLike = {
+  newCDPSession?: (page: PlaywrightPage) => Promise<ScreencastCdp>;
 };
 
 type PlaywrightFrame = {
@@ -1145,7 +1173,7 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
   },
   {
     name: 'viewerVideoFrame',
-    description: 'One poll of the live view as a VP8 video stream. Returns { kind: \'unchanged\' } when the freshly captured pixels are identical to the frame last encoded — nothing crosses the bus — or { kind: \'video\' } with the VP8 packets that continue the stream (key frames restart it, deltas continue it) for the client to decode with WebCodecs. Poll it no faster than the configured cadence and only while the view is visible. No ownership check — read-only viewer method.',
+    description: 'One poll of the live view as a VP8 video stream. The pixels are pushed, not captured per poll: the first poll starts a Page.startScreencast and each later poll drains the newest frame the renderer painted since, dropping any that arrive mid-encode. Returns { kind: \'unchanged\' } when nothing was painted and the pixels match the frame last encoded — nothing crosses the bus — or { kind: \'video\' } with the VP8 packets that continue the stream (key frames restart it, deltas continue it) for the client to decode with WebCodecs. Poll it no faster than the configured cadence and only while the view is visible. No ownership check — read-only viewer method.',
     parameters: [
       { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle' },
       {
@@ -1480,6 +1508,9 @@ export class WebBrowser extends Abject {
    *  and a headful browser can coexist. */
   private ephemeralBrowsers: Map<string, unknown> = new Map();
   private chromium: unknown = null;
+  /** How long a page's first poll waits for the renderer to push a frame. */
+  static readonly SCREENCAST_FIRST_FRAME_WAIT_MS = 400;
+
   private pages: Map<string, TrackedPage> = new Map();
 
   /**
@@ -1499,6 +1530,22 @@ export class WebBrowser extends Abject {
    * page sends nothing) and the counters the viewer reports.
    */
   private viewerVideoStreams: Map<string, ViewerVideoStreamState> = new Map();
+
+  /**
+   * The codec transport's capture, per page: the renderer pushes frames over a
+   * CDP session and the poll drains the newest one, instead of every poll
+   * asking for a screenshot (which cost 57 ms of the 88 ms cycle).
+   */
+  private screencastSources: Map<string, ScreencastSource> = new Map();
+  /** A screencast being opened, so two polls do not open two CDP sessions. */
+  private screencastOpening: Map<string, Promise<ScreencastSource | undefined>> = new Map();
+  /** The CDP session per page, shared by the push and the fallback capture. */
+  private captureSessions: Map<string, ScreencastCdp> = new Map();
+  /** Pages whose host refused the screencast: capture stays per-call for them. */
+  private screencastRefused: Set<string> = new Set();
+  /** The last pushed frame decoded, so an idle poll still has pixels to compare. */
+  private lastPushedFrames: Map<string, RgbaFrame> = new Map();
+
   private pageCounter = 0;
 
   /** Cached persistent contexts keyed by `{workspaceId}/{profileName}`. */
@@ -2506,11 +2553,12 @@ export class WebBrowser extends Abject {
 
     // -- viewerVideoFrame: no ownership check — the codec transport --
     //
-    // One poll of the live view as video. The capture is encoded to VP8 here,
-    // next to the pixels: a still page sends nothing at all, a moving page
-    // sends one small inter frame per poll, and the browser decodes the
-    // stream with WebCodecs. This replaces the PNG patch/key-frame transport,
-    // whose asynchronous reassembly of rectangles is what flickered.
+    // One poll of the live view as video. The pixels are not captured here:
+    // the page's first poll starts a screencast, after which the renderer
+    // pushes frames as it paints and this drains the newest one. The frame is
+    // encoded to VP8 next to the pixels: a still page sends nothing at all, a
+    // moving page sends one small inter frame per poll, and the browser
+    // decodes the stream with WebCodecs.
     this.on('viewerVideoFrame', (msg: AbjectMessage) => {
       const { pageId, options } = msg.payload as {
         pageId: string;
@@ -2523,9 +2571,8 @@ export class WebBrowser extends Abject {
         this.send(error(msg, 'BROWSER_ERROR', `Unknown page handle: ${pageId}`));
         return DEFERRED_REPLY;
       }
-      tracked.page.screenshot({ type: 'png', fullPage: false })
-        .then(async (buffer: Buffer) => {
-          const reply = await this.nextViewerVideoFrame(pageId, decodePng(buffer), options);
+      this.nextViewerVideoReply(pageId, tracked, options)
+        .then(async (reply) => {
           const url = tracked.page.url();
           const title = await this.safeTitle(tracked.page, url);
           this.sendDeferredReply(msg, { ...reply, url, title });
@@ -2927,6 +2974,9 @@ export class WebBrowser extends Abject {
     // Its reference frame goes with it: a new page with the same handle must
     // not be diffed against the old page's pixels.
     this.viewerSessions.delete(pageId);
+    // The screencast goes too: a closed page has nothing to push, and a live
+    // one must not keep a CDP session open on its behalf.
+    this.stopScreencast(pageId);
     if (tracked.profileKey) {
       const ctx = this.profileContexts.get(tracked.profileKey);
       if (ctx && ctx.openPages > 0) ctx.openPages--;
@@ -3280,6 +3330,166 @@ export class WebBrowser extends Abject {
    * first frame, a size change, a forced request or an elapsed key-frame
    * interval sends a whole frame.
    */
+  /**
+   * The pixels for one video poll.
+   *
+   * The capture is pushed, not asked for: the page's first poll starts a
+   * screencast and every poll after that drains whatever the renderer has
+   * painted since. A frame that arrives while one is being encoded is
+   * superseded — the viewer wants the present picture, not a backlog.
+   */
+  private async nextViewerVideoReply(
+    pageId: string,
+    tracked: TrackedPage,
+    options?: { forceKey?: boolean; keyFrameIntervalMs?: number },
+  ): Promise<ViewerVideoReply> {
+    const source = await this.ensureScreencast(pageId, tracked);
+    if (!source) return this.captureViewerVideoFrame(pageId, tracked, options);
+
+    const pushed = source.takeNewest();
+    if (pushed) {
+      const frame = decodePushedFrame(pushed);
+      this.lastPushedFrames.set(pageId, frame);
+      return this.nextViewerVideoFrame(pageId, frame, options);
+    }
+
+    const last = this.lastPushedFrames.get(pageId);
+    if (!last) {
+      // The first poll has no frame yet: wait for the renderer's first push
+      // instead of paying for a screenshot of pixels already in flight.
+      const first = await source.waitForFrame(WebBrowser.SCREENCAST_FIRST_FRAME_WAIT_MS);
+      if (first) {
+        const frame = decodePushedFrame(first);
+        this.lastPushedFrames.set(pageId, frame);
+        return this.nextViewerVideoFrame(pageId, frame, options);
+      }
+      // Accepted the command and pushed nothing: this host will not screencast.
+      this.stopScreencast(pageId);
+      this.screencastRefused.add(pageId);
+      log.info(`screencast pushed nothing for ${pageId}; capturing per poll instead`);
+      return this.captureViewerVideoFrame(pageId, tracked, options);
+    }
+
+    if (options?.forceKey) {
+      // A key frame has to be encoded, and a still page pushes nothing: the
+      // last frame's pixels are this page's current pixels.
+      return this.nextViewerVideoFrame(pageId, last, options);
+    }
+
+    // Nothing arrived since the last poll, so the page has not painted. Report
+    // the stream as it stands without a decode, a scale or an encode.
+    const stream = this.viewerVideoStreams.get(pageId);
+    if (!stream) return this.nextViewerVideoFrame(pageId, last, options);
+    stream.unchangedTicks += 1;
+    return {
+      kind: 'unchanged', seq: stream.seq, key: false,
+      width: stream.width, height: stream.height,
+      sourceWidth: last.width, sourceHeight: last.height,
+      codec: VP8_CODEC, chunks: [],
+    };
+  }
+
+  /**
+   * Capture one screenshot for this poll. The path every page took before the
+   * screencast, kept for hosts with no CDP session and for a host that accepts
+   * `Page.startScreencast` but never pushes a frame.
+   */
+  private async captureViewerVideoFrame(
+    pageId: string,
+    tracked: TrackedPage,
+    options?: { forceKey?: boolean; keyFrameIntervalMs?: number },
+  ): Promise<ViewerVideoReply> {
+    const buffer = await tracked.page.screenshot({ type: 'png', fullPage: false });
+    const frame = decodePng(buffer);
+    this.lastPushedFrames.set(pageId, frame);
+    return this.nextViewerVideoFrame(pageId, frame, options);
+  }
+
+  /** The CDP session a page's screencast rides on, opened once per page. */
+  private async cdpForPage(pageId: string, tracked: TrackedPage): Promise<ScreencastCdp | undefined> {
+    const known = this.captureSessions.get(pageId);
+    if (known) return known;
+    if (typeof tracked.page.context !== 'function') return undefined;
+    const context = tracked.page.context();
+    if (typeof context?.newCDPSession !== 'function') return undefined;
+    const session = await context.newCDPSession(tracked.page);
+    this.captureSessions.set(pageId, session);
+    return session;
+  }
+
+  /**
+   * This page's frame source, starting the push on first use. Returns undefined
+   * when the host cannot screencast, and the caller captures per poll instead.
+   */
+  private async ensureScreencast(
+    pageId: string,
+    tracked: TrackedPage,
+  ): Promise<ScreencastSource | undefined> {
+    if (this.screencastRefused.has(pageId)) return undefined;
+    const running = this.screencastSources.get(pageId);
+    if (running) return running;
+    const opening = this.screencastOpening.get(pageId);
+    if (opening) return opening;
+    const started = this.openScreencast(pageId, tracked);
+    this.screencastOpening.set(pageId, started);
+    try {
+      return await started;
+    } finally {
+      this.screencastOpening.delete(pageId);
+    }
+  }
+
+  private async openScreencast(
+    pageId: string,
+    tracked: TrackedPage,
+  ): Promise<ScreencastSource | undefined> {
+    try {
+      const cdp = await this.cdpForPage(pageId, tracked);
+      if (!cdp) {
+        this.screencastRefused.add(pageId);
+        log.info(`no CDP session for ${pageId}; capturing per poll`);
+        return undefined;
+      }
+      // PNG at the page's own pixel size: the viewer maps pointer coordinates
+      // through sourceWidth/sourceHeight, so the capture must not be rescaled
+      // here — the codec's 960x540 stage does that downstream.
+      const source = new ScreencastSource(cdp, { format: 'png', everyNthFrame: 1 });
+      await source.start();
+      this.screencastSources.set(pageId, source);
+      log.info(`screencast started (${pageId})`);
+      return source;
+    } catch (err) {
+      this.screencastRefused.add(pageId);
+      this.captureSessions.delete(pageId);
+      log.info(`screencast refused for ${pageId}; capturing per poll instead: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
+  /** Stop one page's push and forget everything held for it. */
+  private stopScreencast(pageId: string): void {
+    const source = this.screencastSources.get(pageId);
+    if (source) {
+      this.screencastSources.delete(pageId);
+      void source.stop().catch(() => undefined);
+    }
+    this.screencastOpening.delete(pageId);
+    this.captureSessions.delete(pageId);
+    this.screencastRefused.delete(pageId);
+    this.lastPushedFrames.delete(pageId);
+  }
+
+  /** Stop every push — nothing may outlive the capability. */
+  private async stopAllScreencasts(): Promise<void> {
+    const sources = [...this.screencastSources.values()];
+    this.screencastSources.clear();
+    this.screencastOpening.clear();
+    this.captureSessions.clear();
+    this.lastPushedFrames.clear();
+    this.screencastRefused.clear();
+    for (const source of sources) await source.stop().catch(() => undefined);
+  }
+
   /**
    * Encode one captured frame for the codec transport.
    *
@@ -3831,6 +4041,7 @@ export class WebBrowser extends Abject {
 
   protected override async onStop(): Promise<void> {
     await this.closeAllTrackedPages();
+    await this.stopAllScreencasts();
     for (const [, browser] of this.ephemeralBrowsers) {
       try {
         await (browser as { close: () => Promise<void> }).close();

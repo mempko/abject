@@ -191,8 +191,12 @@ instance.
   `press`, `check`, `waitForSelector`, `getContent`, `getAriaSnapshot`,
   `refAction`, `evaluate`, pointer input `clickAt` / `hoverAt` / `drag` /
   `scroll` / `typeText`, `closePage`, `closeAllPages`, `listPages`); viewer
-  methods for WebBrowserViewer (`viewerScreenshot`, `viewerNavigate`,
-  `viewerInput`); named persistent login profiles per workspace
+  methods for WebBrowserViewer (`viewerVideoFrame`, `viewerNavigate`,
+  `viewerInput`). A viewer page's pixels come from `Page.startScreencast`
+  (`src/objects/screencast-source.ts`): the renderer pushes frames and each
+  poll drains the newest one, so no screenshot is taken per tick; a page whose
+  host has no CDP session, or refuses the command, keeps the per-poll
+  screenshot (`captureViewerVideoFrame`). Named persistent login profiles per workspace
   (`listProfiles`, `deleteProfile`). Pages belong to the object that opened
   them and close when it unregisters. As a plain Node server it launches its
   own Chromium; inside the desktop app it attaches over CDP to Electron's
