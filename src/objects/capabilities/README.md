@@ -196,7 +196,14 @@ instance.
   (`src/objects/screencast-source.ts`): the renderer pushes frames and each
   poll drains the newest one, so no screenshot is taken per tick; a page whose
   host has no CDP session, or refuses the command, keeps the per-poll
-  screenshot (`captureViewerVideoFrame`). Named persistent login profiles per workspace
+  screenshot (`captureViewerVideoFrame`). The picture follows the viewer
+  window in both directions: the page is laid out again at the window's size
+  (so text keeps its pixels at any size), and both the relayout and the encode
+  size wait for the window to hold still for `VIEWER_RESIZE_SETTLE_MS`, because
+  each relayout and each encoder restart is work a drag would throw away. A
+  window that comes to rest on a page that is not painting is answered with
+  one screenshot (`needsCapture`), since a still page pushes no frame to carry
+  the new size. Named persistent login profiles per workspace
   (`listProfiles`, `deleteProfile`). Pages belong to the object that opened
   them and close when it unregisters. As a plain Node server it launches its
   own Chromium; inside the desktop app it attaches over CDP to Electron's

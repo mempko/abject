@@ -60,11 +60,27 @@ import { ScreencastSource, type PushedFrame, type ScreencastCdp } from '../scree
 const log = new Log('WebBrowser');
 
 /**
- * How much larger than the page's layout the viewer's window must be before the
- * page is laid out again to match. A pin-prick more is not worth a reflow of a
- * page the person did not touch; a genuinely bigger window is worth the pixels.
+ * How far the viewer's window may differ from a page's layout before the page is
+ * laid out again to match, in pixels. A drag that lands a pixel or two off is
+ * not worth a reflow of a page the person did not touch; a resize the person
+ * meant is followed in both directions, so the picture keeps matching the
+ * window wherever it comes to rest.
  */
-const VIEWER_VIEWPORT_GROW_RATIO = 1.15;
+const VIEWER_VIEWPORT_SETTLE_PX = 2;
+
+/**
+ * How long a window's new size must hold before the picture follows it, in ms.
+ *
+ * A drag reports a new size every few dozen milliseconds, and following it is
+ * not free: the page is laid out again (a CDP round trip, a full repaint) and
+ * the VP8 stream restarts (a new encoder, one key frame at the new dimensions).
+ * Measured on a live window, a size arriving every 200 ms collapsed delivery to
+ * 4.8 fps, against 15-20 fps at rest. So the size is followed once it has
+ * stopped moving — comfortably longer than the 200 ms of a fast drag, and about
+ * a third of a second of lag on the size the person actually stops at, against
+ * the tens of seconds it used to be.
+ */
+const VIEWER_RESIZE_SETTLE_MS = 250;
 
 /**
  * Decode a frame the renderer pushed, by the frame's own magic rather than by
@@ -104,14 +120,25 @@ interface ViewerVideoPump {
   running: boolean;
   /** The newest encoded reply waiting for the viewer's next poll. */
   latest?: ViewerVideoReply;
-  /** The last sequence handed to the client, so nothing is delivered twice. */
-  deliveredSeq: number;
+  /** The last reply handed to the client, so nothing is delivered twice. */
+  delivered?: ViewerVideoReply;
   /** The client asked for a key frame; the next encode must be one. */
   forceKey: boolean;
   /** Resolves when the running cycle finishes. */
   waiting?: Promise<void>;
   /** The window size the picture is being encoded for. */
   display?: { width: number; height: number };
+  /** The size the window last asked for, held until it stops changing. */
+  requestedDisplay?: { width: number; height: number };
+  /** When that size was first asked for, so a drag can be told from a resize. */
+  requestedAt?: number;
+  /**
+   * A size the picture must be re-encoded for with nothing pushed to encode.
+   *
+   * The pump otherwise only encodes what the renderer paints, so a still page
+   * would leave a new window size unanswered for as long as it stays still.
+   */
+  needsCapture?: boolean;
   /** The client's key-frame cadence, in ms. */
   keyFrameIntervalMs?: number;
   /** When the viewer last asked for pixels, so an abandoned page stops burning CPU. */
@@ -1614,7 +1641,7 @@ export class WebBrowser extends Abject {
    * two polls before the page is laid out again: dragging a window edge
    * reports a new size every poll, and reflowing that often is not a resize.
    */
-  private pendingDisplaySizes: Map<string, { width: number; height: number }> = new Map();
+  private pendingDisplaySizes: Map<string, { width: number; height: number; at: number }> = new Map();
 
   /** Pages that refused a layout change; their own layout is used instead. */
   private layoutFixed: Set<string> = new Set();
@@ -3437,10 +3464,57 @@ export class WebBrowser extends Abject {
     }
   }
   /** One page's encode pump, created on first use. */
+  /**
+   * Follow the window's size with the encode only once it has held.
+   *
+   * A window being dragged reports a new size on every poll, and a new encode
+   * size restarts the VP8 stream (a fresh encoder, a key frame, the same pixels
+   * re-sent), so re-targeting on every poll would leave the picture frozen for
+   * the length of the drag. The first size a page is shown at is adopted at
+   * once; every later one must be asked for twice before the encode follows it,
+   * so the picture keeps moving at its current size through the drag and lands
+   * on the size the window came to rest at.
+   */
+  /**
+   * The clock the resize settle rules are timed against.
+   *
+   * A drag must not reflow the page or restart the encoder on every poll, so
+   * those decisions are timed; a test holds a dragged size still without
+   * sleeping.
+   */
+  private resizeClock(): number {
+    return Date.now();
+  }
+
+  private settlePumpDisplay(pump: ViewerVideoPump, display: { width: number; height: number }): boolean {
+    const width = Math.round(display.width);
+    const height = Math.round(display.height);
+    if (!(width > 0) || !(height > 0)) return false;
+    const encoding = pump.display;
+    if (!encoding) {
+      pump.display = { width, height };
+      pump.requestedDisplay = { width, height };
+      pump.requestedAt = this.resizeClock();
+      return false;
+    }
+    if (Math.abs(encoding.width - width) <= VIEWER_VIEWPORT_SETTLE_PX
+      && Math.abs(encoding.height - height) <= VIEWER_VIEWPORT_SETTLE_PX) return false;
+    const requested = pump.requestedDisplay;
+    if (!requested || requested.width !== width || requested.height !== height) {
+      pump.requestedDisplay = { width, height };
+      pump.requestedAt = this.resizeClock();
+      return false;
+    }
+    if (this.resizeClock() - (pump.requestedAt ?? 0) < VIEWER_RESIZE_SETTLE_MS) return false;
+    pump.display = { width, height };
+    pump.requestedAt = this.resizeClock();
+    return true;
+  }
+
   private viewerVideoPumpFor(pageId: string): ViewerVideoPump {
     let pump = this.viewerVideoPumps.get(pageId);
     if (!pump) {
-      pump = { running: false, deliveredSeq: 0, forceKey: false, lastPollAt: Date.now() };
+      pump = { running: false, forceKey: false, lastPollAt: Date.now() };
       this.viewerVideoPumps.set(pageId, pump);
     }
     return pump;
@@ -3474,6 +3548,25 @@ export class WebBrowser extends Abject {
             // already held: waiting for a push that will not come would leave
             // the client unable to recover.
             next = pump.forceKey ? source.lastFrame() : undefined;
+          }
+          if (!next && pump.needsCapture) {
+            // The window came to rest at a new size and the renderer has nothing
+            // of its own to send: a page that is not painting may stay still for
+            // minutes, and the picture would keep the old size for all of it.
+            // One screenshot buys the new size now; it is paid once per settled
+            // size, not once per poll, and its pixels are the page's own layout
+            // as of the resize. A page mid-navigation falls through to the next
+            // push instead.
+            pump.needsCapture = false;
+            const tracked = this.pages.get(pageId);
+            if (tracked) {
+              try {
+                const buffer = await tracked.page.screenshot({ type: 'png', fullPage: false });
+                next = { data: buffer, format: 'png', capturedAt: Date.now() };
+              } catch {
+                // Nothing to encode yet; the next push carries the new size.
+              }
+            }
           }
           if (!next) {
             // Nothing waiting: wait for the renderer rather than for the next
@@ -3522,7 +3615,14 @@ export class WebBrowser extends Abject {
 
     const pump = this.viewerVideoPumpFor(pageId);
     pump.lastPollAt = Date.now();
-    if (options?.display) pump.display = options.display;
+    const retargeted = options?.display ? this.settlePumpDisplay(pump, options.display) : false;
+    if (retargeted) {
+      // The picture has a new size to be encoded at and no pushed frame to carry
+      // it: have the pump take one, and wake it now rather than let it sit out
+      // its idle wait.
+      pump.needsCapture = true;
+      source.nudge();
+    }
     if (options?.keyFrameIntervalMs !== undefined) pump.keyFrameIntervalMs = options.keyFrameIntervalMs;
     const previousSeq = pump.latest?.seq ?? 0;
     if (options?.forceKey) pump.forceKey = true;
@@ -3562,7 +3662,7 @@ export class WebBrowser extends Abject {
         sourceWidth: 0, sourceHeight: 0, codec: VP8_CODEC, chunks: [],
       };
     }
-    if (latest.seq <= pump.deliveredSeq) {
+    if (pump.delivered === latest) {
       // The pump has not finished the next picture yet. The client already has
       // this one; sending its packets again would only make it decode twice.
       const stream = this.viewerVideoStreams.get(pageId);
@@ -3574,7 +3674,7 @@ export class WebBrowser extends Abject {
         codec: VP8_CODEC, chunks: [],
       };
     }
-    pump.deliveredSeq = latest.seq;
+    pump.delivered = latest;
     return latest;
   }
 
@@ -3659,12 +3759,14 @@ export class WebBrowser extends Abject {
    * Give the page the viewer window's own size, so a large window is captured
    * with enough pixels to fill it rather than upscaling a small capture.
    *
-   * Only ever grows a page's layout. A window smaller than the layout is served
-   * by a downscaled picture, which stays sharp, while shrinking the layout
-   * would reflow a page the person did not resize. The requested size must hold
-   * for two polls before it is applied, because a window being dragged reports
-   * a new size on every frame. A page that refuses is not asked again: its own
-   * layout is used and the picture is encoded from what it has.
+   * Follows the window in both directions: a larger window is captured with
+   * more pixels instead of an upscaled picture, and a smaller one is laid out
+   * again so the picture keeps matching the window instead of staying a
+   * downscale of a layout the person no longer has. The requested size must
+   * hold still for VIEWER_RESIZE_SETTLE_MS before it is applied, because a
+   * window being dragged reports a new size on every frame and each relayout is
+   * a full repaint the drag would throw away. A page that refuses is not asked
+   * again: its own layout is used and the picture is encoded from what it has.
    */
   private async followDisplaySize(
     pageId: string,
@@ -3679,14 +3781,17 @@ export class WebBrowser extends Abject {
     const width = Math.min(MAX_VIDEO_WIDTH, Math.ceil(display.width));
     const height = Math.min(MAX_VIDEO_HEIGHT, Math.ceil(display.height));
     const previous = this.pendingDisplaySizes.get(pageId);
-    this.pendingDisplaySizes.set(pageId, { width, height });
-    if (!previous || previous.width !== width || previous.height !== height) return;
+    if (!previous || previous.width !== width || previous.height !== height) {
+      this.pendingDisplaySizes.set(pageId, { width, height, at: this.resizeClock() });
+      return;
+    }
+    if (this.resizeClock() - previous.at < VIEWER_RESIZE_SETTLE_MS) return;
 
     const current = this.safeViewportSize(tracked.page);
     if (!(current.width > 0) || !(current.height > 0)) return;
-    const grows = width > current.width * VIEWER_VIEWPORT_GROW_RATIO
-      || height > current.height * VIEWER_VIEWPORT_GROW_RATIO;
-    if (!grows) return;
+    const differs = Math.abs(width - current.width) > VIEWER_VIEWPORT_SETTLE_PX
+      || Math.abs(height - current.height) > VIEWER_VIEWPORT_SETTLE_PX;
+    if (!differs) return;
 
     try {
       await tracked.page.setViewportSize({ width, height });
@@ -3764,6 +3869,10 @@ export class WebBrowser extends Abject {
     let stream = this.viewerVideoStreams.get(pageId);
     const sizeChanged = !!stream && (stream.width !== fitted.width || stream.height !== fitted.height);
     if (!stream || sizeChanged) {
+      // The sequence keeps climbing across a restart: the client is owed the
+      // next picture, and a counter that fell back to the top would look like a
+      // picture it already holds.
+      const carriedSeq = stream?.seq ?? 0;
       if (stream) await stream.encoder.close().catch(() => undefined);
       stream = {
         encoder: await Vp8Encoder.create({
@@ -3772,7 +3881,7 @@ export class WebBrowser extends Abject {
         }),
         width: fitted.width,
         height: fitted.height,
-        seq: 0,
+        seq: carriedSeq,
         lastKeyAt: 0,
         lastFrame: new Uint8Array(0),
         keyFrames: 0,

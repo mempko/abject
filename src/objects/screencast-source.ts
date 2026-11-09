@@ -64,6 +64,9 @@ export class ScreencastSource {
   private superseded = 0;
   private waiters: Set<() => void> = new Set();
 
+  /** True while nudge() is releasing waiters, so they resolve empty. */
+  private nudged = false;
+
   constructor(
     private readonly cdp: ScreencastCdp,
     private readonly options: ScreencastOptions = {},
@@ -124,7 +127,7 @@ export class ScreencastSource {
       const wake = (): void => {
         if (settled) return;
         const taken = this.stopped ? undefined : this.takeNewest();
-        if (!taken && !this.stopped) return;
+        if (!taken && !this.stopped && !this.nudged) return;
         settled = true;
         clearTimeout(timer);
         this.waiters.delete(wake);
@@ -143,6 +146,25 @@ export class ScreencastSource {
   /** Wake whoever waits on the next frame; called for each arriving frame. */
   private wakeWaiters(): void {
     for (const waiter of [...this.waiters]) waiter();
+  }
+
+  /**
+   * Wake a reader waiting for the next frame without a frame having arrived.
+   *
+   * A push is not the only thing that gives a reader work: a window that has
+   * come to rest needs a picture at its new size, and a page that is not
+   * painting may send nothing for minutes. The nudged reader takes whatever is
+   * waiting, or nothing, and decides for itself; the frame slot is untouched, so
+   * a nudge cannot swallow a frame that is already there.
+   */
+  nudge(): void {
+    if (this.waiters.size === 0) return;
+    this.nudged = true;
+    try {
+      for (const waiter of [...this.waiters]) waiter();
+    } finally {
+      this.nudged = false;
+    }
   }
 
   /** Stop the push and let the CDP session go. Safe to call more than once. */

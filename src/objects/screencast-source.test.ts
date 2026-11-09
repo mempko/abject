@@ -153,3 +153,29 @@ test('start cannot be called twice on one source', async () => {
   const { source } = await started();
   await assert.rejects(() => source.start(), /twice/);
 });
+
+test('a nudge releases a reader waiting on a frame that never comes', async () => {
+  const { source } = await started();
+  const waiting = source.waitForFrame(5_000);
+  source.nudge();
+  assert.equal(await waiting, undefined, 'the reader was left waiting out its timeout');
+});
+
+test('a nudge never swallows a frame that is already waiting', async () => {
+  const { cdp, source } = await started();
+  cdp.push(FRAME_A, 1);
+  await settle();
+  source.nudge();
+  assert.equal(source.takeNewest()?.data.toString(), 'frame-a-bytes');
+});
+
+test('a read after a nudge still takes the next pushed frame', async () => {
+  const { cdp, source } = await started();
+  const waiting = source.waitForFrame(5_000);
+  source.nudge();
+  assert.equal(await waiting, undefined);
+
+  cdp.push(FRAME_B, 2);
+  await settle();
+  assert.equal(source.takeNewest()?.data.toString(), 'frame-b-longer');
+});
