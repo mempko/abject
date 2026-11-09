@@ -276,11 +276,30 @@ export class Vp8Encoder {
       },
       // Realtime/speed-first: the viewer wants the newest picture, not the
       // smallest file. lag-in-frames 0 means a pushed frame is a packet now.
+      //
+      // static-thresh: let libvpx reuse the previous frame's pixels for any
+      // 4x4 block that changed less than this many SAD units, instead of
+      // re-coding it. On a real page most of the picture is still, so this is
+      // the one knob that actually moves the encode cost. Measured through
+      // this class (fit -> create -> encode, so the RGBA->YUV420p conversion
+      // is included) over 24 captured thetix.ai frames at 1692x1080, the
+      // delta-frame encode goes from 37-53 ms mean (p95 47-59) to 22-25 ms
+      // (p95 25-27), and 28,561 -> 24,429 bytes, for -1.4 dB decoded luma
+      // PSNR (54.9 -> 53.5): roughly half the encode cost. Those ranges are
+      // the real run-to-run spread on a shared machine, measured the same way
+      // on both sides. 1000 was measured too and cost another 1.6 dB (51.9)
+      // for no reliable time saving, so 500 is the value that keeps the
+      // picture. Key frames
+      // are intra-coded and unaffected; the viewer forces one every 2000 ms,
+      // which bounds how stale a held block can get. This changes the
+      // bitstream inside the packets, not their shape: same codec, same
+      // key/delta chunks, same timestamps, same client decode path.
       options: {
         deadline: 'realtime',
         'cpu-used': '8',
         'lag-in-frames': '0',
         'error-resilient': '1',
+        'static-thresh': '500',
       },
     });
     return new Vp8Encoder(libav, codecCtx, framePtr, packetPtr, width, height, fps);
