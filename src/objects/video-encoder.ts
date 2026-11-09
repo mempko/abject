@@ -45,6 +45,13 @@ export interface Vp8EncoderOptions {
   height: number;
   /** Target bitrate in bits per second (default 2 Mbps for a 720p page). */
   bitrate?: number;
+  /**
+   * libvpx static-thresh: how much a 4x4 block must change (SAD units) before
+   * it is re-coded instead of reusing the previous frame's pixels. Higher is
+   * cheaper and, on nearly-still content, blurrier. Default 500 (see the
+   * measurements in create()).
+   */
+  staticThresh?: number;
   /** Frames per second the timestamps advance by (default 30). */
   fps?: number;
   /** Frames between key frames (default 60: a fresh start every ~2s). */
@@ -257,7 +264,7 @@ export class Vp8Encoder {
   ) {}
 
   static async create(options: Vp8EncoderOptions): Promise<Vp8Encoder> {
-    const { width, height, bitrate = 2_000_000, fps = 30, gopSize = 60 } = options;
+    const { width, height, bitrate = 2_000_000, fps = 30, gopSize = 60, staticThresh = 500 } = options;
     requirePositive(width, 'Vp8Encoder needs a positive width');
     requirePositive(height, 'Vp8Encoder needs a positive height');
     requirePositive(fps, 'Vp8Encoder needs a positive fps');
@@ -289,7 +296,18 @@ export class Vp8Encoder {
       // the real run-to-run spread on a shared machine, measured the same way
       // on both sides. 1000 was measured too and cost another 1.6 dB (51.9)
       // for no reliable time saving, so 500 is the value that keeps the
-      // picture. Key frames
+      // picture.
+      //
+      // That cost is a nearly-still-page cost. Over a full-page scroll, where
+      // almost every block moves past the threshold anyway, 0 / 250 / 500 /
+      // 1000 are indistinguishable in quality: 29.51 / 29.58 / 29.58 / 29.58
+      // dB mean delta-frame luma PSNR over 24 real scroll frames at 1280x720
+      // and videoBitrateFor(1280,720), decoded back through libvpx. What does
+      // move the picture there is the bitrate alone: doubling it to 7.37 Mbps
+      // gives 32.72 dB and halves the badly-wrong luma samples (8.31% ->
+      // 4.50%). So on motion the smear is the quantizer, not this knob; 500
+      // still keeps the encode cost down (22.84 -> 17.69 ms per delta frame)
+      // and is therefore left as the default. Key frames
       // are intra-coded and unaffected; the viewer forces one every 2000 ms,
       // which bounds how stale a held block can get. This changes the
       // bitstream inside the packets, not their shape: same codec, same
@@ -299,7 +317,7 @@ export class Vp8Encoder {
         'cpu-used': '8',
         'lag-in-frames': '0',
         'error-resilient': '1',
-        'static-thresh': '500',
+        'static-thresh': String(staticThresh),
       },
     });
     return new Vp8Encoder(libav, codecCtx, framePtr, packetPtr, width, height, fps);
