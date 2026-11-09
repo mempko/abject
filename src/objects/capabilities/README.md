@@ -196,14 +196,20 @@ instance.
   (`src/objects/screencast-source.ts`): the renderer pushes frames and each
   poll drains the newest one, so no screenshot is taken per tick; a page whose
   host has no CDP session, or refuses the command, keeps the per-poll
-  screenshot (`captureViewerVideoFrame`). The picture follows the viewer
-  window in both directions: the page is laid out again at the window's size
-  (so text keeps its pixels at any size), and both the relayout and the encode
-  size wait for the window to hold still for `VIEWER_RESIZE_SETTLE_MS`, because
-  each relayout and each encoder restart is work a drag would throw away. A
-  window that comes to rest on a page that is not painting is answered with
-  one screenshot (`needsCapture`), since a still page pushes no frame to carry
-  the new size. Named persistent login profiles per workspace
+  screenshot (`captureViewerVideoFrame`). The picture is rendered at one
+  fixed size, `FIXED_VIDEO_WIDTH` x `FIXED_VIDEO_HEIGHT` (1280x720, in
+  `src/objects/video-encoder.ts`): the page is laid out at that size when it is
+  opened and is never re-laid-out afterwards, and the encode target is that
+  same size whatever size the window is. The window only scales the decoded
+  picture, contain-fit, so the aspect ratio is kept and any letterbox or
+  pillarbox belongs to the window rather than the page. Resizing the window
+  therefore costs no relayout, no encoder re-target and no stream restart, and
+  the encode cost is bounded by the fixed size however large the window gets. A
+  window larger than 1280x720 shows the picture upscaled (1.25x at 1600x1000,
+  2x at 2560x1440), which is softer than encoding for the window; a smaller one
+  shows it downscaled. A page opened by a caller with its own
+  `options.viewport` keeps that layout and is contained within the fixed encode
+  box rather than growing the stream. Named persistent login profiles per workspace
   (`listProfiles`, `deleteProfile`). Pages belong to the object that opened
   them and close when it unregisters. As a plain Node server it launches its
   own Chromium; inside the desktop app it attaches over CDP to Electron's

@@ -44,6 +44,8 @@ import {
 import {
   DEFAULT_VIDEO_HEIGHT,
   DEFAULT_VIDEO_WIDTH,
+  FIXED_VIDEO_HEIGHT,
+  FIXED_VIDEO_WIDTH,
   MAX_VIDEO_HEIGHT,
   MAX_VIDEO_WIDTH,
   fitFrameToVideo,
@@ -505,6 +507,11 @@ interface TrackedPage {
   lastActivity: number;
   /** Profile key ({workspaceId}/{profileName}) the page was opened against, if any. */
   profileKey?: string;
+  /**
+   * The caller named its own `options.viewport`, so the page keeps that layout
+   * and is contained within the fixed encode box instead of being re-laid-out.
+   */
+  callerViewport?: boolean;
 }
 
 /** Playwright's CDP connection to the desktop app's own Chromium. */
@@ -514,8 +521,19 @@ type CdpBrowser = {
   close: () => Promise<void>;
 };
 
-/** Viewport a page gets when the caller names none (Playwright's own default). */
-const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
+/**
+ * The viewport a page gets when the caller names none — and the fixed render
+ * size the viewer streams at.
+ *
+ * The page is laid out once, at this size, and is never re-laid-out afterwards.
+ * The window it is shown in scales the decoded picture (contain-fit, so the
+ * aspect ratio is kept and the letterbox belongs to the window, not the page)
+ * instead of reflowing the page. Resizing the window therefore costs no
+ * relayout, no re-target and no stream restart, and the encode cost stays
+ * bounded by this size however large the window gets. A window larger than
+ * 1280x720 shows the picture upscaled; a smaller one shows it downscaled.
+ */
+const DEFAULT_VIEWPORT = { width: FIXED_VIDEO_WIDTH, height: FIXED_VIDEO_HEIGHT };
 
 /**
  * Subdirectory of a profile directory that holds the desktop app's Electron
@@ -3047,6 +3065,7 @@ export class WebBrowser extends Abject {
       createdAt: Date.now(),
       lastActivity: Date.now(),
       profileKey,
+      callerViewport: options?.viewport !== undefined,
     };
 
     this.pages.set(pageId, tracked);
@@ -3615,7 +3634,11 @@ export class WebBrowser extends Abject {
 
     const pump = this.viewerVideoPumpFor(pageId);
     pump.lastPollAt = Date.now();
-    const retargeted = options?.display ? this.settlePumpDisplay(pump, options.display) : false;
+    // The encode target is the fixed render size, never the window's, so a
+    // resize cannot re-target the encoder or restart the stream.
+    const retargeted = options?.display
+      ? this.settlePumpDisplay(pump, { width: FIXED_VIDEO_WIDTH, height: FIXED_VIDEO_HEIGHT })
+      : false;
     if (retargeted) {
       // The picture has a new size to be encoded at and no pushed frame to carry
       // it: have the pump take one, and wake it now rather than let it sit out
@@ -3778,8 +3801,14 @@ export class WebBrowser extends Abject {
       return;
     }
     if (this.layoutFixed.has(pageId)) return;
-    const width = Math.min(MAX_VIDEO_WIDTH, Math.ceil(display.width));
-    const height = Math.min(MAX_VIDEO_HEIGHT, Math.ceil(display.height));
+    // A page the caller opened at a viewport of its own keeping: that layout is
+    // theirs, and the fixed encode box contains it rather than replacing it.
+    if (tracked.callerViewport) return;
+    // Otherwise the page is laid out at the fixed render size, never at the window's
+    // size: the window scales the picture instead of reflowing the page, so a
+    // resize costs no relayout and the page never moves once it is open.
+    const width = FIXED_VIDEO_WIDTH;
+    const height = FIXED_VIDEO_HEIGHT;
     const previous = this.pendingDisplaySizes.get(pageId);
     if (!previous || previous.width !== width || previous.height !== height) {
       this.pendingDisplaySizes.set(pageId, { width, height, at: this.resizeClock() });

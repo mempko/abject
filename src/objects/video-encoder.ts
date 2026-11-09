@@ -479,6 +479,45 @@ export function videoTargetFor(
 }
 
 /**
+ * The one size the web viewer renders at: 1280x720, a 16:9 picture.
+ *
+ * The page is laid out at this size when it is opened and is never re-laid-out
+ * afterwards, so the picture the encoder produces is the same size however the
+ * window is dragged: resizing the window scales the decoded image instead of
+ * reflowing the page and re-targeting the encoder, which is what made a drag
+ * restart the VP8 stream over and over.
+ *
+ * 1280x720 is Playwright's own default page viewport and the shape most pages
+ * are designed for, so a page laid out here looks as it already did by
+ * default. It is under MAX_VIDEO_WIDTH/HEIGHT, which bounds the encode cost at
+ * 921,600 pixels no matter how large the window becomes; at the four-bits-per-
+ * pixel rule below that is a 3.7 Mbps stream.
+ *
+ * A window larger than 1280x720 shows this picture upscaled (a 1600x1000 window
+ * magnifies it 1.25x, a 2560x1440 window 2x), which is softer than encoding for
+ * the window: that is the trade this size makes, deliberately, for a stream that
+ * does not restart while it is being resized.
+ */
+export const FIXED_VIDEO_WIDTH = 1280;
+export const FIXED_VIDEO_HEIGHT = 720;
+
+/**
+ * The size to encode a capture of `sourceWidth` x `sourceHeight` at, given that
+ * the page is laid out once and the window only scales the picture.
+ *
+ * Independent of any window size by construction: a capture of the fixed size
+ * encodes at exactly that size, a larger capture (a page opened by a caller with
+ * its own viewport) is contained within the fixed box rather than growing the
+ * stream, and a smaller one keeps its own pixels instead of being upscaled.
+ */
+export function fixedVideoTarget(
+  sourceWidth: number,
+  sourceHeight: number,
+): { width: number; height: number } {
+  return videoTargetFor(sourceWidth, sourceHeight, FIXED_VIDEO_WIDTH, FIXED_VIDEO_HEIGHT);
+}
+
+/**
  * A bitrate that holds quality steady as the picture grows: about four bits per
  * pixel, which is the 2 Mbps the 960x540 stream was tuned at, kept between a
  * floor so a small window is not starved and a ceiling so a huge one cannot
