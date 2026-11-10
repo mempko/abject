@@ -1,5 +1,25 @@
 [
   {
+    "version": "0.16.6",
+    "date": "2026-11-10",
+    "title": "A Smoother Live View of the Web",
+    "summary": "This release rebuilds how the Web Viewer shows you a live page. Instead of sending still images over and over, it now streams the page as video, so scrolling, typing and watching an agent browse should feel smoother and use less bandwidth.",
+    "highlights": [
+      "The Web Viewer's live view now streams the page as VP8 video instead of sending pixel patches, so motion on the page looks continuous rather than choppy.",
+      "Frames now come straight from the browser's screencast feed instead of a fresh screenshot on every poll, which cuts the delay between a change on the page and what you see.",
+      "Pages render at a fixed 1280x720 and are scaled to fit the window, so the stream costs the same whatever size the window is.",
+      "Parts of the page that stay still are held in place instead of being encoded again, which saves bandwidth and keeps static text sharp.",
+      "Video encoding now runs separately from frame capture, and image decoding is faster at every window size, so a slow frame no longer holds up the next one.",
+      "Before the switch to video, the viewer was changed to send only what differs from a key frame instead of whole images.",
+      "The encoder's threshold for still blocks can now be adjusted, and the viewer records what actually blurs while you scroll, so scroll quality can be tuned with real measurements."
+    ],
+    "fixes": [
+      "The live view follows a window resize right away, even when the page itself is not repainting.",
+      "The video stream now matches the size of the window it is shown in.",
+      "When a page asks you to confirm before closing, the viewer waits for your answer for as long as the dialog is open instead of giving up early."
+    ]
+  },
+  {
     "version": "0.16.5",
     "date": "2026-11-03",
     "title": "Windows that arrive and leave more gently",
