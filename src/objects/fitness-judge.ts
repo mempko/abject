@@ -33,8 +33,9 @@
  * Honesty: a verdict fails only on a verified contradiction with the
  * recording. No recordings, recordings that could not be read, a target
  * that is not yet an object (a spawn), recordings the live source itself
- * cannot reproduce, or a caller's deadline that passed all yield a pass
- * labelled unverified with the reason, never a refusal.
+ * cannot reproduce (on the control run, or again on a second run once the
+ * draft contradicts them), or a caller's deadline that passed all yield a
+ * pass labelled unverified with the reason, never a refusal.
  */
 
 import { AbjectId, AbjectMessage, TypeId } from '../core/types.js';

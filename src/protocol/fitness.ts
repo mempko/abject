@@ -117,6 +117,10 @@ export interface EvidenceStrength {
   /** Usable recordings the LIVE source reproduces; recordings it cannot are
    *  non-deterministic or state-dependent and are not held against the draft. */
   deterministic?: number;
+  /** Recordings the candidate contradicted that the live source then failed
+   *  to reproduce on a second run: the live object's own answer moves, so
+   *  they cannot convict the draft (the self-replay canary). */
+  selfDivergent?: number;
   detail: string;
 }
 
@@ -225,6 +229,10 @@ export async function replay(source: string, recordings: InvocationRecording[], 
     if (failure) failures.push(failure);
     if (failures.length >= maxFailures) break;
   }
+  return replayResult(judged, failures);
+}
+
+function replayResult(judged: number, failures: string[]): ReplayResult {
   const reproduced = judged - failures.length;
   return {
     pass: failures.length === 0,
@@ -247,8 +255,9 @@ const MAX_REPORTED_FAILURES = 3;
  *
  * Order: keep the recordings that can be replayed at all; drop the ones the
  * live source cannot reproduce (when a live source is given); replay the
- * candidate against what remains. A verdict fails only on a verified
- * contradiction.
+ * candidate against what remains; run the live source again on each
+ * recording the candidate contradicted, and set aside any it no longer
+ * reproduces. A verdict fails only on a verified contradiction.
  */
 export async function evaluate(candidate: { source: string }, evidence: Evidence,
                                invoke: Invoker, opts: FitnessOptions = {}): Promise<Verdict> {
@@ -280,8 +289,35 @@ export async function evaluate(candidate: { source: string }, evidence: Evidence
     usable = kept;
   }
 
-  const rep = await replay(candidate.source, usable, invoke, MAX_REPORTED_FAILURES, opts.deadline);
+  // The candidate replays what is left, with the self-replay canary folded
+  // in. One control run that matched can still be luck: a handler that picks
+  // at random, or reads the clock at a coarse grain, matches its recording on
+  // some runs and not others, and the draft's run can land on the other side.
+  // So before a recording convicts the draft, the live source runs it once
+  // more. If the live source now gives a different answer, the recording is
+  // set aside (and counted on the verdict), never held against the draft.
+  // Each recording is replayed at most once per source in this pass, and a
+  // passing draft costs no extra run.
+  const failures: string[] = [];
+  let judged = 0;
+  let selfDivergent = 0;
+  for (const rec of usable) {
+    if (past(opts.deadline)) break;
+    const failure = await replayOne(candidate.source, rec, invoke);
+    if (failure && opts.liveSource !== undefined) {
+      if (past(opts.deadline)) break;
+      if (await replayOne(opts.liveSource, rec, invoke) !== undefined) { selfDivergent++; continue; }
+    }
+    judged++;
+    if (failure) failures.push(failure);
+    if (failures.length >= MAX_REPORTED_FAILURES) break;
+  }
   if (past(opts.deadline)) return unjudged('judgment abandoned: the caller\'s deadline passed during replay', strength);
+  if (selfDivergent > 0) strength.selfDivergent = selfDivergent;
+  if (judged === 0) {
+    return unjudged(`the live source gave a different answer on a second run for every recording the draft contradicted (${selfDivergent}) — not deterministic`, strength);
+  }
+  const rep = replayResult(judged, failures);
   strength.detail = `${usable.length} recording${usable.length === 1 ? '' : 's'} replayed`;
   return finish(rep.pass, rep, strength);
 }
@@ -302,11 +338,14 @@ function finish(pass: boolean, rep: ReplayResult, strength: EvidenceStrength): V
  *  plenty, and a pass must say how much of the evidence the control set
  *  aside: "1 recording reproduced" reads the same for 1 of 1 and 1 of 50. */
 export function summarizeVerdict(v: Verdict): string {
-  if (!v.pass) return `fitness: FAIL — ${v.replay.detail}: ${v.replay.failures[0] ?? ''}`;
+  const unstable = v.evidence.selfDivergent
+    ? `; ${v.evidence.selfDivergent} set aside: the live source did not reproduce itself on a second run`
+    : '';
+  if (!v.pass) return `fitness: FAIL — ${v.replay.detail}${unstable}: ${v.replay.failures[0] ?? ''}`;
   if (!v.replay.verified) return `fitness: unverified — ${v.replay.detail}`;
   const { usable, deterministic } = v.evidence;
   const excluded = deterministic !== undefined && deterministic < usable
     ? ` (${usable - deterministic} of ${usable} excluded by the control)`
     : '';
-  return `fitness: PASS — ${v.replay.detail}${excluded}`;
+  return `fitness: PASS — ${v.replay.detail}${excluded}${unstable}`;
 }
