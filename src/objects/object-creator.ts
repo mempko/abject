@@ -2779,6 +2779,9 @@ ${source}
       // and the caller may have stopped waiting. Either way, no swap.
       const changedDuringJudgment = await this.detectSourceConflict(state, targetId!);
       if (changedDuringJudgment) return changedDuringJudgment;
+      // A task cancelled mid-judgment does not stop that judgment: it runs to
+      // its budget (holding the judge's queue that long), and only here does
+      // the deploy learn the task is gone, so nothing is swapped.
       if (call && !call.live()) {
         return { ok: false, summary: 'deploy_update: not deployed, the task ended while the draft was being judged',
           error: 'The task this deploy belonged to was cancelled or finished; the live object is untouched.' };

@@ -46,7 +46,7 @@ import { request } from '../core/message.js';
 import { requireNonEmpty } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 import { evaluate, type Verdict, type InvocationRecording } from '../protocol/fitness.js';
-import { buildSandboxInvoker } from '../protocol/sandbox-invoker.js';
+import { buildSandboxInvoker, type SandboxInvoker } from '../protocol/sandbox-invoker.js';
 
 const log = new Log('FITNESS-JUDGE');
 
@@ -71,6 +71,9 @@ export class FitnessJudge extends Abject {
   private storageId?: AbjectId;
   /** Tail of the one-at-a-time queue of judgments. */
   private queue: Promise<unknown> = Promise.resolve();
+  /** The worker of the judgment running now, so stop() can end it. */
+  private running?: SandboxInvoker;
+  private stopping = false;
 
   constructor() {
     super({
@@ -112,6 +115,14 @@ export class FitnessJudge extends Abject {
     this.on('judge', async (msg: AbjectMessage) => this.judge(msg.payload as JudgeRequest));
   }
 
+  /** A stopped judge runs no candidate code: the judgment in progress loses
+   *  its worker and answers unverified, and queued ones answer at once. */
+  protected override async onStop(): Promise<void> {
+    this.stopping = true;
+    this.running?.dispose();
+    this.running = undefined;
+  }
+
   judge(req: JudgeRequest): Promise<Verdict> {
     const run = this.queue.then(() => this.judgeNow(req));
     this.queue = run.catch(() => undefined);
@@ -120,6 +131,7 @@ export class FitnessJudge extends Abject {
 
   private async judgeNow(req: JudgeRequest): Promise<Verdict> {
     requireNonEmpty(req.source, 'source');
+    if (this.stopping) return unverified('the judge has stopped');
     if (!req.typeId) {
       return unverified('no typeId: an object that does not exist yet has no recorded history');
     }
@@ -134,17 +146,22 @@ export class FitnessJudge extends Abject {
     // One worker per judgment: the invoker serialises invocations on its
     // worker, and two judgments must not share one. ~15ms to spawn.
     const invoker = buildSandboxInvoker();
+    this.running = invoker;
     // Just past the caller's deadline the worker is stopped, which ends the
     // invocation in flight; evaluate() sees the deadline passed and answers
     // unverified instead of counting that invocation against the draft.
     const stop = deadline === undefined ? undefined
       : setTimeout(() => invoker.dispose(), Math.min(Math.max(0, deadline - Date.now()) + 50, 2 ** 31 - 1));
     try {
-      return await evaluate({ source: req.source }, { invocations: loaded }, invoker,
+      const verdict = await evaluate({ source: req.source }, { invocations: loaded }, invoker,
         { liveSource: req.liveSource, deadline });
+      // Every invocation after stop() fails on the disposed worker, which is
+      // not the draft's doing, so a stopped judgment is never a verdict.
+      return this.stopping ? unverified('judgment abandoned: the judge stopped') : verdict;
     } finally {
       clearTimeout(stop);
       invoker.dispose();
+      if (this.running === invoker) this.running = undefined;
     }
   }
 
