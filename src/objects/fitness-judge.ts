@@ -23,7 +23,9 @@
  * `deadline`: a judgment whose deadline passed while it waited in the queue
  * answers "unverified" when its turn comes, without running, and a running
  * one stops its worker and answers "unverified", so a caller that gave up
- * does not hold the queue for the next one.
+ * does not hold the queue for the next one. A request may also carry
+ * `budgetMs`, how long the judgment may run once it starts: time spent
+ * queued behind another judgment is not counted against it.
  *
  * What it does NOT do: hold a verdict for later, or bind one to a digest.
  * Deploy ops ask about the exact source and target they are deploying, at
@@ -60,6 +62,9 @@ export interface JudgeRequest {
   liveSource?: string;
   /** Epoch ms at which the caller stops waiting for the answer. */
   deadline?: number;
+  /** How long the judgment may run once it starts. Time spent waiting in the
+   *  queue does not count against it; `deadline` still bounds the whole wait. */
+  budgetMs?: number;
 }
 
 export class FitnessJudge extends Abject {
@@ -87,6 +92,7 @@ export class FitnessJudge extends Abject {
                 { name: 'typeId', type: { kind: 'primitive', primitive: 'string' }, description: 'Durable typeId of the target object (omit for a new object)', optional: true },
                 { name: 'liveSource', type: { kind: 'primitive', primitive: 'string' }, description: 'The target\'s current source, used to exclude non-deterministic recordings', optional: true },
                 { name: 'deadline', type: { kind: 'primitive', primitive: 'number' }, description: 'Epoch ms at which the caller stops waiting; past it the judgment stops and answers unverified', optional: true },
+                { name: 'budgetMs', type: { kind: 'primitive', primitive: 'number' }, description: 'How long the judgment may run once it starts, not counting time queued; the deadline still applies', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 pass: { kind: 'primitive', primitive: 'boolean' },
@@ -120,6 +126,9 @@ export class FitnessJudge extends Abject {
     if (req.deadline !== undefined && Date.now() >= req.deadline) {
       return unverified('judgment abandoned: the caller\'s deadline passed while it was queued');
     }
+    // The budget starts now, when the judgment does, never after the caller's deadline.
+    const deadline = req.budgetMs === undefined ? req.deadline
+      : Math.min(req.deadline ?? Number.POSITIVE_INFINITY, Date.now() + req.budgetMs);
     const loaded = await this.loadRecordings(req.typeId);
     if (typeof loaded === 'string') return unverified(loaded);
     // One worker per judgment: the invoker serialises invocations on its
@@ -128,11 +137,11 @@ export class FitnessJudge extends Abject {
     // Just past the caller's deadline the worker is stopped, which ends the
     // invocation in flight; evaluate() sees the deadline passed and answers
     // unverified instead of counting that invocation against the draft.
-    const stop = req.deadline === undefined ? undefined
-      : setTimeout(() => invoker.dispose(), Math.min(Math.max(0, req.deadline - Date.now()) + 50, 2 ** 31 - 1));
+    const stop = deadline === undefined ? undefined
+      : setTimeout(() => invoker.dispose(), Math.min(Math.max(0, deadline - Date.now()) + 50, 2 ** 31 - 1));
     try {
       return await evaluate({ source: req.source }, { invocations: loaded }, invoker,
-        { liveSource: req.liveSource, deadline: req.deadline });
+        { liveSource: req.liveSource, deadline });
     } finally {
       clearTimeout(stop);
       invoker.dispose();

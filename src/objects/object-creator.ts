@@ -41,8 +41,13 @@ import type { Verdict } from '../protocol/fitness.js';
 
 const log = new Log('OBJECT-CREATOR');
 
-/** How long a deploy waits for the FitnessJudge; the judgment stops at the same deadline. */
+/** How long a judgment may run once the FitnessJudge starts it. Time spent
+ *  waiting in the judge's queue is not counted against it: that wait is
+ *  bounded by the action's own deadline instead. */
 const JUDGE_TIMEOUT_MS = 90000;
+/** The judge stops this long before the action's deadline, so its
+ *  "unverified" answer arrives before the deploy stops waiting for it. */
+const JUDGE_REPLY_MARGIN_MS = 2000;
 
 /**
  * The gate's policy when the judge cannot answer (absent, timed out, or
@@ -2340,7 +2345,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    */
   private async judgeDraft(draftSource: string, targetId: AbjectId, targetLabel: string | undefined,
                            liveSource: string | undefined, intendedChange: string | undefined,
-                           verb: string): Promise<{ note: string; refusal?: { ok: false; summary: string; error: string } }> {
+                           verb: string, actDeadline: number): Promise<{ note: string; refusal?: { ok: false; summary: string; error: string } }> {
     let typeId: TypeId | undefined;
     let name: string | undefined;
     if (this.registryId) {
@@ -2361,11 +2366,16 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     let verdict: Verdict;
     try {
-      // The deadline travels with the request, so a judgment this deploy
-      // stops waiting for also stops running instead of holding the judge's
-      // queue in front of the next deploy.
+      // The judge runs one judgment at a time, so this request may wait in
+      // its queue behind other deploys. The budget starts when the judgment
+      // does (budgetMs), and the action's own deadline bounds the whole wait:
+      // the judge stops just before it, so a judgment this deploy can no
+      // longer use stops running instead of holding the queue, and its
+      // answer still arrives before this request gives up.
+      const waitMs = Math.max(0, actDeadline - Date.now());
       verdict = await this.sendRequest<Verdict>(this.fitnessJudgeId, 'judge',
-        { source: draftSource, typeId, liveSource, deadline: Date.now() + JUDGE_TIMEOUT_MS }, JUDGE_TIMEOUT_MS);
+        { source: draftSource, typeId, liveSource, deadline: actDeadline - JUDGE_REPLY_MARGIN_MS, budgetMs: JUDGE_TIMEOUT_MS },
+        waitMs);
     } catch (err) {
       this.fitnessJudgeId = undefined; // re-resolve next time: the judge may have restarted
       const msg = err instanceof Error ? err.message : String(err);
@@ -2563,12 +2573,16 @@ ${source}
     };
   }
 
-  private async opDeploySpawn(state: LoopState, action: Record<string, unknown> = {}): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+  private async opDeploySpawn(state: LoopState, action: Record<string, unknown> = {}, call?: ActCall): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     if (!this.factoryId) return { ok: false, summary: 'deploy_spawn: Factory unavailable', error: 'Factory not resolved' };
     if (!state.draftManifest) return { ok: false, summary: 'deploy_spawn: no manifest drafted', error: 'call draft_manifest or draft_via_llm({kind: "manifest"}) first' };
     if (!state.draftSource) return { ok: false, summary: 'deploy_spawn: no source drafted', error: 'call draft_source, edit_source, or draft_via_llm({kind: "source"}) first' };
 
-    if (state.spawnedObjectId) return this.opDeployUpdate(state, { action: 'deploy_update', objectId: state.spawnedObjectId });
+    // Already spawned: this is an update of that object. It keeps the act's
+    // own fields (intendedChange) and the act's deadline.
+    if (state.spawnedObjectId) {
+      return this.opDeployUpdate(state, { ...action, action: 'deploy_update', objectId: state.spawnedObjectId } as AgentAction, call);
+    }
     const refusal = this.gateDeploy(state, 'deploy_spawn');
     if (refusal) return refusal;
 
@@ -2750,7 +2764,7 @@ ${source}
     const ownTarget = targetId === state.targetObjectId;
     const judged = await this.judgeDraft(draftSource, targetId, targetLabel,
       ownTarget ? state.targetSource : undefined,
-      typeof intendedChange === 'string' ? intendedChange : undefined, 'deploy_update');
+      typeof intendedChange === 'string' ? intendedChange : undefined, 'deploy_update', deadline);
     if (judged.refusal) return judged.refusal;
 
     // Everything from here is one write to one object. Two modify loops
@@ -5008,6 +5022,7 @@ ${source}
     }
     const state = extra.state;
     const callerId = extra.callerId;
+    const actCall: ActCall = { deadline: actDeadline, live: () => this.tasks.get(taskId)?.state === state };
 
     let res: { ok: boolean; summary: string; data?: unknown; error?: string; terminal?: boolean };
     try {
@@ -5065,10 +5080,10 @@ ${source}
           res = await this.opReviewSemantics(state);
           break;
         case 'deploy_spawn':
-          res = await this.opDeploySpawn(state, action);
+          res = await this.opDeploySpawn(state, action, actCall);
           break;
         case 'deploy_update':
-          res = await this.opDeployUpdate(state, action, { deadline: actDeadline, live: () => this.tasks.get(taskId)?.state === state });
+          res = await this.opDeployUpdate(state, action, actCall);
           break;
         case 'compose_organism':
           res = await this.opComposeOrganism(state, action);
