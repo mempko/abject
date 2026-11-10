@@ -186,6 +186,8 @@ export interface InvocationEvent {
 const INVOCATION_TEXT_CAP = 64 * 1024; // characters, same cap as an HTTP exchange body
 /** Outbound calls kept per invocation; past this the recording is marked truncated. */
 const INVOCATION_CALL_CAP = 100;
+/** How long a returned handler's recording waits for its leftover helper calls to be answered. */
+const RECORD_QUIET_WAIT_MS = 3000;
 /** How long a failed recorder discovery is trusted before asking the registry again. */
 const RECORDER_RETRY_MS = 1000;
 
@@ -195,6 +197,20 @@ interface InvocationTrace {
   calls: InvocationEvent['calls'];
   truncated: boolean;
   closed?: boolean;
+  /** Another handler on this object ran while this one did. */
+  overlapped?: boolean;
+  /** The object's outbound call count when this invocation started. */
+  callsAtStart: number;
+  /** Outbound calls made under this trace, kept or past the cap. */
+  attributed: number;
+  /** The sandbox the handler ran in, and its count of timers set and the
+   *  object's count of sandbox interrupts when the handler started. */
+  sandbox: Sandbox;
+  timersAtStart: number;
+  interruptsAtStart: number;
+  /** Set while a returned handler waits for its leftover helper calls:
+   *  decides the recording now. */
+  settleNow?: () => void;
 }
 
 export class ScriptableAbject extends Abject {
@@ -209,6 +225,13 @@ export class ScriptableAbject extends Abject {
   /** The last copy of `this.data` read out, for when the sandbox cannot answer. */
   private _lastData: Record<string, unknown>;
   private activeUserCalls = 0;
+  /** Recorded invocations still running, and every outbound call the
+   *  object's handlers have made: together they tell an invocation whose
+   *  calls are all its own from one that shared the object with other work. */
+  private openTraces = new Set<InvocationTrace>();
+  private outboundCalls = 0;
+  /** Times the sandbox stopped a stretch of code and cleared its calls. */
+  private sandboxInterrupts = 0;
   private activating = false;
   /** Whether a `show` call (by message) left the object on screen; `hide` clears it. */
   private _showing = false;
@@ -448,6 +471,16 @@ export class ScriptableAbject extends Abject {
     if (loading) return loading.then(() => this.invokeUserHandler(name, msg));
     if (this.activating) throw new Error('Source activation in progress; retry against the committed revision');
     this.activeUserCalls++;
+    // A handler starting while recorded ones run makes them ambiguous (see
+    // recordInvocation), whether or not this one is recorded itself.
+    // A recording still waiting for its handler's leftover helper calls is
+    // decided now if they have all been answered. Otherwise it overlaps this
+    // handler, and so does any other work still in flight on the object.
+    for (const open of [...this.openTraces]) {
+      if (open.settleNow && open.sandbox.pendingHelperCalls() === 0) open.settleNow();
+      else open.overlapped = true;
+    }
+    const othersRunning = this.activeUserCalls > 1 || this.openTraces.size > 0 || this.sandbox.pendingHelperCalls() > 0;
     const method = msg.routing.method;
     const lifecycle = method === 'show' || method === 'hide';
     // Recording is decided before the handler runs, on the cached recorder id
@@ -464,7 +497,10 @@ export class ScriptableAbject extends Abject {
       && !ScriptableAbject.INHERITED_HANDLERS.has(name);
     const recorderId = recordable ? this.recorderId : undefined;
     if (!recorderId && recordable) void this.resolveRecorder();
-    const trace: InvocationTrace | undefined = recorderId ? { calls: [], truncated: false } : undefined;
+    const trace: InvocationTrace | undefined = recorderId
+      ? { calls: [], truncated: false, overlapped: othersRunning, callsAtStart: this.outboundCalls, attributed: 0,
+          sandbox: this.sandbox, timersAtStart: this.sandbox.timersSet, interruptsAtStart: this.sandboxInterrupts } : undefined;
+    if (trace) this.openTraces.add(trace);
     const started = Date.now();
     let outcome: SandboxOutcome;
     try {
@@ -506,8 +542,10 @@ export class ScriptableAbject extends Abject {
   /** The proxy's `call()`: a request that, inside a recorded invocation, notes
    *  what was asked and what came back. Outside one it is `request`. */
   private async tracedRequest<T>(message: AbjectMessage, timeoutMs?: number): Promise<T> {
+    this.outboundCalls++;
     const trace = ScriptableAbject.trace.getStore();
     if (!trace || trace.closed) return this.request<T>(message, timeoutMs);
+    trace.attributed++;
     if (trace.calls.length >= INVOCATION_CALL_CAP) {
       trace.truncated = true;
       return this.request<T>(message, timeoutMs);
@@ -536,13 +574,14 @@ export class ScriptableAbject extends Abject {
 
   private recordInvocation(recorderId: AbjectId, method: string, msg: AbjectMessage, trace: InvocationTrace,
                            started: number, outcome: { value?: unknown; error?: unknown }): void {
-    trace.closed = true;
+    // What the handler was asked and what it returned are taken now. Which
+    // calls it made is settled once the object is quiet (see below).
+    let ev: InvocationEvent;
+    let argsCut: boolean;
     try {
-      const [argsText, argsCut] = capText(msg.payload);
-      const ev: InvocationEvent = {
-        caller: this.id, method, argsText: argsText ?? '', calls: trace.calls.map(c => ({ ...c })),
-        durationMs: Date.now() - started, at: Date.now(),
-      };
+      let argsText: string | undefined;
+      [argsText, argsCut] = capText(msg.payload);
+      ev = { caller: this.id, method, argsText: argsText ?? '', calls: [], durationMs: Date.now() - started, at: Date.now() };
       if ('error' in outcome) {
         ev.errorText = capError(outcome.error)[0];
       } else {
@@ -550,11 +589,58 @@ export class ScriptableAbject extends Abject {
         if (resultText === undefined || resultCut) trace.truncated = true;
         if (resultText !== undefined) ev.resultText = resultText;
       }
-      if (trace.truncated || argsCut) ev.truncated = true;
-      this.send(event(this.id, recorderId, 'invocation', ev));
     } catch (err) {
+      trace.closed = true;
+      this.openTraces.delete(trace);
       log.warn(`invocation recording failed for '${this.manifest.name}':`, err instanceof Error ? err.message : String(err));
+      return;
     }
+    // Outbound calls are attributed through AsyncLocalStorage, and the
+    // sandbox resumes a handler from whichever host callback drains its
+    // microtasks. While other work runs on the object (another handler, a
+    // timer), a call can land in the wrong invocation or in none, and a call
+    // the handler did not await can reach the host after it returned. A
+    // recording must hold exactly the calls its own handler made. So when
+    // the handler returns with helper calls still waiting (an un-awaited
+    // call, an emit to a dep() target, a saveData), the trace stays open
+    // until they are answered (at most RECORD_QUIET_WAIT_MS), and the
+    // invocation is then not recorded when another handler on the object ran
+    // during it, when the object made a call that is not in its trace, when
+    // it set a timer (a timer runs in the context it was set in, so its calls
+    // would count as this handler's), or when a helper call is still on its
+    // way at the end of the wait.
+    // The checks read the sandbox the handler ran in: a source swap or a
+    // stopped stretch of code during the wait means the trace cannot be
+    // trusted, so it is not recorded.
+    const { sandbox } = trace;
+    const decide = (): void => {
+      if (trace.closed) return;
+      trace.closed = true;
+      trace.settleNow = undefined;
+      this.openTraces.delete(trace);
+      if (trace.overlapped || this.outboundCalls - trace.callsAtStart !== trace.attributed) return;
+      if (this.sandbox !== sandbox || this.sandboxInterrupts !== trace.interruptsAtStart) return;
+      if (sandbox.timersSet !== trace.timersAtStart || sandbox.pendingHelperCalls() > 0) return;
+      try {
+        ev.calls = trace.calls.map(c => ({ ...c }));
+        if (trace.truncated || argsCut) ev.truncated = true;
+        this.send(event(this.id, recorderId, 'invocation', ev));
+      } catch (err) {
+        log.warn(`invocation recording failed for '${this.manifest.name}':`, err instanceof Error ? err.message : String(err));
+      }
+    };
+    if (sandbox.pendingHelperCalls() === 0) { decide(); return; }
+    trace.settleNow = decide;
+    const quietBy = Date.now() + RECORD_QUIET_WAIT_MS;
+    const poll = (): void => {
+      if (trace.closed) return;
+      if ((this._status as string) === 'stopped') { trace.closed = true; this.openTraces.delete(trace); return; }
+      if (sandbox.pendingHelperCalls() === 0 || Date.now() >= quietBy) { decide(); return; }
+      this.setTimer(poll, 10);
+    };
+    // Helper calls usually answer within microtasks: look again before the
+    // next macrotask, then poll.
+    queueMicrotask(() => { if (!trace.closed && sandbox.pendingHelperCalls() === 0) decide(); else poll(); });
   }
 
   private async resolveRecorder(): Promise<AbjectId | undefined> {
@@ -1078,7 +1164,10 @@ export class ScriptableAbject extends Abject {
         id: () => this.id,
         changed: (aspect: unknown, value?: unknown) => { this.changed(String(aspect), value); },
       },
-      onInterrupt: (err) => log.warn(`[${this.manifest.name}] ${err.message} Its calls in flight failed and its timers were cleared.`),
+      onInterrupt: (err) => {
+        this.sandboxInterrupts++;
+        log.warn(`[${this.manifest.name}] ${err.message} Its calls in flight failed and its timers were cleared.`);
+      },
       onUncaught: (err) => log.warn(`[${this.manifest.name}] uncaught error in a timer callback: ${err.message}`),
       owner: () => ({ id: this.id, name: this.manifest.name }),
     });
