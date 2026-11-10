@@ -183,6 +183,9 @@ parentPort.on('message', (job) => {
   };
   const timerSet = (repeat, ms, cb) => {
     const id = ++timerSeq;
+    // A timer set by work that outlived its job would fire during the next
+    // job on this worker. It is never armed.
+    if (settled) return id;
     const handle = repeat
       ? setInterval(() => { try { cb(); } catch {} }, Math.max(10, ms))
       : setTimeout(() => { jobTimers.delete(id); try { cb(); } catch {} }, ms);
