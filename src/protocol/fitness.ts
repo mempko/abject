@@ -178,13 +178,26 @@ function parses(text: string): boolean {
 /** Answer the candidate's outbound calls from one recording. Exact on target,
  *  method, and canonical payload: `{q: 1}` and `{q: 2}` are different
  *  questions, and a call with no payload matches only a recorded call with
- *  no payload, so omitting the payload is a miss, never a wildcard. */
+ *  no payload, so omitting the payload is a miss, never a wildcard. The same
+ *  question asked more than once is answered in recorded order, so a retry
+ *  that failed and then succeeded replays the same way. Asked more often
+ *  than it was recorded, it gets the last recorded answer again. One stub
+ *  serves one replay run. */
 export function stubFor(recording: InvocationRecording): CallStub {
+  const used = new Set<number>();
   return req => {
     const want = redactedCanonical(req.payloadText);
-    const hit = recording.calls.find(c =>
-      c.target === req.target && c.method === req.method && redactedCanonical(c.payloadText) === want);
-    if (!hit) return undefined;
+    let next = -1;
+    let last = -1;
+    recording.calls.forEach((c, i) => {
+      if (c.target !== req.target || c.method !== req.method || redactedCanonical(c.payloadText) !== want) return;
+      last = i;
+      if (next < 0 && !used.has(i)) next = i;
+    });
+    const at = next >= 0 ? next : last;
+    if (at < 0) return undefined;
+    used.add(at);
+    const hit = recording.calls[at];
     if (hit.errorText !== undefined) return { errorText: hit.errorText };
     return { replyText: hit.replyText! };
   };

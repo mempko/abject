@@ -56,6 +56,12 @@ const vm = require('node:vm');
 
 const signal = new Int32Array(workerData.signal);
 const stubPort = workerData.stubPort;
+
+// A judged handler can leave work running after it returns (an un-awaited
+// call, a timer's async callback). One worker runs a judgment's jobs in
+// turn, so such work outlives its job, and its rejection must not take the
+// worker, and the next job with it, down. The job already has its outcome.
+process.on('unhandledRejection', () => {});
 const REMOVED_GLOBALS = workerData.removedGlobals;
 const PROXY_BUILTINS = workerData.proxyBuiltins;
 
@@ -84,13 +90,20 @@ const BOOTSTRAP_SCRIPT = new vm.Script(\`(function(__stubText, __timerSet, __tim
   // object is special here: HttpClient, Storage, a sibling user object --
   // the recording either has the answer or the candidate is asking the
   // world something the live object never asked.
-  const call = async (target, method, payload) => {
+  const call = async (target, method, payload, options) => {
+    // The same two shapes the live proxy takes: (to, method, payload?, options?)
+    // and the older (to, interfaceId, method, payload), and the same {} for a
+    // missing or null payload, so the stub is asked what the live object asked.
+    if (options !== undefined && typeof method === 'string' && typeof payload === 'string') {
+      method = payload;
+      payload = options;
+    }
     // The live proxy awaits its target, and the prompt teaches
     // this.call(this.dep('X'), ...) where dep() returns a promise, so the
     // harness must await it too or every such call stubs as [object Promise].
     const t = await target;
     let raw;
-    try { raw = __stubText(String(t), String(method), JSONStringify(payload === undefined ? {} : payload)); }
+    try { raw = __stubText(String(t), String(method), JSONStringify(payload == null ? {} : payload)); }
     catch { throw new ErrorCtor('fitness: stub call failed'); }
     if (!raw) throw new ErrorCtor("fitness: unrecorded call -- call('" + t + "', '" + method + "')");
     const hit = JSONParse(raw);
@@ -149,7 +162,8 @@ const BOOTSTRAP_SCRIPT = new vm.Script(\`(function(__stubText, __timerSet, __tim
       }
       const handler = bound.get(__method) ?? bound.get('*');
       if (!handler) throw new ErrorCtor("fitness: source has no handler for '" + __method + "'");
-      const value = await handler({ payload: JSONParse(__argsText), routing: { from: 'fitness-judge', to: 'fitness-candidate', method: __method } });
+      const value = await handler({ header: { messageId: 'fitness-replay', sequenceNumber: 0, timestamp: 0, type: 'request' },
+        payload: JSONParse(__argsText), routing: { from: 'fitness-judge', to: 'fitness-candidate', method: __method } });
       // Outcomes must survive structured clone; a candidate returning a
       // function or symbol is returning something no message can carry.
       return JSONParse(JSONStringify(value === undefined ? null : value));
@@ -246,6 +260,9 @@ interface WorkerConn {
  *  run; respawned lazily after a termination. */
 class WorkerInvoker {
   private conn: WorkerConn | undefined;
+  /** Set by dispose(): a disposed invoker refuses new jobs instead of
+   *  respawning a worker for them. */
+  private disposed = false;
 
   constructor(private timeoutMs: number) {}
 
@@ -314,6 +331,7 @@ class WorkerInvoker {
   }
 
   invoke(source: string, method: string, args: Record<string, unknown>, stub: CallStub): Promise<unknown> {
+    if (this.disposed) return Promise.reject(new Error('fitness: invoker disposed'));
     try {
       Sandbox.checkSource(source, 'handlers');
     } catch (err) {
@@ -339,6 +357,7 @@ class WorkerInvoker {
 
   /** Release the worker. Idempotent; a later invoke respawns. */
   dispose(): void {
+    this.disposed = true;
     const conn = this.conn;
     this.conn = undefined;
     if (conn) {
