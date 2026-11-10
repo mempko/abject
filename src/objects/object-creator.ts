@@ -434,6 +434,10 @@ interface TaskExtra {
   goalId?: string;
   deferredMsg?: AbjectMessage;
   state: LoopState;
+  /** Set when AgentAbject reports the task cancelled. The task stays in
+   *  `tasks` until its result arrives, so this is what tells a deploy still
+   *  in flight that its task has ended. */
+  cancelled?: boolean;
   /**
    * Multimodal content (an image part) staged by the previous `act` to ride
    * into the NEXT observation — e.g. a screenshot captured via
@@ -3975,6 +3979,14 @@ ${source}
     this.on('agentPhaseChanged', async () => { /* no-op */ });
     this.on('agentIntermediateAction', async () => { /* no-op */ });
     this.on('agentActionResult', async () => { /* no-op */ });
+    // A cancelled task's act may still be running (a deploy waiting on the
+    // judge). Mark it, so that act swaps nothing. Its result arrives later.
+    this.on('taskCancelled', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.agentAbjectId) return;
+      const { taskId } = msg.payload as { taskId?: string };
+      const extra = taskId ? this.tasks.get(taskId) : undefined;
+      if (extra) extra.cancelled = true;
+    });
 
     // ── Receive task results from AgentAbject ──
     this.onDelivery('taskResult', async (msg: AbjectMessage) => {
@@ -5025,7 +5037,10 @@ ${source}
     }
     const state = extra.state;
     const callerId = extra.callerId;
-    const actCall: ActCall = { deadline: actDeadline, live: () => this.tasks.get(taskId)?.state === state };
+    const actCall: ActCall = { deadline: actDeadline, live: () => {
+      const now = this.tasks.get(taskId);
+      return now?.state === state && !now.cancelled;
+    } };
 
     let res: { ok: boolean; summary: string; data?: unknown; error?: string; terminal?: boolean };
     try {

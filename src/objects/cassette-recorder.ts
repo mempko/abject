@@ -84,7 +84,7 @@ export interface Cassette {
 export interface InvocationCassette {
   method: string;
   argsText: string;
-  calls: Array<{ target: string; method: string; payloadText: string; replyText?: string; errorText?: string }>;
+  calls: Array<{ target: string; targetName?: string; method: string; payloadText: string; replyText?: string; errorText?: string }>;
   resultText?: string;
   errorText?: string;
   truncated?: boolean;
@@ -216,19 +216,22 @@ export class CassetteRecorder extends Abject {
     // call (a window from createWindowAbject, a widget, a spawned child)
     // reaches the replay the same way, from the same recorded text, so it is
     // kept as that id. Any other target becomes the name the registry knows
-    // it by, since dep()/find() resolve a name. A target that is neither makes
-    // the recording unreplayable, so it is dropped rather than kept as a
-    // half-truth.
+    // it by, since dep()/find() resolve a name. A handed id the registry can
+    // also name keeps that name beside it (targetName): the id may only have
+    // appeared in a reply while the handler addressed the object by name, and
+    // a replay matches either. A target that is neither makes the recording
+    // unreplayable, so it is dropped rather than kept as a half-truth.
     const calls: InvocationCassette['calls'] = [];
     for (const c of ev.calls ?? []) {
       const handed = ev.argsText.includes(c.targetId)
         || calls.some(prev => prev.replyText?.includes(c.targetId));
-      const target = handed ? c.targetId : (await this.resolveCallerIdentity(c.targetId))?.name;
+      const name = (await this.resolveCallerIdentity(c.targetId))?.name;
+      const target = handed ? c.targetId : name;
       if (!target) {
         log.info(`invocation of ${typeId}.${ev.method} dropped: outbound target ${c.targetId} is not registered`);
         return;
       }
-      calls.push({ target, method: c.method, payloadText: c.payloadText,
+      calls.push({ target, ...(handed && name ? { targetName: name } : {}), method: c.method, payloadText: c.payloadText,
         ...(c.replyText !== undefined ? { replyText: c.replyText } : {}),
         ...(c.errorText !== undefined ? { errorText: c.errorText } : {}) });
     }

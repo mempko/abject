@@ -65,9 +65,11 @@ function redactedCanonical(text: string): string {
  *  the live id it saw to that name, because ids die with their object), or,
  *  for an id the invocation was handed in its arguments or an earlier reply,
  *  that id: the replay hands the candidate the same text, so it addresses
- *  the same id. */
+ *  the same id. A handed id the registry can also name carries that name in
+ *  `targetName`, and a call by either one matches. */
 export interface RecordedCall {
   target: string;
+  targetName?: string;
   method: string;
   payloadText: string;
   replyText?: string;
@@ -175,22 +177,23 @@ function parses(text: string): boolean {
   try { JSON.parse(text); return true; } catch { return false; }
 }
 
-/** Answer the candidate's outbound calls from one recording. Exact on target,
- *  method, and canonical payload: `{q: 1}` and `{q: 2}` are different
- *  questions, and a call with no payload matches only a recorded call with
- *  no payload, so omitting the payload is a miss, never a wildcard. The same
- *  question asked more than once is answered in recorded order, so a retry
- *  that failed and then succeeded replays the same way. Asked more often
- *  than it was recorded, it gets the last recorded answer again. One stub
- *  serves one replay run. */
+/** Answer the candidate's outbound calls from one recording. Exact on target
+ *  (its name, or a handed id), method, and canonical payload: `{q: 1}` and
+ *  `{q: 2}` are different questions, and a call with no payload matches only
+ *  a recorded call with no payload, so omitting the payload is a miss, never
+ *  a wildcard. The same question asked more than once is answered in
+ *  recorded order, so a retry that failed and then succeeded replays the same
+ *  way. Asked more often than it was recorded, it gets the last recorded
+ *  answer again. One stub serves one replay run. */
 export function stubFor(recording: InvocationRecording): CallStub {
   const used = new Set<number>();
-  return req => {
+  return (req: CallStubRequest) => {
     const want = redactedCanonical(req.payloadText);
     let next = -1;
     let last = -1;
     recording.calls.forEach((c, i) => {
-      if (c.target !== req.target || c.method !== req.method || redactedCanonical(c.payloadText) !== want) return;
+      if ((c.target !== req.target && c.targetName !== req.target) || c.method !== req.method) return;
+      if (redactedCanonical(c.payloadText) !== want) return;
       last = i;
       if (next < 0 && !used.has(i)) next = i;
     });
