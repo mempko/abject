@@ -11,7 +11,10 @@
  *   `invocations:<typeId>` - ScriptableAbject's `invocation` events: which
  *                            handler ran, with what, every outbound `call()`
  *                            it made and the reply, and what it returned.
- *                            This is what the FitnessJudge replays.
+ *                            This is what the FitnessJudge replays. An
+ *                            invocation that threw, was truncated, or left
+ *                            an outbound call unanswered is not kept,
+ *                            because it cannot be replayed.
  *
  * The link is the emitter's to make, not this object's: HttpClient and each
  * ScriptableAbject discover the recorder through the registry and send to
@@ -197,6 +200,14 @@ export class CassetteRecorder extends Abject {
   }
 
   private async recordInvocation(from: AbjectId, ev: InvocationEvent): Promise<void> {
+    // Replay needs the value a handler returned, whole, and an answer for
+    // every outbound call. An invocation that threw, was cut at a size cap,
+    // or returned before an un-awaited call was answered can never be
+    // replayed, and kept here it would take one of its method's
+    // PER_BUCKET_CAP slots: a handler that often rejects bad input would
+    // push every replayable recording out.
+    if (ev.resultText === undefined || ev.truncated) return;
+    if ((ev.calls ?? []).some(c => c.replyText === undefined && c.errorText === undefined)) return;
     const typeId = await this.userTypeIdOf(from);
     if (!typeId) return;
     // Each outbound target becomes the name the registry knows it by. Replay
