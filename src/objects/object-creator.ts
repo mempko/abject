@@ -45,6 +45,17 @@ const log = new Log('OBJECT-CREATOR');
 const JUDGE_TIMEOUT_MS = 90000;
 
 /**
+ * The gate's policy when the judge cannot answer (absent, timed out, or
+ * erroring): it fails OPEN. A deploy is refused only on a contradiction the
+ * judge verified; a judge that could not weigh the evidence has verified
+ * nothing, and refusing would leave the agent a refusal it can do nothing
+ * about while the live object keeps its old code. The note on the result
+ * says the deploy went ahead unjudged, so a judge that keeps failing shows
+ * on every deploy instead of passing silently.
+ */
+const JUDGE_FAILS_OPEN = 'the gate fails open, so this deploy went ahead unjudged';
+
+/**
  * The task timeout ObjectCreator asks AgentAbject for. AgentAbject also waits
  * at most this long for each act (the `agentAct` request, or the job that
  * carries it), so an action still running past it has been given up on.
@@ -2346,7 +2357,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     if (liveSource === undefined) return { note: 'fitness: unverified — no live source to run as the control, so a contradiction could not be told from non-determinism' };
 
     this.fitnessJudgeId ??= (await this.discoverDep('FitnessJudge')) ?? undefined;
-    if (!this.fitnessJudgeId) return { note: 'fitness: judge unavailable — unverified' };
+    if (!this.fitnessJudgeId) return { note: `fitness: judge unavailable — unverified; ${JUDGE_FAILS_OPEN}` };
 
     let verdict: Verdict;
     try {
@@ -2361,12 +2372,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const timedOut = /time(?:d)?\s*out|timeout/i.test(msg);
       // A judge that timed out is distinct from one that is not on the bus:
       // the evidence exists but could not be weighed inside the budget, rather
-      // than there being nothing to weigh. Both fail OPEN (the deploy proceeds,
-      // unverified); whether a timeout should instead refuse is an open policy
-      // question, and the label keeps a persistent timeout visible.
+      // than there being nothing to weigh. Both fail open (JUDGE_FAILS_OPEN),
+      // and the label keeps a persistent timeout visible.
       return { note: timedOut
-        ? `fitness: judge timed out (${msg.slice(0, 80)}) — unverified`
-        : `fitness: judge unreachable (${msg.slice(0, 80)}) — unverified` };
+        ? `fitness: judge timed out (${msg.slice(0, 80)}) — unverified; ${JUDGE_FAILS_OPEN}`
+        : `fitness: judge unreachable (${msg.slice(0, 80)}) — unverified; ${JUDGE_FAILS_OPEN}` };
     }
     if (verdict.pass) return { note: verdict.summary };
 
