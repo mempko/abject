@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.16.7",
+    "date": "2026-11-11",
+    "title": "A Terminal of Your Own",
+    "summary": "Abject now has a built-in terminal: each terminal window runs its own interactive shell, which you approve once per session. Clipboard access also now goes through you, so nothing reads or writes your clipboard without your say.",
+    "highlights": [
+      "Terminal: open an interactive shell in its own window. Each window gets its own shell, and you approve shell access once per session rather than for every command.",
+      "Clipboard permission: every clipboard read and write is now put to you for approval, so objects cannot quietly read what you copied or replace it.",
+      "New documentation on how the terminal works inside Abjects, built on a VT core (libghostty).",
+      "The project has adopted a code of conduct: everyone is welcome, except fascists."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.16.6",
     "date": "2026-11-10",
     "title": "A Smoother Live View of the Web",
