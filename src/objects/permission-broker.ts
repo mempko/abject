@@ -333,7 +333,7 @@ export class PermissionBroker extends Abject {
               name: 'requestPermission',
               description: 'Called by capability objects. Returns a decision, asking the user only when policy cannot answer.',
               parameters: [
-                { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'shell | directory | domain | skill_shell | web_action | mcp_tool' },
+                { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'shell | directory | domain | skill_shell | clipboard | web_action | mcp_tool' },
                 { name: 'resource', type: { kind: 'primitive', primitive: 'string' }, description: 'The command, path, domain, or the action as the person should read it (e.g. https://example.com: click button "Send")' },
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Human-readable request; for web_action the action itself (click button "Send")', optional: true },
                 { name: 'cwd', type: { kind: 'primitive', primitive: 'string' }, description: 'Where a command would run', optional: true },
@@ -459,7 +459,9 @@ export class PermissionBroker extends Abject {
   }
 
   private async claimAuthority(): Promise<void> {
-    for (const name of ['ShellExecutor', 'HostFileSystem', 'HttpClient', 'StreamClient']) {
+    // Clipboard is claimed too: it holds no policy of its own, so the only way
+    // its reads and writes are answered is through this object.
+    for (const name of ['ShellExecutor', 'HostFileSystem', 'HttpClient', 'StreamClient', 'Clipboard']) {
       const id = await this.discoverDep(name);
       if (!id) continue;
       try {
@@ -659,7 +661,9 @@ export class PermissionBroker extends Abject {
     delete req.receipt;
     if (isOutward(req.type)) return this.authorizeOutward(req, msg.routing.from);
     const ownerNames = req.type === 'shell' || req.type === 'skill_shell' ? ['ShellExecutor']
-      : req.type === 'directory' ? ['HostFileSystem', 'ShellExecutor'] : ['HttpClient', 'StreamClient'];
+      : req.type === 'directory' ? ['HostFileSystem', 'ShellExecutor']
+      : req.type === 'clipboard' ? ['Clipboard']
+      : ['HttpClient', 'StreamClient'];
     const owners = await Promise.all(ownerNames.map(name => this.discoverDep(name)));
     if (!owners.includes(msg.routing.from)) {
       if (req.callerId && req.callerId !== msg.routing.from) throw new Error('Only a capability owner may forward another caller');
@@ -722,6 +726,7 @@ export class PermissionBroker extends Abject {
     if (checkStep) return checkStep;
     if (req.type === 'shell') return this.decideShell(req, ctx);
     if (req.type === 'directory') return this.decideDirectory(req, ctx);
+    if (req.type === 'clipboard') return this.decideClipboard(req, ctx);
     if (isOutward(req.type)) return this.decideOutward(req, ctx);
 
     const standing = this.standingVerdict(req.type, req.resource);
@@ -853,6 +858,30 @@ export class PermissionBroker extends Abject {
    * are honored here exactly as they are for commands, so "Allow file edits in
    * X" answers once for both. Everything else asks.
    */
+  /**
+   * The clipboard, asked about like a file and decided like nothing else.
+   *
+   * What sits on a clipboard is not the asking object's: a read hands over
+   * whatever the person copied last, often a password or a private note, and a
+   * write replaces that under them. So no autonomy level answers it — a
+   * project being at `full` is a statement about its own files, not about the
+   * one place everything copied passes through. Only an answer the person gave
+   * for this exact operation is reused, which is why the resource is the
+   * operation (`read text`, `write image`) rather than a path or a scope.
+   */
+  private async decideClipboard(req: PermissionRequest, ctx: CallerContext): Promise<Outcome> {
+    const standing = this.standingVerdict('clipboard', req.resource);
+    if (standing === false) {
+      this.record(req, ctx, 'deny', false, 'blocked by a standing clipboard rule');
+      return { decision: 'deny', asked: false, restrictEnv: false };
+    }
+    if (standing === true) {
+      this.record(req, ctx, 'accept_once', false, 'standing clipboard grant');
+      return { decision: 'accept_once', asked: false, restrictEnv: false };
+    }
+    return this.ask(req, ctx, undefined, 'the clipboard is not covered by any standing answer');
+  }
+
   private async decideDirectory(req: PermissionRequest, ctx: CallerContext): Promise<Outcome> {
     const target = req.resource;
     const operation = req.operation ?? 'read';
@@ -1318,7 +1347,10 @@ export class PermissionBroker extends Abject {
    */
   private unattendedDecision(req: PermissionRequest, analysis: CommandAnalysis | undefined): PermissionDecision | undefined {
     if (this.promptMode === 'deny') return 'deny';
-    if (this.promptMode === 'allow' && !isOutward(req.type)
+    // A clipboard access is asked about even in allow mode. "Do not ask me"
+    // was an answer about commands this machine runs; a read here hands over
+    // whatever the person last copied, and a write discards it.
+    if (this.promptMode === 'allow' && !isOutward(req.type) && req.type !== 'clipboard'
       && !(analysis && (analysis.effect === 'dangerous' || analysis.opaque))) {
       return 'accept_once';
     }
@@ -1354,9 +1386,10 @@ export class PermissionBroker extends Abject {
       kind: 'options',
       topic: 'permission',
       title: req.type === 'shell' ? 'Shell Permission'
-        : req.type === 'domain' ? 'Network Permission' : 'Filesystem Permission',
-      message: `${ctx.name} wants to ${req.type === 'shell' ? 'run a command' : req.type === 'directory' ? `${req.operation ?? 'read'} files` : 'access'}`
-        + (project ? ` in ${project.name}` : ''),
+        : req.type === 'domain' ? 'Network Permission'
+        : req.type === 'clipboard' ? 'Clipboard Permission' : 'Filesystem Permission',
+      message: `${ctx.name} wants to ${req.type === 'shell' ? 'run a command' : req.type === 'directory' ? `${req.operation ?? 'read'} files` : req.type === 'clipboard' ? `${req.operation ?? 'read'} the clipboard` : 'access'}`
+        + (project && req.type !== 'clipboard' ? ` in ${project.name}` : ''),
       ...(summary ? { summary } : {}),
       resource: redactCommand(req.resource),
       detail,
@@ -1513,6 +1546,23 @@ export class PermissionBroker extends Abject {
           ],
         });
       }
+      return groups;
+    }
+
+    // The clipboard has two operations and no path, program or scope to grant
+    // inside, so the remembered answers are the operations themselves. The
+    // labels name what is actually being covered, since a rule on one
+    // operation answers nothing for the other.
+    if (req.type === 'clipboard') {
+      const [verb, noun] = req.resource.split(' ');
+      const what = noun ? `${verb === 'write' ? 'writing' : 'reading'} clipboard ${noun}` : req.resource;
+      groups.push({
+        label: 'Clipboard',
+        options: [
+          { id: 'accept_always', label: `Always allow ${what}`, tone: 'good' },
+          { id: 'deny_always', label: `Never allow ${what}`, tone: 'bad' },
+        ],
+      });
       return groups;
     }
 
@@ -1858,6 +1908,9 @@ export class PermissionBroker extends Abject {
       '',
       'Outward actions (web_action from WebBrowser, mcp_tool from an MCPBridge) go to the person in',
       'every mode but deny, unless they remembered an answer for that caller on that site or tool.',
+      'Clipboard reads and writes are put to the person in every prompt mode but deny: what is on a',
+      'clipboard is not the asking object\'s to read, and an answer given for one operation covers',
+      'that operation only.',
       'A refusal comes back to the acting object as a failure it can report and adapt to.',
     ];
     return super.askPrompt(question) + '\n\n' + lines.join('\n');
@@ -1916,7 +1969,7 @@ interface PermissionRequest {
   physicalPaths?: Array<{ logical: string; physical?: string }>;
   receipt?: PermissionReceipt;
   taskId?: string;
-  type: 'shell' | 'directory' | 'domain' | 'skill_shell' | OutwardType;
+  type: 'shell' | 'directory' | 'domain' | 'skill_shell' | 'clipboard' | OutwardType;
   resource: string;
   description?: string;
   /** Outward requests: what a remembered answer covers (site origin, "server/tool"). */
@@ -2107,6 +2160,11 @@ function describeRule(r: Rule): string {
   }
   const outward = /^(web_action|mcp_tool):(.*)$/s.exec(r.command);
   if (outward) return describeOutward(outward[1] as OutwardType, outward[2], r.caller, r.allow);
+  const clipboard = /^clipboard:(read|write) (text|image)$/s.exec(r.command);
+  if (clipboard) {
+    return `Clipboard ${clipboard[2]} ${clipboard[1] === 'read' ? 'reads are' : 'writes are'} ` +
+      `${r.allow ? 'allowed' : 'blocked'}`;
+  }
   const standing = /^(directory|domain|skill_shell):(.*)$/s.exec(r.command);
   if (standing) {
     return `${standing[1] === 'domain' ? 'Network' : 'Filesystem'} access to ` +

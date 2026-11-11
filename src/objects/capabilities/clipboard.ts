@@ -5,8 +5,16 @@
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { request } from '../../core/message.js';
+import { PermissionDenied, PermissionReceipt } from '../../core/permission-outcome.js';
 
 const CLIPBOARD_INTERFACE = 'abjects:clipboard';
+
+/**
+ * How long a clipboard question waits for a person. The same span a shell
+ * command gets: the answer needs someone at the keyboard, and a shorter wait
+ * would turn "nobody is here" into "no".
+ */
+const PERMISSION_WAIT_MS = 31 * 60 * 1000;
 
 /**
  * Clipboard capability object.
@@ -27,13 +35,14 @@ export class Clipboard extends Abject {
   private memoryClipboard = '';
   private memoryImage = '';
   private uiServerId?: AbjectId;
+  private permissionsAuthorityId?: AbjectId;
 
   constructor() {
     super({
       manifest: {
         name: 'Clipboard',
         description:
-          'Provides clipboard read/write capabilities for text and images. Objects can copy and paste text, and copy/read images (as data:image/* URIs). Use cases: copy text or images to the system clipboard, read them back.',
+          'Provides clipboard read/write capabilities for text and images. Objects can copy and paste text, and copy/read images (as data:image/* URIs). Use cases: copy text or images to the system clipboard, read them back. Every read and write is put to the person through PermissionBroker first, and a refusal arrives as PermissionDenied.',
         version: '1.0.0',
         interface: {
             id: CLIPBOARD_INTERFACE,
@@ -102,31 +111,93 @@ export class Clipboard extends Abject {
   }
 
   private setupHandlers(): void {
-    this.on('read', async () => {
+    // PermissionBroker claims this at boot; first caller wins, as on the other
+    // capability objects.
+    this.on('setPermissionsAuthority', async (msg: AbjectMessage) => {
+      if (this.permissionsAuthorityId) return { success: false, error: 'Authority already set' };
+      this.permissionsAuthorityId = msg.routing.from;
+      return { success: true };
+    });
+
+    this.on('read', async (msg: AbjectMessage) => {
+      await this.authorize(msg, 'read', 'text');
       return this.readClipboard();
     });
 
     this.on('write', async (msg: AbjectMessage) => {
       const { text } = msg.payload as { text: string };
+      await this.authorize(msg, 'write', 'text');
       return this.writeClipboard(text);
     });
 
-    this.on('hasText', async () => {
+    this.on('hasText', async (msg: AbjectMessage) => {
+      await this.authorize(msg, 'read', 'text');
       return this.hasClipboardText();
     });
 
-    this.on('readImage', async () => {
+    this.on('readImage', async (msg: AbjectMessage) => {
+      await this.authorize(msg, 'read', 'image');
       return this.readClipboardImage();
     });
 
     this.on('writeImage', async (msg: AbjectMessage) => {
       const { image } = msg.payload as { image: string };
+      await this.authorize(msg, 'write', 'image');
       return this.writeClipboardImage(image);
     });
 
     this.on('hasImage', async () => {
       return this.memoryImage.length > 0;
     });
+  }
+
+  /**
+   * The question every read and write passes through.
+   *
+   * Nothing on a clipboard belongs to the object asking for it: a read hands
+   * over whatever the person copied last, and a write replaces it under them.
+   * So the answer comes from PermissionBroker, which puts it to the person
+   * unless they already answered for this exact operation — the operation, not
+   * the caller's project, since a project's autonomy says nothing about the one
+   * place everything copied passes through.
+   *
+   * A refusal is thrown as PermissionDenied carrying the receipt, so the caller
+   * can tell a decline from a rule from an outage. With no broker running
+   * nobody can be asked, and that is a refusal: this object keeps no clipboard
+   * access of its own to fall back on.
+   */
+  private async authorize(msg: AbjectMessage, operation: 'read' | 'write', kind: 'text' | 'image'): Promise<void> {
+    const resource = `${operation} ${kind}`;
+    const local = (decision: string, source: PermissionReceipt['source'], reason: string): PermissionReceipt => ({
+      authority: this.permissionsAuthorityId ?? this.id,
+      callerId: msg.routing.from,
+      operation,
+      resource,
+      decision,
+      source,
+      reason,
+    });
+    this.permissionsAuthorityId = await this.resolveDep('PermissionBroker', this.permissionsAuthorityId);
+    if (!this.permissionsAuthorityId) {
+      throw new PermissionDenied(local('deny', 'unavailable', 'no permission broker is running to ask about the clipboard'));
+    }
+    let response: { decision?: string; receipt?: PermissionReceipt } | undefined;
+    try {
+      response = await this.request<{ decision?: string; receipt?: PermissionReceipt }>(
+        request(this.id, this.permissionsAuthorityId, 'requestPermission', {
+          type: 'clipboard',
+          operation,
+          resource,
+          callerId: msg.routing.from,
+        }),
+        PERMISSION_WAIT_MS);
+    } catch (err) {
+      throw new PermissionDenied(local('deny', 'unavailable',
+        `could not ask about the clipboard: ${err instanceof Error ? err.message : String(err)}`));
+    }
+    if (typeof response?.decision === 'string' && response.decision.startsWith('accept')) return;
+    throw new PermissionDenied(response?.receipt
+      ?? local(response?.decision ?? 'deny', 'policy', 'Clipboard access denied'));
   }
 
   /**
@@ -280,7 +351,8 @@ export class Clipboard extends Abject {
 ### IMPORTANT
 - Images are data:image/* base64 URIs (the same form a canvas \`imageUrl\`/\`drawImage\` command draws, and that markdown \`![alt](data:...)\` renders).
 - To capture an image a user PASTES into your widget, handle the widget's paste input event — that delivers the pasted image directly; readImage returns only what was written through this object.
-- May fail if the browser denies clipboard permissions.
+- Every read and write asks the person first (PermissionBroker), who can allow it once or always. A refusal comes back as PermissionDenied, not as an empty string — so handle it rather than treating '' as "nothing there".
+- May also fail if the browser denies clipboard permissions.
 - Do NOT use navigator.clipboard directly — always go through the Clipboard object.`;
   }
 }
