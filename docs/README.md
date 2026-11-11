@@ -9,6 +9,7 @@ modules in other languages, web routes, workspace profiles.
 
 - **LLM_PROVIDERS.md**: how an abject becomes an LLM provider by registering with the LLM object, the messages it then answers, naming rules, credentials, and network limits.
 - **PACKAGES.md**: abject packages in both runtimes (WASM and script): `abject.json`, building with `pnpm forge`, where packages load from, `packages.json`, settings, the `abject` command, the headless edition, and how package abjects persist and stay read-only.
+- **TERMINAL.md**: giving the person a real terminal inside Abjects: how shell access is owned and consented to today, what libghostty offers as an embeddable library (libghostty-vt), and the proposed `Terminal` capability, `TerminalSession`, `TerminalView` UI abject landscape — with the security analysis, packaging options and implementation sequence.
 - **WASM_ABI.md**: the host/guest contract for abjects compiled to WebAssembly: module exports, host imports, the JSON envelope protocol, the `wasm:sha256:` source ref, and the package format.
 - **WEB_GATEWAY.md**: the HTTP gateway: serving abjects as JSON method routes, or in `http` mode as whole HTTP requests (pages, sign-in, cookies, webhooks), access and tokens, and what the gateway keeps for itself.
 - **WORKSPACE_PROFILES.md**: which built-in objects and packages a workspace gets: the `default` and `service` profiles, `profiles.json`, packages joining profiles, the headless edition, and restarts.
