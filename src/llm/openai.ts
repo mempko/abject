@@ -535,7 +535,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     }
 
     try {
-      return await this.completeOnce(request);
+      return await this.completeOnce(request, options.signal);
     } catch (err) {
       // As the stream does: with retries exhausted, an empty completion is an
       // empty answer, for callers that have their own empty-reply handling.
@@ -545,12 +545,13 @@ export class OpenAIProvider extends BaseLLMProvider {
   }
 
   /** One plain chat-completions request, retried; a reply with no text throws EmptyCompletionError. */
-  private completeOnce(request: OpenAIRequest): Promise<LLMCompletionResult> {
+  private completeOnce(request: OpenAIRequest, signal?: AbortSignal): Promise<LLMCompletionResult> {
     return this.withRetries(async () => {
       const response = await this.fetch(`${this.baseUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: this.buildHeaders(),
         body: JSON.stringify(request),
+        signal,
       }, { timeout: 300000 });
 
       const data = JSON.parse(response.body) as OpenAIResponse;
@@ -586,8 +587,9 @@ export class OpenAIProvider extends BaseLLMProvider {
     }, {
       label: `${this.name}.complete`,
       // An empty completion is a stochastic model behavior: always worth an
-      // immediate retry, whatever numbers its message happens to carry.
-      isRetryable: err => err instanceof EmptyCompletionError || defaultIsRetryable(err),
+      // immediate retry, whatever numbers its message happens to carry. A
+      // call the caller aborted is never retried.
+      isRetryable: err => !signal?.aborted && (err instanceof EmptyCompletionError || defaultIsRetryable(err)),
       delayMs: (err, _attempt, delay) => (err instanceof EmptyCompletionError ? 0 : delay),
     });
   }

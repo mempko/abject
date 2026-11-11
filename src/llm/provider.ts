@@ -716,18 +716,23 @@ export abstract class BaseLLMProvider implements LLMProvider {
     }
 
     let response: Response;
-    if (fetchOptions?.timeout && !options.signal) {
+    if (fetchOptions?.timeout) {
       const abort = new AbortController();
       const timer = setTimeout(() => abort.abort(), fetchOptions.timeout);
+      // The caller no longer wants the answer: close the connection now.
+      const signal = options.signal;
+      const onStop = () => abort.abort();
+      if (signal?.aborted) onStop(); else signal?.addEventListener('abort', onStop, { once: true });
       try {
         response = await fetch(url, { ...options, signal: abort.signal });
       } catch (err) {
-        if (abort.signal.aborted) {
+        if (abort.signal.aborted && !signal?.aborted) {
           throw new Error(`LLM API request timed out after ${fetchOptions.timeout}ms`);
         }
         throw err;
       } finally {
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onStop);
       }
     } else {
       response = await fetch(url, options);
