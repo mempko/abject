@@ -228,7 +228,7 @@ export class Scheduler extends Abject {
         description: string; intervalMs: number; jobCode: string; queue?: string;
       };
       requireNonEmpty(description, 'description');
-      precondition(intervalMs > 0, 'intervalMs must be positive');
+      precondition(typeof intervalMs === 'number' && isFinite(intervalMs) && intervalMs > 0, 'intervalMs must be a positive number (ms)');
       requireNonEmpty(jobCode, 'jobCode');
 
       // Deduplicate: if an identical schedule already exists (same jobCode
