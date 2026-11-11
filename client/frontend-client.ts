@@ -430,9 +430,12 @@ export class FrontendClient {
     // Tell the backend when the viewport changes size (debounced past the
     // resize-drag stream) so display-sized chrome like the sidebar dock can
     // follow. Read the dimensions inside the debounce: the compositor's own
-    // resize handler has updated the canvas by then.
+    // resize handler has updated the canvas by then. The canvas can also
+    // change size with no window resize (a stylesheet that applies late, as
+    // in Safari); the compositor reports that, and both paths share one
+    // debounce so a window resize still sends a single message.
     let resizeNotifyTimer: ReturnType<typeof setTimeout> | undefined;
-    window.addEventListener('resize', () => {
+    const notifyDisplayResized = () => {
       if (resizeNotifyTimer) clearTimeout(resizeNotifyTimer);
       resizeNotifyTimer = setTimeout(() => {
         resizeNotifyTimer = undefined;
@@ -443,7 +446,9 @@ export class FrontendClient {
           mobile: this.mobileMode || this.isPhone,
         });
       }, 250);
-    });
+    };
+    window.addEventListener('resize', notifyDisplayResized);
+    this.compositor.onCanvasResized = notifyDisplayResized;
   }
 
   private setupMobileKeyboard(): void {
