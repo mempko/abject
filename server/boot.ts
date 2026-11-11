@@ -70,6 +70,7 @@ import { FileTransfer } from '../src/objects/capabilities/file-transfer.js';
 import { MediaStreamCapability } from '../src/objects/capabilities/media-stream.js';
 import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from '../src/objects/workspace-share-registry.js';
 import { ShellExecutor } from '../src/objects/capabilities/shell-executor.js';
+import { Terminal } from '../src/objects/capabilities/terminal.js';
 import { HostFileSystem } from '../src/objects/capabilities/host-filesystem.js';
 import { WebSearch } from '../src/objects/capabilities/web-search.js';
 import { WebFetch } from '../src/objects/capabilities/web-fetch.js';
@@ -504,6 +505,9 @@ export async function bootServer(options: BootOptions): Promise<void> {
   runtime.objectFactory.registerConstructor('FileTransfer', () => new FileTransfer());
   runtime.objectFactory.registerConstructor('MediaStream', () => new MediaStreamCapability());
   runtime.objectFactory.registerConstructor('ShellExecutor', () => new ShellExecutor());
+  // Terminal stays on the main thread with the display layer: the pty and the
+  // ghostty screen it starts live in the process that runs the window.
+  runtime.objectFactory.registerConstructor('Terminal', () => new Terminal());
   runtime.objectFactory.registerConstructor('HostFileSystem', () => new HostFileSystem());
   runtime.objectFactory.registerConstructor('WebSearch', () => new WebSearch());
   runtime.objectFactory.registerConstructor('WebFetch', () => new WebFetch());
@@ -631,6 +635,8 @@ export async function bootServer(options: BootOptions): Promise<void> {
   const webBrowserId = await supervisedSpawn('WebBrowser');
   // WebAgent is per-workspace (spawned by WorkspaceManager), not global
   const shellExecutorId = await supervisedSpawn('ShellExecutor');
+  // Interactive shells: one approved session per window, opened by consent.
+  await supervisedSpawn('Terminal');
   const hostFilesystemId = await supervisedSpawn('HostFileSystem');
   const webSearchId = await supervisedSpawn('WebSearch');
   const webFetchId = await supervisedSpawn('WebFetch');

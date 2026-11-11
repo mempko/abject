@@ -24,6 +24,10 @@ files:
   # bundle: it loads its platform package (@lydell/node-pty-<os>-<arch>) by
   # name at runtime.
   - node_modules/@lydell/**/*
+  # The terminal emulator. External to the server bundle because its Node
+  # loader reads wasm/ghostty-vt.wasm from beside its own module with
+  # fs.readFile; the one prebuilt wasm serves every OS and architecture.
+  - node_modules/@slopus/**/*
   - node_modules/ws/**/*
   - node_modules/uuid/**/*
   - node_modules/ajv/**/*
@@ -55,6 +59,9 @@ asarUnpack:
   - node_modules/node-datachannel/**/prebuilds/**/*
   # node-pty's addon, and on macOS its spawn-helper executable
   - node_modules/@lydell/**/*
+  # The terminal's wasm is read with fs.readFile from a worker thread, which
+  # cannot reach inside the asar archive (same reason as the workers below).
+  - node_modules/@slopus/**/*
 
 linux:
   target:

@@ -660,8 +660,12 @@ export class PermissionBroker extends Abject {
     const req = { ...(msg.payload as PermissionRequest) };
     delete req.receipt;
     if (isOutward(req.type)) return this.authorizeOutward(req, msg.routing.from);
-    const ownerNames = req.type === 'shell' || req.type === 'skill_shell' ? ['ShellExecutor']
-      : req.type === 'directory' ? ['HostFileSystem', 'ShellExecutor']
+    // Terminal owns a pty the way ShellExecutor owns a single command, and it
+    // asks on behalf of the view that opened the session, so it is a capability
+    // owner here too. Without it a terminal view's first ask was refused as
+    // "forwarding another caller" and no terminal could ever open.
+    const ownerNames = req.type === 'shell' || req.type === 'skill_shell' ? ['ShellExecutor', 'Terminal']
+      : req.type === 'directory' ? ['HostFileSystem', 'ShellExecutor', 'Terminal']
       : req.type === 'clipboard' ? ['Clipboard']
       : ['HttpClient', 'StreamClient'];
     const owners = await Promise.all(ownerNames.map(name => this.discoverDep(name)));
@@ -1381,6 +1385,12 @@ export class PermissionBroker extends Abject {
       })()
       : [`Asking because   ${why}`];
     const summary = req.type === 'shell' ? await this.explainCommand(req.resource, analysis, req.cwd) : undefined;
+
+    // A capability may ask for more than one action at once: a terminal asks for
+    // a whole session, where everything typed afterwards runs without another
+    // prompt. That sentence changes what the buttons mean, so it belongs above
+    // the command analysis, not in a log line the person never reads.
+    if (req.description) detail.unshift(`Scope      ${req.description}`);
 
     const answer = await this.askPerson({
       kind: 'options',

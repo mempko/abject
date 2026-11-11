@@ -42,6 +42,8 @@ export const INFRA_OBJECTS = [
 export const UI_OBJECTS = [
   'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
   'WebBrowserViewer', 'FileManager', 'FileViewer', 'ExternalProjectBrowser', 'ChatBrowser',
+  // Before Taskbar, which offers a launcher row for it.
+  'TerminalView',
   // Taskbar resolves its optional browsers at init, so every object it offers a
   // row for has to be spawned before it.
   'AbjectEditor', 'PeersViewer', 'Taskbar',

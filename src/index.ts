@@ -211,7 +211,13 @@ export { AgentAbject, AGENT_ABJECT_ID } from './objects/agent-abject.js';
 export type { AgentPhase, AgentAction, AgentActionResult, AgentTaskState, AgentTaskOptions, AgentConfig, TerminalActionConfig } from './objects/agent-abject.js';
 export { ScrumMaster } from './objects/scrum-master.js';
 export { WebBrowserViewer, WEB_BROWSER_VIEWER_ID } from './objects/web-browser-viewer.js';
+export {
+  TerminalView, TERMINAL_VIEW_ID, composeTerminalFrame, encodeKey, encodeMouse, scanMouseMode,
+} from './objects/terminal-view.js';
+export type { TerminalScreen, TerminalCell, TerminalRow, TerminalCursor, DrawCommand, FrameOptions } from './objects/terminal-view.js';
 export { ShellExecutor, SHELL_EXECUTOR_ID } from './objects/capabilities/shell-executor.js';
+export { Terminal, TERMINAL_ID, TERMINAL_INTERFACE } from './objects/capabilities/terminal.js';
+export { TerminalSession, TERMINAL_SESSION_INTERFACE, type TerminalSessionSpec } from './objects/capabilities/terminal-session.js';
 export { HostFileSystem, HOST_FILESYSTEM_ID } from './objects/capabilities/host-filesystem.js';
 export { WebSearch, WEB_SEARCH_ID } from './objects/capabilities/web-search.js';
 export { WebFetch, WEB_FETCH_ID } from './objects/capabilities/web-fetch.js';

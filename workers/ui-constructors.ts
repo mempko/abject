@@ -43,6 +43,7 @@ import { Sidebar } from '../src/objects/sidebar.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { WebBrowserViewer } from '../src/objects/web-browser-viewer.js';
+import { TerminalView } from '../src/objects/terminal-view.js';
 
 export function addUiConstructors(map: Map<string, ObjectFactory>): Map<string, ObjectFactory> {
   map.set('AbjectEditor', () => new AbjectEditor());
@@ -84,5 +85,6 @@ export function addUiConstructors(map: Map<string, ObjectFactory>): Map<string, 
   map.set('GlobalToolbar', () => new GlobalToolbar());
   map.set('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   map.set('WebBrowserViewer', () => new WebBrowserViewer());
+  map.set('TerminalView', () => new TerminalView());
   return map;
 }

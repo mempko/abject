@@ -21,7 +21,8 @@
  *                           pairing (RemoteUIAccess). `abject serve` runs whichever
  *                           the install carries.
  *   lib/native/             the bundled packages (the knowledge base)
- *   lib/node_modules/       native and external modules, for this platform
+ *   lib/node_modules/       native and external modules, for this platform,
+ *                           including the terminal's ghostty-vt.wasm
  *   lib/package.json, VERSION, README.txt, LICENSE
  *
  * The binary is a copy of the Node that runs this script, so build with the
@@ -108,7 +109,12 @@ import(pathToFileURL(path.join(__dirname, 'cli', 'abject.mjs')).href).catch((err
 // The modules the server and the CLI keep external: native ones, and ones
 // loaded lazily (node-pty for the CLI-agent providers, Playwright for web
 // browsing; browsers are downloaded by \`abject setup\`, not shipped).
-const runtimeDeps = ['ws', 'node-datachannel', 'linkedom', '@lydell/node-pty', 'playwright'];
+// @slopus/ghostty-wasm (the terminal emulator) is here for its asset, not
+// its code: its Node loader reads wasm/ghostty-vt.wasm beside its own module
+// with fs.readFile, so the package must be a real directory the bundle can
+// resolve from lib/dist-server, not bundled into it. Nothing per-platform:
+// the one ghostty-vt.wasm ships unchanged for every OS and architecture.
+const runtimeDeps = ['ws', 'node-datachannel', 'linkedom', '@lydell/node-pty', 'playwright', '@slopus/ghostty-wasm'];
 const dependencies = Object.fromEntries(runtimeDeps.map((d) => {
   const v = pkg.dependencies[d];
   if (!v) throw new Error(`package.json has no dependency '${d}'`);

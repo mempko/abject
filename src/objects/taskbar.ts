@@ -74,6 +74,7 @@ export class Taskbar extends Abject {
   private peersViewerId?: AbjectId;
   private jobBrowserId?: AbjectId;
   private webBrowserViewerId?: AbjectId;
+  private terminalViewId?: AbjectId;
   private goalBrowserId?: AbjectId;
   private knowledgeBrowserId?: AbjectId;
   private agentBrowserId?: AbjectId;
@@ -259,6 +260,7 @@ row; favorites list right under the built-in apps and are kept per workspace.
     this.peersViewerId = await this.requireDep('PeersViewer');
     this.jobBrowserId = await this.requireDep('JobBrowser');
     this.webBrowserViewerId = await this.discoverDep('WebBrowserViewer') ?? undefined;
+    this.terminalViewId = await this.discoverDep('TerminalView') ?? undefined;
     this.goalBrowserId = await this.discoverDep('GoalBrowser') ?? undefined;
     this.knowledgeBrowserId = await this.discoverDep('KnowledgeBrowser') ?? undefined;
     this.agentBrowserId = await this.discoverDep('AgentBrowser') ?? undefined;
@@ -630,6 +632,9 @@ row; favorites list right under the built-in apps and are kept per workspace.
       if (this.agentBrowserId) launchers.push({ label: 'Agents', key: 'agents', target: this.agentBrowserId });
       if (this.schedulerBrowserId) launchers.push({ label: 'Schedules', key: 'schedules', target: this.schedulerBrowserId });
       if (this.webBrowserViewerId) launchers.push({ label: 'Web', key: 'web', target: this.webBrowserViewerId });
+      // A terminal is the person's own shell, so it sits among the apps rather
+      // than among the user objects. Opening it asks permission there and then.
+      if (this.terminalViewId) launchers.push({ label: 'Terminal', key: 'terminal', target: this.terminalViewId });
       if (this.fileManagerId) launchers.push({ label: 'Files', key: 'files', target: this.fileManagerId });
       // Projects — the on-disk counterpart to Files
       if (this.externalProjectBrowserId) launchers.push({ label: 'Projects', key: 'projects', target: this.externalProjectBrowserId });
@@ -785,6 +790,7 @@ row; favorites list right under the built-in apps and are kept per workspace.
     // Subscribe as dependent of system objects for visibility change events
     const depIds = [this.appExplorerId!, this.chatBrowserId!, this.jobBrowserId!];
     if (this.webBrowserViewerId) depIds.push(this.webBrowserViewerId);
+    if (this.terminalViewId) depIds.push(this.terminalViewId);
     if (this.fileManagerId) depIds.push(this.fileManagerId);
     if (this.externalProjectBrowserId) depIds.push(this.externalProjectBrowserId);
     if (this.goalBrowserId) depIds.push(this.goalBrowserId);

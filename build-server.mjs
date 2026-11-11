@@ -52,6 +52,13 @@ const runtimeExternals = [
   'electron-updater',
   'linkedom',
   'tsx/esm/api',
+  // The terminal emulator's Node loader reads its wasm from disk with
+  // readFile(new URL('../wasm/ghostty-vt.wasm', import.meta.url)), i.e.
+  // relative to this module's own path. Bundled into dist-server/ that base
+  // would point at dist-server/wasm/, which does not exist, so the package
+  // stays external and ships as a real directory in node_modules (see
+  // scripts/package-headless.mjs runtimeDeps and electron-builder.yml files).
+  '@slopus/ghostty-wasm',
 ];
 
 const external = [...nodeExternals, ...runtimeExternals];

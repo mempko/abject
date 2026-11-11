@@ -1314,6 +1314,8 @@ export class SettingsManager extends Abject {
     await this.applyCapabilityQuietly('ShellExecutor', 'updatePermissions', {
       enabled: this.shell.enabled, allowedCommands: this.shell.allowedCommands, deniedCommands: this.shell.deniedCommands,
     });
+    // Terminal starts a shell too, so the same master switch governs it.
+    await this.applyCapabilityQuietly('Terminal', 'updatePermissions', { enabled: this.shell.enabled });
     // Streams are web access held open: one switch and one domain list govern both.
     for (const capability of ['HttpClient', 'StreamClient']) {
       await this.applyCapabilityQuietly(capability, 'updatePermissions', {

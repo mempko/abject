@@ -25,6 +25,7 @@ import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
 import type { BootContext, HealthResponder, UiLayer } from './boot.js';
 import { BrowserWindowHost } from '../src/objects/capabilities/browser-window-host.js';
 import { WebBrowserViewer } from '../src/objects/web-browser-viewer.js';
+import { TerminalView } from '../src/objects/terminal-view.js';
 import { Settings } from '../src/objects/settings.js';
 import { CommandPaletteAbject } from '../src/objects/command-palette.js';
 import { WindowSwitcherAbject } from '../src/objects/window-switcher.js';
@@ -130,7 +131,7 @@ export function createDesktopUi(): UiLayer {
       'FileManager', 'FileViewer', 'AgentBrowser', 'ExternalProjectBrowser', 'DataBrowser', 'SchedulerBrowser',
       'ChatWindow', 'ChatBrowser', 'AbjectEditor', 'PeersViewer', 'Taskbar',
       'WorkspaceBrowser', 'WorkspaceCollaboratorInspector', 'CommandPalette', 'WindowSwitcher',
-      'WebBrowserViewer',
+      'WebBrowserViewer', 'TerminalView',
       // The UI shell. WidgetManager moves its entire widget tree with it:
       // windows/widgets/layouts init onto their creator's bus, so they all
       // live in WidgetManager's worker.
@@ -290,6 +291,7 @@ export function createDesktopUi(): UiLayer {
       factory.registerConstructor('WorkspaceBrowser', () => new WorkspaceBrowser());
       factory.registerConstructor('WorkspaceCollaboratorInspector', () => new WorkspaceCollaboratorInspector());
       factory.registerConstructor('WebBrowserViewer', () => new WebBrowserViewer());
+      factory.registerConstructor('TerminalView', () => new TerminalView());
       factory.registerConstructor('DataBrowser', () => new DataBrowser());
       factory.registerConstructor('SkillBrowser', () => new SkillBrowser());
       factory.registerConstructor('ExternalProjectBrowser', () => new ExternalProjectBrowser());

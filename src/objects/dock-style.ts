@@ -19,7 +19,7 @@ type Style = Record<string, unknown>;
 export type DockLauncher =
   | 'network' | 'explorer' | 'procs' | 'eye' | 'notifications'
   | 'chat' | 'peers' | 'goals' | 'jobs' | 'knowledge' | 'agents'
-  | 'schedules' | 'web' | 'files' | 'projects'
+  | 'schedules' | 'web' | 'files' | 'projects' | 'terminal'
   | 'browse' | 'spaceShared' | 'spacePublic' | 'spaceLocal';
 
 /** The vector icon (ui/icons.ts) each launcher row draws. */
@@ -39,6 +39,7 @@ export const DOCK_LAUNCHERS: Record<DockLauncher, { icon: IconName }> = {
   web:           { icon: 'globe' },
   files:         { icon: 'folder' },
   projects:      { icon: 'folderOpen' },
+  terminal:      { icon: 'grid' },
   browse:        { icon: 'grid' },
   spaceShared:   { icon: 'users' },
   spacePublic:   { icon: 'globe' },
