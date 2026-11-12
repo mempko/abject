@@ -557,7 +557,7 @@ undo() / redo() take back the last change made in this window to the AI settings
 
       // Auth checkbox toggled
       if (fromId === this.authCheckboxId && aspect === 'change') {
-        await this.setAuthFieldsDisabled(!(value as boolean));
+        await this.setAuthFieldsDisabled(!(value === true || value === 'true'));
         return;
       }
 
@@ -635,13 +635,13 @@ undo() / redo() take back the last change made in this window to the AI settings
         return;
       }
       if (fromId === this.fsReadOnlyCheckboxId && aspect === 'change') {
-        this.fsReadOnly = value as boolean;
+        this.fsReadOnly = value === true || value === 'true';
         return;
       }
 
       // Shell: enabled checkbox
       if (fromId === this.shellEnabledCheckboxId && aspect === 'change') {
-        this.shellEnabled = value as boolean;
+        this.shellEnabled = value === true || value === 'true';
         return;
       }
       // Shell: add allowed command
@@ -704,7 +704,7 @@ undo() / redo() take back the last change made in this window to the AI settings
 
       // Web: enabled checkbox
       if (fromId === this.webEnabledCheckboxId && aspect === 'change') {
-        this.webEnabled = value as boolean;
+        this.webEnabled = value === true || value === 'true';
         return;
       }
       // Permission prompt mode select: takes effect at once.
@@ -2198,7 +2198,7 @@ undo() / redo() take back the last change made in this window to the AI settings
   private async saveAuthSettings(): Promise<void> {
     if (!this.windowId) return;
 
-    const checked = await this.request<boolean>(
+    const checked = await this.request<unknown>(
       request(this.id, this.authCheckboxId!, 'getValue', {})
     );
     const username = await this.request<string>(
@@ -2207,7 +2207,7 @@ undo() / redo() take back the last change made in this window to the AI settings
     const password = await this.request<string>(
       request(this.id, this.authPassInputId!, 'getValue', {})
     );
-    const enabled = !!checked;
+    const enabled = checked === true || checked === 'true';
 
     const error = await this.saveSection('auth', { enabled, username: username ?? '', password: password ?? '' });
     if (error) {
