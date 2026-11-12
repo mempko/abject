@@ -1474,7 +1474,7 @@ Interface: abjects:peer-network`;
       if (fromId === this.remoteEnableCheckboxId && aspect === 'change') {
         if (this.remoteUIAccessId) {
           try {
-            await this.request(request(this.id, this.remoteUIAccessId, 'setEnabled', { enabled: !!value }));
+            await this.request(request(this.id, this.remoteUIAccessId, 'setEnabled', { enabled: value === true || value === 'true' }));
           } catch {
             await this.reject('Could not change remote UI access.');
           }
