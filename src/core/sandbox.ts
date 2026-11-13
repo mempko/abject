@@ -92,6 +92,18 @@ const MIN_INTERVAL_MS = 10;
 const MAX_TIMER_MS = 2_147_483_647;
 const BOOT_MS = 1000;
 
+/** Globals removed from the sandbox realm so callbacks and shared memory stay out. */
+export const SANDBOX_REMOVED_GLOBALS: readonly string[] = [
+  'FinalizationRegistry', 'WeakRef', 'Atomics', 'SharedArrayBuffer', 'WebAssembly',
+];
+
+/** Keys on the handler `this` target that user handler code must not overwrite.
+ *  Shared with protocol/sandbox-invoker so replay builds the same receiver shape. */
+export const HANDLER_PROXY_BUILTINS: readonly string[] = [
+  'call', 'dep', 'find', 'changed', 'emit', 'observe', 'id',
+  'data', 'saveData', 'ensure', 'invariant',
+];
+
 // ── The codec, host side ────────────────────────────────────────────────
 
 const TAG = '\u0000abj';
@@ -753,8 +765,12 @@ export class Sandbox {
   private readonly inherited: Record<string, Helper>;
   private seq = 0;
   private readonly invocations = new Map<number, Invocation>();
-  private readonly tickets = new Set<number>();
+  /** Helper calls waiting for an answer, by ticket, with the helper's name. */
+  private readonly tickets = new Map<number, string>();
   private readonly timers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** Timers the code has set, ever: a count, so a caller can tell whether
+   *  any were set between two points. */
+  private timersSetCount = 0;
   private inSlice = false;
   private stoppedReason?: string;
   private stuckCheckQueued = false;
@@ -805,6 +821,19 @@ export class Sandbox {
   /** No helper call is waiting for an answer and no timer is set: only a new call can run code. */
   get idle(): boolean {
     return this.tickets.size === 0 && this.timers.size === 0;
+  }
+
+  /** How many calls to the named helpers (all of them, by default) are waiting for an answer. */
+  pendingHelperCalls(names?: ReadonlySet<string>): number {
+    if (!names) return this.tickets.size;
+    let n = 0;
+    for (const name of this.tickets.values()) if (names.has(name)) n++;
+    return n;
+  }
+
+  /** How many timers the code has set since it was loaded, never decreasing. */
+  get timersSet(): number {
+    return this.timersSetCount;
   }
 
   // ── Loading code ──
@@ -1103,7 +1132,7 @@ export class Sandbox {
     if (this.tickets.size >= MAX_TICKETS) return refusal(`More than ${MAX_TICKETS} calls are already waiting for answers`);
     const args = decodeOut(argsText);
     if (!Array.isArray(args)) return refusal('Malformed arguments');
-    this.tickets.add(ticket);
+    this.tickets.set(ticket, name);
     // Started after the slice ends, so a helper may enter the sandbox itself.
     queueMicrotask(() => {
       let result: unknown;
@@ -1148,6 +1177,7 @@ export class Sandbox {
       this.runSlice(DRAIN);
     };
     this.timers.set(id, repeat ? setInterval(fire, ms) : setTimeout(fire, ms));
+    this.timersSetCount++;
     return '';
   }
 }
