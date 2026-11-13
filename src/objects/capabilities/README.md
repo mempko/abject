@@ -93,6 +93,23 @@ instance.
   to the permissions authority. Authority-only: `updatePermissions`,
   `updateObjectPermissions`, `updateSkillPermissions`. SkillRegistry-only:
   `setSkillEnv`, `setSkillCommands`.
+- **`terminal.ts`**: `Terminal` (`TERMINAL_ID`, main thread). The one object
+  that starts a pseudo-terminal. `open` is for a person's shell: admitted to
+  the built-in TerminalView and CliServer only, asked about twice through
+  PermissionBroker (the directory, then the shell for the whole session), and
+  behind the shell switch. `openProgram` is for the LLM object only: it runs
+  the CLI of a model provider the person chose (the warm `claude` session of
+  `src/llm/pty-session.ts`) with the arguments, directory, size and withheld
+  environment prefixes the LLM object names, asks no question, and is not
+  behind the shell switch. `list` and `close` reach only the caller's own
+  sessions; a closed session is stopped and leaves the bus.
+- **`terminal-session.ts`**: `TerminalSession`. One program in a pty
+  (`@lydell/node-pty`) with a libghostty screen (`@slopus/ghostty-wasm`), both
+  loaded when the session starts. Only its owner and `Terminal` may use it:
+  `screen` (styled cells for a view), `text`, `read` (every row as text, which
+  rows soft-wrapped onto the next, idle time and exit state, for a program
+  reading the screen; cached until output arrives), `write`, `paste`,
+  `resize`, `scroll`, `readOutput`, `close`, `wait`. Never touches a clipboard.
 - **`running-process.ts`**: `RunningProcess`. One approved subprocess as an
   Abject: `status`, `readOutput` (byte offset and length, 64 KiB max), `input`,
   `stop`, `wait`. Answers only its owner and ShellExecutor.

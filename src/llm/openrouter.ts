@@ -249,6 +249,7 @@ export class OpenRouterProvider extends OpenAIProvider implements DecisionProvid
       label: 'OpenRouter',
       storageSuffix: 'openrouterApiKey',
       credentialMode: 'apiKey',
+      credentialUrl: 'https://openrouter.ai/keys',
       credentialLabel: 'OpenRouter API Key',
       credentialPlaceholder: 'sk-or-...',
       models: Object.values(DEFAULT_TIER_MODELS).map(id => ({ id, name: id })),

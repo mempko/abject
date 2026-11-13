@@ -57,7 +57,10 @@ Credentials come from SettingsManager (stored under each description's
 
 ### Core contract and shared helpers
 
-- **`provider.ts`**: the `LLMProvider` interface and `BaseLLMProvider`. Message
+- **`provider.ts`**: the `LLMProvider` interface and `BaseLLMProvider`
+  (`checkCredential()` tells a refused key from an unreachable provider by how
+  the model-listing request ended, since a failed listing falls back to the
+  built-in catalog; `LLMObject.probeProvider` runs it before Settings saves a key). Message
   types (`LLMMessage` with text, image and PDF `ContentPart`s and an optional
   `cacheBreakpoint`), `LLMCompletionOptions` (`tier`, `model`, `effort`,
   `maxTokens`, `cacheKey`, `jsonMode`, `signal`, ...; `signal` fires on Kill
@@ -202,13 +205,16 @@ Abject messages.
   fallback. Other abjects do not compute budgets themselves: they ask `LLM`
   by message (`getContextBudget`), which answers with the window and these
   budgets.
-- **`pty-session.ts`**: `PtySession` (one warm CLI in a pseudo-terminal from
-  `@lydell/node-pty`, screen kept by `@xterm/headless`, both loaded by dynamic
-  import on first use) and `PtySessionPool` (leases one session per request;
-  defaults: 2 sessions, recycled after 50 turns, evicted after 10 idle
-  minutes). Also `scrubAgentEnv()`, and `sessionSandboxDir()` /
-  `removeSandboxDir()` for the empty working directory each CLI process runs
-  in.
+- **`pty-session.ts`**: `PtySession` (one warm CLI running in a terminal
+  session of the system's own: a `TerminalSession` abject the `Terminal`
+  capability opens for the LLM object, so the pseudo-terminal and the
+  libghostty screen live there and nothing in `src/llm/` holds a pty or an
+  emulator) and `PtySessionPool` (leases one session per request; defaults: 2
+  sessions, recycled after 50 turns, evicted after 10 idle minutes). The
+  session reaches its terminal through a `TerminalHost` (`open`, `read`,
+  `write`, `close`) that `LLMObject` implements with messages. Also
+  `sessionSandboxDir()` / `removeSandboxDir()` for the empty working
+  directory each CLI process runs in.
 - **`pty-dialects.ts`**: everything that recognises a particular terminal UI.
   Only `claudeDialect` exists (ready, busy and turn-complete patterns, trust
   dialog dismissal, chrome filtering, hardening flags
@@ -294,10 +300,20 @@ A built-in provider:
   newline when a line exactly fills the UI's width, reports no token usage,
   and depends on patterns in `pty-dialects.ts` that a Claude Code release can
   break. Use `claude-cli` when byte-exact output or usage matters.
-- **`@lydell/node-pty` is native.** It loads a platform package by name at
-  runtime, so the server bundle keeps it external (`build-server.mjs`) and
-  installs ship it as a runtime dependency (`scripts/package-headless.mjs`).
-  It is imported only when a PTY session first starts.
+- **Warm sessions need the `Terminal` object.** `claude-cli-pty` runs its
+  sessions through `Terminal.openProgram`, which admits the built-in LLM
+  object only. The pty (`@lydell/node-pty`, a native addon) and the screen
+  are loaded there, on the main thread, when a session first starts; a
+  200x400 screen is read again only when the program has produced output
+  since the last read. The screen is 200 wide, not wider, because a session's
+  screen is capped at 80,000 cells (`MAX_SCREEN_CELLS`): libghostty-vt 1.3.6
+  traps on larger ones when Claude Code starts.
+- **Only Claude has a warm session.** Codex had one and lost it on purpose: a
+  rendered screen cannot tell a native tool run from the final reply, so
+  Codex runs `codex exec --json`, where a native tool call is seen and
+  refused (`codex-cli-pty` remains only so routes saved under that name keep
+  working, and takes the same one-shot path). `agy` cannot be run without
+  its tools at all, and only its headless mode auto-denies them.
 - **Sandbox directories are per process run.** `sessionSandboxDir()` makes
   `$TMPDIR/abjects-cli-sessions/s<pid>-<random>` (with `git init`); a PTY
   session removes its own on dispose and the one-shot `claude-cli` path

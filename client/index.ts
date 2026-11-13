@@ -43,6 +43,14 @@ function buildWsUrl(): string {
   if (location.protocol === 'https:') {
     return `wss://${location.host}/ws`;
   }
+  // The desktop app says which port its own backend listens on (?ws=PORT).
+  // The bundle is built once and cannot know: a second instance started with
+  // its own WS_PORT would otherwise reach for the first one's backend, be
+  // refused there, and sit on the splash screen. Loopback only.
+  const fromPage = Number(new URLSearchParams(location.search).get('ws'));
+  if (Number.isInteger(fromPage) && fromPage > 0 && fromPage < 65536) {
+    return `ws://127.0.0.1:${fromPage}`;
+  }
   const wsPort = import.meta.env.VITE_WS_PORT ?? '7719';
   return `ws://127.0.0.1:${wsPort}`;
 }

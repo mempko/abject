@@ -111,6 +111,7 @@ export class GrokProvider extends OpenAIProvider {
       label: 'Grok',
       storageSuffix: 'grokApiKey',
       credentialMode: 'apiKey',
+      credentialUrl: 'https://console.x.ai',
       credentialLabel: 'xAI Grok API Key',
       credentialPlaceholder: 'xai-...',
       models: [

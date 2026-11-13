@@ -32,7 +32,7 @@ import {
   systemMessage,
   userMessage,
 } from '../llm/provider.js';
-import { isContextOverflowError, EmptyCompletionError } from '../llm/provider.js';
+import { isContextOverflowError, EmptyCompletionError, BaseLLMProvider, type CredentialCheck } from '../llm/provider.js';
 import { LATEST_MODEL, MODEL_TIERS, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
 import {
   validateDecisionRequest, boundDecisionState, isDecisionProvider, summarizeAnswers, stateChars,
@@ -42,6 +42,7 @@ import {
 import { emulateDecision, type EmulationTransport } from '../llm/decision-emulator.js';
 import { TypeSafeProvider } from '../llm/typesafe.js';
 import { RemoteLLMProvider, parseRemoteProviderSpec, type RemoteProviderHost } from '../llm/remote-provider.js';
+import type { TerminalHost, TerminalReading } from '../llm/pty-session.js';
 import { packageNameOf } from '../core/packages.js';
 import {
   DECISION_SITES, DEFAULT_DECISION_POLICY, resolveSiteMode,
@@ -858,6 +859,15 @@ export class LLMObject extends Abject {
                 },
               },
               {
+                name: 'probeProvider',
+                description: 'Whether one provider can serve right now, without registering it: checks an API key with the provider, asks a local server at its address, looks for a CLI on PATH. Taken from SettingsManager only.',
+                parameters: [
+                  { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider id' },
+                  { name: 'credential', type: { kind: 'primitive', primitive: 'string' }, description: 'The API key or address to check', optional: true },
+                ],
+                returns: { kind: 'reference', reference: 'CredentialCheck' },
+              },
+              {
                 name: 'registerProvider',
                 description:
                   'Register the sending abject as an LLM provider, usually from its startup handler. ' +
@@ -1558,6 +1568,7 @@ export class LLMObject extends Abject {
         tierFallbacks?: TierFallbacks | null;
         visionFallback?: TierConfig | null;
         cacheKeepalive?: { enabled: boolean };
+        withdraw?: string[];
       };
       await this.configure(config);
       return true;
@@ -1575,6 +1586,14 @@ export class LLMObject extends Abject {
       const stream = typeof streamId === 'string' ? this.remoteStreams.get(streamId) : undefined;
       if (!stream || stream.backend !== m.routing.from || typeof content !== 'string') return;
       stream.sink(content);
+    });
+
+    // SettingsManager asks before it saves a credential or offers a provider.
+    this.on('probeProvider', async (m: AbjectMessage) => {
+      require(await this.isBuiltInCaller(m.routing.from, ['SettingsManager']), 'probeProvider is taken from SettingsManager only');
+      const { provider, credential } = (m.payload ?? {}) as { provider?: unknown; credential?: unknown };
+      require(typeof provider === 'string' && provider !== '', 'probeProvider: provider is required');
+      return this.probeProvider(provider as string, typeof credential === 'string' && credential !== '' ? credential : undefined);
     });
 
     this.on('listProviderModels', async (m: AbjectMessage) => {
@@ -1871,6 +1890,36 @@ export class LLMObject extends Abject {
   }
 
   /**
+   * The terminal a warm CLI session runs in: the Terminal capability opens a
+   * TerminalSession owned by this object, and the provider types into it and
+   * reads its screen through these messages.
+   */
+  private terminalHost(): TerminalHost {
+    const terminalId = async (): Promise<AbjectId> => {
+      const id = await this.discoverDep('Terminal');
+      if (!id) throw new Error('the Terminal object is not running, so there is nowhere to run a terminal session');
+      return id;
+    };
+    return {
+      open: async (spec) => {
+        const opened = await this.request<{ sessionId: string }>(
+          msg.request(this.id, await terminalId(), 'openProgram', spec), 30_000);
+        return opened.sessionId;
+      },
+      read: (sessionId) =>
+        this.request<TerminalReading>(msg.request(this.id, sessionId as AbjectId, 'read', {}), 15_000),
+      write: async (sessionId, text) => {
+        const result = await this.request<{ success: boolean; error?: string }>(
+          msg.request(this.id, sessionId as AbjectId, 'write', { text }), 15_000);
+        if (!result.success) throw new Error(result.error ?? 'the terminal took no input');
+      },
+      close: async (sessionId) => {
+        await this.request(msg.request(this.id, await terminalId(), 'close', { sessionId }), 15_000);
+      },
+    };
+  }
+
+  /**
    * The owner the Factory registered an abject with, looked up where the
    * Factory registered it. A package owner marks an installed package's
    * abjects; nothing in a message can claim one.
@@ -2017,6 +2066,8 @@ export class LLMObject extends Abject {
     /** Explicit decision route: undefined leaves it untouched, null returns to auto. */
     decisionRoute?: DecisionRoute | null;
     decisionPolicy?: Partial<DecisionPolicy>;
+    /** Keyed providers to withdraw: their key was removed in Settings. */
+    withdraw?: string[];
   }): Promise<void> {
     // Built-in providers call the endpoints the person configured in Settings
     // > AI directly, the way streaming and Ollama always have. HttpClient's
@@ -2045,29 +2096,36 @@ export class LLMObject extends Abject {
     // is the plain name because it is the one that reports token usage and
     // returns output verbatim; the pty entry trades both away for warm
     // startup.
-    this.registerProvider(new ClaudeCliProvider());
-    this.registerProvider(new ClaudeCliProvider({ transport: 'terminal' }));
-    this.registerProvider(new CodexCliProvider());
-    this.registerProvider(new CodexCliProvider({ transport: 'terminal' }));
-    this.registerProvider(new AntigravityCliProvider());
-
-    // API-key-credentialed providers, registered when a key is present.
-    const apiKeyFactories: Array<[string, (apiKey: string) => LLMProvider]> = [
-      ['anthropic',  (apiKey) => new AnthropicProvider({ apiKey, fetchFn })],
-      ['openai',     (apiKey) => new OpenAIProvider({ apiKey, fetchFn })],
-      ['openrouter', (apiKey) => new OpenRouterProvider({ apiKey, fetchFn })],
-      ['deepseek',   (apiKey) => new DeepSeekProvider({ apiKey, fetchFn })],
-      ['peerllm',    (apiKey) => new PeerLLMProvider({ apiKey, fetchFn })],
-      ['grok',       (apiKey) => new GrokProvider({ apiKey, fetchFn })],
-      ['gemini',     (apiKey) => new GeminiProvider({ apiKey, fetchFn })],
-      ['kimi',       (apiKey) => new KimiProvider({ apiKey, fetchFn })],
-      ['minimax',    (apiKey) => new MiniMaxProvider({ apiKey, fetchFn })],
-      ['meta',       (apiKey) => new MetaProvider({ apiKey, fetchFn })],
+    // Registered once and kept across later configures: the warm-session
+    // provider holds live sessions, and replacing it on every settings change
+    // would strand them.
+    const cliProviders: LLMProvider[] = [
+      new ClaudeCliProvider(),
+      // Its warm sessions run in the system's Terminal object.
+      new ClaudeCliProvider({ transport: 'terminal', terminal: this.terminalHost() }),
+      new CodexCliProvider(),
+      new CodexCliProvider({ transport: 'terminal' }),
+      new AntigravityCliProvider(),
     ];
-    for (const [id, make] of apiKeyFactories) {
-      const cred = credentials[id];
-      if (cred) this.registerProvider(make(cred));
+    for (const provider of cliProviders) {
+      if (!this.providers.has(provider.name)) this.registerProvider(provider);
     }
+
+    // API-key-credentialed providers, registered when a key is present. One
+    // named in `withdraw` (the person removed its key) leaves, so nothing
+    // keeps calling on that key. A provider keyed from the environment at
+    // boot is in neither list and stays.
+    for (const [id, make] of LLMObject.KEYED_PROVIDERS) {
+      const cred = credentials[id];
+      if (cred) {
+        this.registerProvider(make(cred, fetchFn));
+      } else if (config.withdraw?.includes(id) && this.providers.delete(id)) {
+        this.modelListCache.delete(id);
+        if (this.defaultProvider === id) this.defaultProvider = this.providers.keys().next().value;
+        log.info(`provider '${id}' withdrawn: its key was removed`);
+      }
+    }
+    if (config.withdraw?.includes('typesafe') && !credentials.typesafe) this.decisionProviders.delete('typesafe');
 
     // URL-credentialed providers (Ollama). Always register if configured;
     // also register if reachable at the default URL even without explicit
@@ -2863,6 +2921,8 @@ Only output the code, no explanations. Use proper formatting and comments.`;
   private static readonly PROVIDER_DESCRIPTORS: ReadonlyArray<{
     id: string;
     describe(): LLMProviderDescription;
+    /** Whether the unconfigured provider can serve right now (a CLI on PATH). */
+    isAvailable(): Promise<boolean>;
   }> = [
     new AnthropicProvider({ apiKey: '' }),
     new OpenAIProvider({ apiKey: '' }),
@@ -2881,7 +2941,52 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     new MiniMaxProvider({ apiKey: '' }),
     new MetaProvider({ apiKey: '' }),
     new TypeSafeProvider({ apiKey: '' }),
-  ].map(p => ({ id: p.describe().id, describe: () => p.describe() }));
+  ].map(p => ({ id: p.describe().id, describe: () => p.describe(), isAvailable: () => ('isAvailable' in p ? p.isAvailable() : Promise.resolve(false)) }));
+
+  /** The API-keyed chat providers, each built from its key. */
+  private static readonly KEYED_PROVIDERS: ReadonlyArray<[string, (apiKey: string, fetchFn?: FetchDelegate) => BaseLLMProvider]> = [
+    ['anthropic',  (apiKey, fetchFn) => new AnthropicProvider({ apiKey, fetchFn })],
+    ['openai',     (apiKey, fetchFn) => new OpenAIProvider({ apiKey, fetchFn })],
+    ['openrouter', (apiKey, fetchFn) => new OpenRouterProvider({ apiKey, fetchFn })],
+    ['deepseek',   (apiKey, fetchFn) => new DeepSeekProvider({ apiKey, fetchFn })],
+    ['peerllm',    (apiKey, fetchFn) => new PeerLLMProvider({ apiKey, fetchFn })],
+    ['grok',       (apiKey, fetchFn) => new GrokProvider({ apiKey, fetchFn })],
+    ['gemini',     (apiKey, fetchFn) => new GeminiProvider({ apiKey, fetchFn })],
+    ['kimi',       (apiKey, fetchFn) => new KimiProvider({ apiKey, fetchFn })],
+    ['minimax',    (apiKey, fetchFn) => new MiniMaxProvider({ apiKey, fetchFn })],
+    ['meta',       (apiKey, fetchFn) => new MetaProvider({ apiKey, fetchFn })],
+  ];
+
+  /**
+   * Whether one provider can serve right now, without registering it: an API
+   * key is checked against the provider, a local server is asked whether it
+   * answers at its address, a CLI is looked for on PATH.
+   */
+  private async probeProvider(providerId: string, credential?: string): Promise<CredentialCheck> {
+    const descriptor = LLMObject.PROVIDER_DESCRIPTORS.find(d => d.id === providerId);
+    if (!descriptor) {
+      // A provider another abject registered serves for as long as it is registered.
+      return this.providers.has(providerId) ? { state: 'ok' } : { state: 'unreachable', detail: 'not registered' };
+    }
+    const desc = descriptor.describe();
+    if (desc.credentialMode === 'cli') {
+      return (await descriptor.isAvailable())
+        ? { state: 'ok' }
+        : { state: 'unreachable', detail: desc.cli?.installHint ?? `${desc.cli?.binary ?? providerId} was not found` };
+    }
+    if (desc.credentialMode === 'url') {
+      const baseUrl = credential || desc.credentialPlaceholder || 'http://localhost:11434';
+      const provider = new OllamaProvider({ baseUrl });
+      if (!(await provider.isAvailable())) return { state: 'unreachable', detail: `nothing answered at ${baseUrl}` };
+      return { state: 'ok', models: (await provider.listModels()).length };
+    }
+    const make = LLMObject.KEYED_PROVIDERS.find(([id]) => id === providerId)?.[1];
+    if (!make) return { state: 'unchecked' };
+    if (credential) return make(credential).checkCredential();
+    // No key given: one keyed from the environment at boot is registered already.
+    const registered = this.providers.get(providerId);
+    return registered instanceof BaseLLMProvider ? registered.checkCredential() : { state: 'rejected', detail: 'no key given' };
+  }
 
   /**
    * Set the default provider.

@@ -24,7 +24,8 @@ import { installService, serviceStatus } from './service.js';
 const say = (text = ''): void => { process.stdout.write(`${text}\n`); };
 const heading = (text: string): void => { say(); say(`\x1b[1m${text}\x1b[0m`); };
 
-interface Preset { name: string; builtin: boolean; preset: { routing: Record<string, { provider: string; model: string } | undefined> } }
+interface Preset { name: string; builtin: boolean; needs?: string[]; preset: { routing: Record<string, { provider: string; model: string } | undefined> } }
+interface ConnectResult { ok: boolean; reason?: string; message?: string; models?: number }
 interface SchemaField { key: string; label: string; type: string; description?: string }
 interface SchemaSection { id: string; label: string; fields: SchemaField[] }
 
@@ -79,7 +80,8 @@ async function setupModels(client: AbjectClient): Promise<void> {
     const provider = providerOf(p);
     const hasKey = ai?.fields.some(f => f.key === `credentials.${provider}`);
     const envReady = !!process.env[envKeyFor(provider)];
-    return `${p.name.replace(/ recommended$/, '')}${hasKey ? (envReady ? `  (key found in ${envKeyFor(provider)})` : '') : '  (no key needed)'}`;
+    const keyless = p.needs?.includes(provider) ? '  (not found on this computer)' : '  (no key needed)';
+    return `${p.name.replace(/ recommended$/, '')}${hasKey ? (envReady ? `  (key found in ${envKeyFor(provider)})` : '') : keyless}`;
   });
   const defaultIndex = Math.max(0, recommended.findIndex(p => !!process.env[envKeyFor(providerOf(p))]));
   const choice = await chooseLine('Which provider should the agents use?', [...labels, 'Skip for now'], defaultIndex);
@@ -103,9 +105,18 @@ async function setupModels(client: AbjectClient): Promise<void> {
       }
       if (!value) { say('No key given; skipped.'); return; }
       try {
-        await client.request('setSettings', { section: 'ai', values: { credentials: { [provider]: value } } }, 60_000);
-        const models = await client.request<unknown[]>('listModels', { provider }, 60_000);
-        say(`Key saved; ${models.length} model${models.length === 1 ? '' : 's'} available.`);
+        // The backend checks the key with the provider before saving it.
+        let result = await client.request<ConnectResult>('connectProvider', { provider, credential: value }, 90_000);
+        if (!result.ok && result.reason === 'unreachable'
+            && await confirmLine(`${result.message ?? 'The provider could not be reached.'} Save the key without checking it?`, false)) {
+          result = await client.request<ConnectResult>('connectProvider', { provider, credential: value, unchecked: true }, 90_000);
+        }
+        if (!result.ok) {
+          say(`\x1b[31m${result.message ?? 'The key was not accepted.'}\x1b[0m Nothing was saved.`);
+          if (attempt === 2) return;
+          continue;
+        }
+        say(`Key saved${result.models ? `; ${result.models} model${result.models === 1 ? '' : 's'} available` : ''}.`);
         break;
       } catch (err) {
         say(`\x1b[31m${err instanceof Error ? err.message : String(err)}\x1b[0m`);

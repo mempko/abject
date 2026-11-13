@@ -241,6 +241,7 @@ export class GeminiProvider extends BaseLLMProvider {
       label: 'Gemini',
       storageSuffix: 'geminiApiKey',
       credentialMode: 'apiKey',
+      credentialUrl: 'https://aistudio.google.com/apikey',
       credentialLabel: 'Google Gemini API Key',
       credentialPlaceholder: 'AIza...',
       models: [

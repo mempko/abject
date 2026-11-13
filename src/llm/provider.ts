@@ -246,6 +246,8 @@ export interface LLMProviderDescription {
   credentialLabel?: string;
   /** Placeholder for the credential input. */
   credentialPlaceholder?: string;
+  /** Where a person creates this provider's API key, for the Settings window's link. */
+  credentialUrl?: string;
   /**
    * For `cli` providers: the binary name to detect on PATH and the
    * one-line install hint shown when it isn't found.
@@ -630,6 +632,20 @@ export interface LLMProvider {
 }
 
 /**
+ * What checking a credential against the provider found. `ok`: the provider
+ * accepted it. `rejected`: the provider refused it (a wrong or revoked key).
+ * `unreachable`: no answer either way (network, outage). `unchecked`: this
+ * provider has no request to check with.
+ */
+export interface CredentialCheck {
+  state: 'ok' | 'rejected' | 'unreachable' | 'unchecked';
+  /** Models the provider listed, when it answered. */
+  models?: number;
+  /** The provider's or the network's own words, for the person. */
+  detail?: string;
+}
+
+/**
  * Base class for LLM providers with common functionality.
  */
 export abstract class BaseLLMProvider implements LLMProvider {
@@ -637,6 +653,8 @@ export abstract class BaseLLMProvider implements LLMProvider {
   protected apiKey?: string;
   protected baseUrl?: string;
   protected fetchFn?: FetchDelegate;
+  /** How this instance's newest HTTP request ended; checkCredential reads it. */
+  private lastFetch?: { ok: boolean; status?: number; error?: string };
 
   constructor(config: { apiKey?: string; baseUrl?: string; fetchFn?: FetchDelegate } = {}) {
     this.apiKey = config.apiKey;
@@ -661,6 +679,27 @@ export abstract class BaseLLMProvider implements LLMProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     return [];
+  }
+
+  /**
+   * Check this instance's credential by listing the provider's models. Model
+   * listings fall back to a built-in catalog when the request fails, so the
+   * answer comes from how the request itself ended, not from the list.
+   */
+  async checkCredential(): Promise<CredentialCheck> {
+    this.lastFetch = undefined;
+    let models: ModelInfo[];
+    try {
+      models = await this.listModels();
+    } catch (err) {
+      return { state: 'unreachable', detail: err instanceof Error ? err.message : String(err) };
+    }
+    const outcome = this.lastFetch as { ok: boolean; status?: number; error?: string } | undefined;
+    if (!outcome) return { state: 'unchecked', models: models.length };
+    if (outcome.ok) return { state: 'ok', models: models.length };
+    const refused = outcome.status === 401 || outcome.status === 403
+      || (outcome.status === 400 && /api[ _-]?key|credential|unauthori/i.test(outcome.error ?? ''));
+    return { state: refused ? 'rejected' : 'unreachable', detail: outcome.error };
   }
 
   /** Providers opt in by overriding; the default provider has no speech APIs. */
@@ -707,9 +746,27 @@ export abstract class BaseLLMProvider implements LLMProvider {
     options: RequestInit,
     fetchOptions?: { timeout?: number }
   ): Promise<FetchResult> {
+    this.lastFetch = undefined;
+    try {
+      const result = await this.fetchOnce(url, options, fetchOptions);
+      this.lastFetch = { ok: true, status: result.status };
+      return result;
+    } catch (err) {
+      const status = (this.lastFetch as { status?: number } | undefined)?.status;
+      this.lastFetch = { ok: false, ...(status !== undefined ? { status } : {}), error: err instanceof Error ? err.message : String(err) };
+      throw err;
+    }
+  }
+
+  private async fetchOnce(
+    url: string,
+    options: RequestInit,
+    fetchOptions?: { timeout?: number }
+  ): Promise<FetchResult> {
     if (this.fetchFn) {
       const result = await this.fetchFn(url, options, fetchOptions);
       if (!result.ok) {
+        this.lastFetch = { ok: false, status: result.status };
         throw new Error(`LLM API error (${result.status}): ${result.body}`);
       }
       return result;
@@ -734,6 +791,7 @@ export abstract class BaseLLMProvider implements LLMProvider {
     }
 
     if (!response.ok) {
+      this.lastFetch = { ok: false, status: response.status };
       const errorText = await response.text().catch(() => 'Unknown error');
       throw new Error(`LLM API error (${response.status}): ${errorText}`);
     }

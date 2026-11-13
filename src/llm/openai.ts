@@ -395,6 +395,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       label: 'OpenAI',
       storageSuffix: 'openaiApiKey',
       credentialMode: 'apiKey',
+      credentialUrl: 'https://platform.openai.com/api-keys',
       credentialLabel: 'OpenAI API Key',
       credentialPlaceholder: 'sk-...',
       models: this.fallbackModels(),

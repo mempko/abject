@@ -24,7 +24,7 @@ import { request, event } from '../core/message.js';
 import { require as precondition, invariant, ContractViolation } from '../core/contracts.js';
 import { UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods, type UndoAction, type UndoResult, type UndoStep } from '../core/undo.js';
 import { Log } from '../core/timed-log.js';
-import { LLMProviderDescription, servesChat } from '../llm/provider.js';
+import { LLMProviderDescription, servesChat, type CredentialCheck } from '../llm/provider.js';
 import { LATEST_MODEL, aliasLadders, freezeModel, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
 import type { DecisionGates } from '../core/decision-sites.js';
 import { parsePrivateHost } from './capabilities/address-policy.js';
@@ -61,6 +61,60 @@ export interface TierPreset {
   decision?: ModelRef | null;
 }
 
+/** A tier or one of the single-model rows: anything that names a provider and model. */
+export type SlotKey = ModelTierName | AuxRowKey;
+
+/**
+ * Routes a preset named for providers that were not ready when it was
+ * applied. Each goes into effect when its provider connects, and is dropped
+ * when the person sets that tier or row to something else.
+ */
+export interface PendingRoutes { preset: string; slots: Partial<Record<SlotKey, TierRoute>> }
+
+/**
+ * Whether a provider can serve. `connected`: it can (a key is saved, a local
+ * server answers, a CLI is installed, an abject serves it). `needsKey`: it
+ * wants an API key. `unreachable`: nothing answers at its address.
+ * `missing`: its CLI is not installed. `unknown`: not looked at yet.
+ */
+export type ProviderState = 'connected' | 'needsKey' | 'unreachable' | 'missing' | 'unknown';
+
+/** One provider as the Settings window lists it. */
+export interface ProviderStatus {
+  id: string;
+  label: string;
+  mode: LLMProviderDescription['credentialMode'];
+  /** Serves chat (the tier rows); false for a decision-only provider. */
+  chat: boolean;
+  state: ProviderState;
+  /** One line for the person: what the state means here. */
+  detail: string;
+  /** The tiers and single-model rows routed to it, by label. */
+  usedBy: string[];
+  /** Models it listed when last asked. */
+  models?: number;
+  credentialLabel?: string;
+  credentialPlaceholder?: string;
+  /** Where to create a key. */
+  credentialUrl?: string;
+}
+
+/** One preset as listed: what it routes, which of its providers are not ready, and whether the tiers match it now. */
+export interface PresetListing { name: string; builtin: boolean; preset: TierPreset; needs: string[]; inUse: boolean }
+
+/** What connecting a provider came to. */
+export interface ConnectResult {
+  ok: boolean;
+  /** Why not: the provider refused the key, nothing answered, or the CLI is not installed. */
+  reason?: 'rejected' | 'unreachable' | 'missing';
+  message?: string;
+  models?: number;
+  /** The tiers were empty and now run on this provider's recommended models. */
+  routed?: boolean;
+  /** False when the key was saved without the provider confirming it. */
+  checked?: boolean;
+}
+
 /** A secret as readers see it; `value` only for the Settings window (or a value that is not secret). */
 export interface SecretValue { set: boolean; value?: string }
 
@@ -80,6 +134,8 @@ export interface AiSettings {
    * across all workspaces. 0 turns learning model work off.
    */
   learningBudgetUsdPerDay: number;
+  /** Preset routes waiting for their provider to connect; read-only. */
+  pending: PendingRoutes | null;
 }
 export interface AuthSettings { enabled: boolean; username: string; password: SecretValue }
 export interface FilesystemSettings { allowedPaths: string[]; readOnly: boolean }
@@ -167,6 +223,7 @@ export const DEFAULT_LEARNING_BUDGET_USD_PER_DAY = 3;
 const MAX_LEARNING_BUDGET_USD_PER_DAY = 1000;
 const STORAGE_KEY_DECISION_GATES = 'global-settings:decisionGates';
 const STORAGE_KEY_TIER_PRESETS = 'global-settings:tierPresets';
+const STORAGE_KEY_PENDING_ROUTES = 'global-settings:pendingRoutes';
 // Legacy keys, migrated once at boot
 const LEGACY_KEY_ANTHROPIC = 'settings:anthropicApiKey';
 const LEGACY_KEY_OPENAI = 'settings:openaiApiKey';
@@ -224,6 +281,12 @@ function cleanList(list: string[]): string[] {
 
 const emptyTiers = (): Record<ModelTierName, TierRoute | null> => ({ smart: null, balanced: null, fast: null, code: null });
 const emptyAux = (): Record<AuxRowKey, ModelRef | null> => ({ vision: null, fallback: null, decision: null });
+const SLOT_LABELS: Record<SlotKey, string> = { ...TIER_LABELS, vision: 'Vision', fallback: 'Fallback', decision: 'Decision' };
+const sameRoute = (a: ModelRef | null | undefined, b: ModelRef | null | undefined): boolean =>
+  (a ?? null) === null ? (b ?? null) === null : !!b && a!.provider === b.provider && a!.model === b.model;
+/** "A", "A and B", "A, B and C". */
+const listed = (names: string[]): string =>
+  names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 
 export class SettingsManager extends Abject {
   private llmId?: AbjectId;
@@ -252,6 +315,15 @@ export class SettingsManager extends Abject {
   private cacheKeepalive = false;
   private learningBudgetUsdPerDay = DEFAULT_LEARNING_BUDGET_USD_PER_DAY;
   private savedPresets: Record<string, TierPreset> = {};
+  /** Preset routes waiting for their provider. */
+  private pending: PendingRoutes | null = null;
+  /**
+   * What looking at each provider last found: a local server answering, a
+   * CLI installed, a key the environment supplied at boot. Keys saved here
+   * need no look: the key being there is the state.
+   */
+  private probes = new Map<string, { state: ProviderState; detail: string; models?: number }>();
+  private probesInFlight = new Map<string, Promise<void>>();
 
   // Auth (applied over the environment's only once saved here)
   private auth = { enabled: false, username: '', password: '' };
@@ -312,8 +384,33 @@ export class SettingsManager extends Abject {
               ],
               returns: { kind: 'reference', reference: 'SettingsBySection[section]' },
             },
-            { name: 'listPresets', description: 'Tier presets: saved ones first, then the built-ins derived from each provider.', parameters: [], returns: { kind: 'array', elementType: { kind: 'reference', reference: '{ name, builtin, preset }' } } },
-            { name: 'applyPreset', description: 'Route the tiers (and single-model rows) as a preset says, then save.', parameters: [{ name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Preset name' }], returns: { kind: 'reference', reference: 'AiSettings' } },
+            { name: 'listPresets', description: 'Tier presets: saved ones first, then the built-ins derived from each provider. Each says which of its providers are not ready (needs) and whether the tiers match it now (inUse).', parameters: [], returns: { kind: 'array', elementType: { kind: 'reference', reference: '{ name, builtin, preset, needs, inUse }' } } },
+            {
+              name: 'applyPreset', description: 'Route the tiers (and single-model rows) as a preset says, then save. A preset naming a provider that is not ready is refused, unless onlyReady is true: then the ready part applies now and the rest waits (ai.pending) until its provider connects.',
+              parameters: [
+                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Preset name' },
+                { name: 'onlyReady', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Apply the part whose providers are ready and keep the rest waiting', optional: true },
+              ],
+              returns: { kind: 'reference', reference: 'AiSettings' },
+            },
+            {
+              name: 'listProviders', description: 'Every provider with its state: connected, needsKey, unreachable (a local server not answering), missing (a CLI not installed) or unknown (not looked at yet). probe: true looks first.',
+              parameters: [
+                { name: 'probe', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Look at local servers and CLIs not looked at yet', optional: true },
+                { name: 'force', type: { kind: 'primitive', primitive: 'boolean' }, description: 'With probe: look again at every one', optional: true },
+              ],
+              returns: { kind: 'array', elementType: { kind: 'reference', reference: 'ProviderStatus' } },
+            },
+            {
+              name: 'connectProvider', description: 'Connect one provider: check its API key with the provider (or that its local server answers, or its CLI is installed), save the credential, and, when no tier is set yet, route every tier to its recommended models. A refused key is not saved.',
+              parameters: [
+                { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider id' },
+                { name: 'credential', type: { kind: 'primitive', primitive: 'string' }, description: 'The API key, or the address of a local server', optional: true },
+                { name: 'unchecked', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Save the key without checking it (when the provider cannot be reached to check)', optional: true },
+                { name: 'route', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Route every tier to this provider even when tiers are already set', optional: true },
+              ],
+              returns: { kind: 'reference', reference: 'ConnectResult' },
+            },
             {
               name: 'savePreset', description: 'Save a preset under a name: the given routing, or the current one. "Latest" is saved as the model it resolves to today; any other model id, a moving alias included, is saved as given.',
               parameters: [
@@ -325,6 +422,7 @@ export class SettingsManager extends Abject {
             { name: 'deletePreset', description: 'Delete a saved preset (built-ins stay).', parameters: [{ name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Preset name' }], returns: { kind: 'primitive', primitive: 'boolean' } },
             { name: 'listModels', description: 'Models one provider offers (its live catalog when reachable).', parameters: [{ name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider id' }], returns: { kind: 'array', elementType: { kind: 'reference', reference: 'ModelInfo' } } },
             { name: 'isConfigured', description: 'True once any model credential or tier is set.', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
+            { name: 'recommendedRoute', description: "A provider's recommended model for one tier, as { provider, model }, or null when it has none to recommend.", parameters: [{ name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider id' }, { name: 'tier', type: { kind: 'primitive', primitive: 'string' }, description: 'smart, balanced, fast or code' }], returns: { kind: 'reference', reference: 'TierRoute' } },
             ...undoMethods('your last change to the AI settings (tiers, single-model rows, gates, keepalive, learning budget) or to a saved preset. Credentials, the login and the permission sections are never undone'),
           ],
           events: [
@@ -353,6 +451,7 @@ export class SettingsManager extends Abject {
     await this.loadProviderDescriptions();
     await this.loadAi();
     this.savedPresets = await this.loadSavedPresets();
+    this.pending = this.parseJson<PendingRoutes>(await this.fetch<string>(STORAGE_KEY_PENDING_ROUTES)) ?? null;
     await this.loadAndApplyAuth();
     await this.loadAndApplyPermissions();
     if (this.isConfigured()) {
@@ -401,17 +500,22 @@ export class SettingsManager extends Abject {
       return this.view(section as SettingsSectionId, false);
     });
 
-    this.on('listPresets', async () => {
-      await this.refreshKeyedCatalogs();
+    this.on('listPresets', async (): Promise<PresetListing[]> => {
+      await Promise.all([this.refreshKeyedCatalogs(), this.probeProviders(false)]);
+      const listing = (name: string, builtin: boolean, preset: TierPreset): PresetListing => ({
+        name, builtin, preset,
+        needs: [...new Set(this.presetSlots(preset).map(([, route]) => route.provider).filter(id => !this.isReady(id)))],
+        inUse: TIER_NAMES.every(t => sameRoute(preset.routing[t], this.tiers[t])),
+      });
       return [
-        ...Object.keys(this.savedPresets).sort().map(name => ({ name, builtin: false, preset: this.savedPresets[name] })),
-        ...this.builtinPresets().filter(b => !this.savedPresets[b.name]).map(b => ({ name: b.name, builtin: true, preset: b.preset })),
+        ...Object.keys(this.savedPresets).sort().map(name => listing(name, false, this.savedPresets[name])),
+        ...this.builtinPresets().filter(b => !this.savedPresets[b.name]).map(b => listing(b.name, true, b.preset)),
       ];
     });
 
     this.on('applyPreset', async (msg: AbjectMessage) => {
       await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
-      const { name } = (msg.payload ?? {}) as { name?: string };
+      const { name, onlyReady } = (msg.payload ?? {}) as { name?: string; onlyReady?: boolean };
       precondition(typeof name === 'string' && name.trim() !== '', 'name must be a preset name');
       await this.refreshKeyedCatalogs();
       const preset = this.savedPresets[name!] ?? this.builtinPresets().find(b => b.name === name)?.preset;
@@ -420,20 +524,73 @@ export class SettingsManager extends Abject {
         ...Object.values(preset!.routing).map(r => r?.provider),
         preset!.vision?.provider, preset!.fallback?.provider, preset!.decision?.provider,
       ]);
-      const update: Record<string, unknown> = { tiers: { ...emptyTiers(), ...preset!.routing } };
-      update.vision = preset!.vision ?? null;
-      if (preset!.fallback !== undefined) update.fallback = preset!.fallback;
-      if (preset!.decision !== undefined) update.decision = preset!.decision;
-      // A provider this build does not know leaves its tier as it is.
-      const tiers = update.tiers as Record<string, TierRoute | null>;
-      for (const tier of TIER_NAMES) {
-        const route = tiers[tier];
-        if (!route || !this.providerDescById.has(route.provider)) tiers[tier] = this.tiers[tier];
+      await this.probeProviders(false);
+      const slots = this.presetSlots(preset!);
+      const waiting = slots.filter(([, route]) => !this.isReady(route.provider));
+      if (waiting.length > 0 && onlyReady !== true) {
+        const providers = [...new Set(waiting.map(([, route]) => this.providerDescById.get(route.provider)?.label ?? route.provider))];
+        precondition(false, `"${name}" uses ${listed(providers)}, which ${providers.length === 1 ? 'is' : 'are'} not connected. ` +
+          `Connect ${providers.length === 1 ? 'it' : 'them'} first, or apply only the part that is ready.`);
       }
+      // Routes for ready providers apply now. A tier or row the preset leaves
+      // empty is cleared, as before; one whose provider is not ready, or is
+      // unknown to this build, stays as it is.
+      const isWaiting = (key: SlotKey) => waiting.some(([k]) => k === key);
+      const tiers: Record<string, TierRoute | null> = {};
+      for (const tier of TIER_NAMES) {
+        const route = preset!.routing[tier];
+        if (!route) tiers[tier] = null;
+        else if (this.providerDescById.has(route.provider) && !isWaiting(tier)) tiers[tier] = route;
+      }
+      const update: Record<string, unknown> = { tiers };
+      if (!isWaiting('vision')) update.vision = preset!.vision ?? null;
+      if (preset!.fallback !== undefined && !isWaiting('fallback')) update.fallback = preset!.fallback;
+      if (preset!.decision !== undefined && !isWaiting('decision')) update.decision = preset!.decision;
       const before = this.aiUndoFields();
-      await this.setSection('ai', update);
+      const priorPending = this.pending;
+      // Set before the write, so the change it announces already shows what waits.
+      this.pending = waiting.length > 0 ? { preset: name!, slots: Object.fromEntries(waiting) } : null;
+      try {
+        await this.setSection('ai', update);
+      } catch (err) {
+        this.pending = priorPending;
+        throw err;
+      }
+      await this.persistPending();
       await this.recordAiChange(msg, before, `Apply preset ${name}`);
       return this.view('ai', false);
+    });
+
+    this.on('listProviders', async (msg: AbjectMessage): Promise<ProviderStatus[]> => {
+      const { probe, force } = (msg.payload ?? {}) as { probe?: boolean; force?: boolean };
+      if (probe === true) {
+        await this.probeProviders(force === true);
+        await this.applyPending();
+      }
+      return this.providerDescriptions.map(desc => this.providerStatus(desc));
+    });
+
+    this.on('connectProvider', async (msg: AbjectMessage): Promise<ConnectResult> => {
+      await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
+      const { provider, credential, unchecked, route } = (msg.payload ?? {}) as { provider?: string; credential?: string; unchecked?: boolean; route?: boolean };
+      if (typeof provider === 'string') await this.knowProviders([provider]);
+      const desc = typeof provider === 'string' ? this.providerDescById.get(provider) : undefined;
+      precondition(!!desc, `Unknown provider: ${provider}`);
+      precondition(credential === undefined || typeof credential === 'string', 'credential must be a string');
+      const before = this.aiUndoFields();
+      const result = await this.connect(desc!, (credential ?? '').trim(), unchecked === true, route === true);
+      if (result.ok) await this.recordAiChange(msg, before, `Connect ${desc!.label}`);
+      return result;
+    });
+
+    this.on('recommendedRoute', async (msg: AbjectMessage): Promise<TierRoute | null> => {
+      const { provider, tier } = (msg.payload ?? {}) as { provider?: string; tier?: string };
+      if (typeof provider === 'string') await this.knowProviders([provider]);
+      const desc = typeof provider === 'string' ? this.providerDescById.get(provider) : undefined;
+      precondition(!!desc, `Unknown provider: ${provider}`);
+      precondition(TIER_NAMES.includes(tier as ModelTierName), `Unknown tier: ${tier}. Tiers: ${TIER_NAMES.join(', ')}`);
+      await this.refreshCatalog(desc!.id);
+      return this.recommendedRoute(desc!, tier as ModelTierName);
     });
 
     this.on('savePreset', async (msg: AbjectMessage) => {
@@ -613,6 +770,7 @@ export class SettingsManager extends Abject {
           decisionGates: this.decisionGates,
           cacheKeepalive: this.cacheKeepalive,
           learningBudgetUsdPerDay: this.learningBudgetUsdPerDay,
+          pending: this.pending ? { preset: this.pending.preset, slots: { ...this.pending.slots } } : null,
         } as SettingsBySection[S];
       }
       case 'auth':
@@ -782,6 +940,32 @@ export class SettingsManager extends Abject {
       const ref = values[key] === null ? null : this.checkModelRef(values[key], key, providers, this.aux[key]);
       aux[key] = ref ? { provider: ref.provider, model: ref.model } : null;
     }
+    // A key taken away takes its provider out of the routing: tiers that ran
+    // on it move to a provider that still serves (or wait for one), and
+    // single-model rows on it are cleared. A tier or row this same write sets
+    // is left to the checks below.
+    const removedCredentials = Object.keys(this.credentials).filter(id => {
+      // A local-URL provider falls back to its default address, so it never leaves.
+      const desc = this.providerDescById.get(id);
+      return !credentials[id] && !(desc?.credentialMode === 'url' && desc.credentialPlaceholder);
+    });
+    const written = new Set<string>([
+      ...(values.tiers && typeof values.tiers === 'object' ? Object.keys(values.tiers) : []),
+      ...AUX_ROW_KEYS.filter(key => values[key] !== undefined),
+    ]);
+    if (removedCredentials.length > 0) {
+      const serves = (id: string | undefined): boolean => !!id && !removedCredentials.includes(id);
+      const standIn = TIER_NAMES.map(t => tiers[t]?.provider).find(serves)
+        ?? this.providerDescriptions.find(d => servesChat(d) && d.credentialMode === 'apiKey' && !!credentials[d.id])?.id;
+      const standInDesc = standIn ? this.providerDescById.get(standIn) : undefined;
+      for (const tier of TIER_NAMES) {
+        if (written.has(tier) || !tiers[tier] || serves(tiers[tier]!.provider)) continue;
+        tiers[tier] = standInDesc ? this.recommendedRoute(standInDesc, tier) : null;
+      }
+      for (const key of AUX_ROW_KEYS) {
+        if (!written.has(key) && aux[key] && !serves(aux[key]!.provider)) aux[key] = null;
+      }
+    }
     let decisionGates = this.decisionGates;
     if (values.decisionGates !== undefined) {
       precondition(DECISION_GATES.includes(values.decisionGates as DecisionGates), `decisionGates must be one of ${DECISION_GATES.join(', ')}`);
@@ -800,28 +984,36 @@ export class SettingsManager extends Abject {
       learningBudgetUsdPerDay = Math.round((v as number) * 100) / 100;
     }
 
-    // The result must work: a tier configured, and a key for every provider
-    // that needs one. A local-URL provider gets its default address.
-    if (values.tiers !== undefined) precondition(TIER_NAMES.some(t => tiers[t] !== null), 'Configure at least one model tier.');
+    // The result must work: a key for every provider that needs one (one the
+    // environment keyed at boot counts). No tier set at all is a valid state:
+    // nothing is connected yet. A local-URL provider gets its default address.
     for (const desc of this.providerDescriptions) {
       if (desc.credentialMode === 'url' && !credentials[desc.id] && desc.credentialPlaceholder) credentials[desc.id] = desc.credentialPlaceholder;
     }
+    const keyed = (desc: LLMProviderDescription): boolean =>
+      !!credentials[desc.id] || (!removedCredentials.includes(desc.id) && this.probes.get(desc.id)?.state === 'connected');
     for (const tier of TIER_NAMES) {
       const route = tiers[tier];
       const desc = route ? this.providerDescById.get(route.provider) : undefined;
       if (desc?.credentialMode === 'apiKey') {
-        precondition(!!credentials[desc.id], `${TIER_LABELS[tier]} tier uses ${desc.label} but no API key provided.`);
+        precondition(keyed(desc), `${TIER_LABELS[tier]} tier uses ${desc.label}, which has no API key yet. Connect ${desc.label} first.`);
       }
     }
     for (const key of AUX_ROW_KEYS) {
       const ref = aux[key];
       const desc = ref ? this.providerDescById.get(ref.provider) : undefined;
       if (desc?.credentialMode === 'apiKey') {
-        precondition(!!credentials[desc.id], `${AUX_ROWS[key].label} uses ${desc.label} but no API key provided.`);
+        precondition(keyed(desc), `${AUX_ROWS[key].label} uses ${desc.label}, which has no API key yet. Connect ${desc.label} first.`);
       }
     }
 
-    const removedCredentials = Object.keys(this.credentials).filter(id => !credentials[id]);
+    // A tier or row set here is no longer waiting on a preset.
+    if (this.pending) {
+      const slots = Object.fromEntries(Object.entries(this.pending.slots).filter(([key]) => !written.has(key)));
+      this.pending = Object.keys(slots).length > 0 ? { preset: this.pending.preset, slots } : null;
+      await this.persistPending();
+    }
+    for (const id of removedCredentials) this.probes.delete(id);
     this.credentials = credentials;
     this.tiers = tiers;
     this.aux = aux;
@@ -849,7 +1041,7 @@ export class SettingsManager extends Abject {
     await this.store('set', STORAGE_KEY_CACHE_KEEPALIVE, this.cacheKeepalive);
     await this.store('set', STORAGE_KEY_LEARNING_BUDGET, this.learningBudgetUsdPerDay);
     await this.store('set', STORAGE_KEY_DECISION_GATES, this.decisionGates);
-    await this.configureProviders();
+    await this.configureProviders(removedCredentials);
     log.info('Saved provider settings');
   }
 
@@ -1053,13 +1245,15 @@ export class SettingsManager extends Abject {
   }
 
   /** One LLM configure carrying credentials, routing, the single-model rows and the policies. */
-  private async configureProviders(): Promise<void> {
+  private async configureProviders(withdraw: string[] = []): Promise<void> {
     const routing: Record<string, TierRoute> = {};
     for (const tier of TIER_NAMES) if (this.tiers[tier]) routing[tier] = { ...this.tiers[tier]! };
     const fallback = this.aux.fallback;
     await this.request(request(this.id, this.llmId!, 'configure', {
       credentials: { ...this.credentials },
-      tierRouting: Object.keys(routing).length > 0 ? routing : undefined,
+      withdraw,
+      // Always sent: an empty routing clears tiers that were routed before.
+      tierRouting: routing,
       // One fallback model covers every tier: outage cover, not per-tier routing.
       tierFallbacks: fallback ? Object.fromEntries(TIER_NAMES.map(tier => [tier, [fallback]])) : null,
       visionFallback: this.aux.vision,
@@ -1095,6 +1289,204 @@ export class SettingsManager extends Abject {
 
   private async refreshKeyedCatalogs(): Promise<void> {
     await Promise.all(this.providerDescriptions.map(d => this.refreshCatalog(d.id)));
+  }
+
+  // ===========================================================================
+  // Providers: state, connecting, and preset routes that wait for them
+  // ===========================================================================
+
+  /** Every route a preset names, by tier or row. Providers this build does not know are left out. */
+  private presetSlots(preset: TierPreset): Array<[SlotKey, TierRoute]> {
+    const slots: Array<[SlotKey, TierRoute]> = [];
+    for (const tier of TIER_NAMES) if (preset.routing[tier]) slots.push([tier, preset.routing[tier]!]);
+    for (const key of AUX_ROW_KEYS) if (preset[key]) slots.push([key, preset[key]!]);
+    return slots.filter(([, route]) => this.providerDescById.has(route.provider));
+  }
+
+  private isReady(providerId: string): boolean {
+    const desc = this.providerDescById.get(providerId);
+    return !!desc && this.providerStatus(desc).state === 'connected';
+  }
+
+  private providerStatus(desc: LLMProviderDescription): ProviderStatus {
+    const probe = this.probes.get(desc.id);
+    let state: ProviderState;
+    let detail: string;
+    switch (desc.credentialMode) {
+      case 'apiKey':
+        if (this.credentials[desc.id]) { state = 'connected'; detail = 'Connected'; }
+        else if (probe?.state === 'connected') { state = 'connected'; detail = 'Connected with a key from the environment'; }
+        else { state = 'needsKey'; detail = 'No key yet'; }
+        break;
+      case 'url':
+        state = probe?.state ?? 'unknown';
+        detail = probe?.detail ?? 'Checking';
+        break;
+      case 'cli':
+        state = probe?.state ?? 'unknown';
+        detail = probe?.detail ?? 'Looking for it on this computer';
+        break;
+      default:
+        state = 'connected';
+        detail = 'Provided by a package';
+    }
+    const usedBy = [
+      ...TIER_NAMES.filter(t => this.tiers[t]?.provider === desc.id),
+      ...AUX_ROW_KEYS.filter(k => this.aux[k]?.provider === desc.id),
+    ].map(key => SLOT_LABELS[key]);
+    const models = probe?.models ?? (this.modelCatalog.has(desc.id) ? this.modelCatalog.get(desc.id)!.length : undefined);
+    return {
+      id: desc.id, label: desc.label, mode: desc.credentialMode, chat: servesChat(desc), state, detail, usedBy,
+      ...(models !== undefined ? { models } : {}),
+      ...(desc.credentialLabel ? { credentialLabel: desc.credentialLabel } : {}),
+      ...(desc.credentialPlaceholder ? { credentialPlaceholder: desc.credentialPlaceholder } : {}),
+      ...(desc.credentialUrl ? { credentialUrl: desc.credentialUrl } : {}),
+    };
+  }
+
+  private async askProbe(providerId: string, credential?: string): Promise<CredentialCheck> {
+    try {
+      return await this.request<CredentialCheck>(
+        request(this.id, this.llmId!, 'probeProvider', { provider: providerId, ...(credential ? { credential } : {}) }), 30_000);
+    } catch (err) {
+      return { state: 'unreachable', detail: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Look at one provider that has no key saved here: whether its local
+   * server answers, its CLI is installed, or the environment keyed it.
+   */
+  private async probeProvider(desc: LLMProviderDescription): Promise<void> {
+    if (desc.credentialMode === 'none' || (desc.credentialMode === 'apiKey' && this.credentials[desc.id])) return;
+    const address = desc.credentialMode === 'url' ? (this.credentials[desc.id] || desc.credentialPlaceholder || '') : undefined;
+    const check = await this.askProbe(desc.id, address);
+    const ok = check.state === 'ok';
+    if (desc.credentialMode === 'url') {
+      const where = (address ?? '').replace(/^https?:\/\//, '');
+      this.probes.set(desc.id, ok
+        ? { state: 'connected', detail: `Running at ${where}`, ...(check.models !== undefined ? { models: check.models } : {}) }
+        : { state: 'unreachable', detail: `Nothing answering at ${where}` });
+    } else if (desc.credentialMode === 'cli') {
+      this.probes.set(desc.id, ok
+        ? { state: 'connected', detail: 'Found on this computer' }
+        : { state: 'missing', detail: 'Not installed on this computer' });
+    } else {
+      this.probes.set(desc.id, ok
+        ? { state: 'connected', detail: 'Connected with a key from the environment', ...(check.models !== undefined ? { models: check.models } : {}) }
+        : { state: 'needsKey', detail: 'No key yet' });
+    }
+  }
+
+  /** Look at every provider not looked at yet (or, with force, at every one). Looks under way are joined. */
+  private async probeProviders(force: boolean): Promise<void> {
+    await Promise.all(this.providerDescriptions.map(desc => {
+      if (!force && this.probes.has(desc.id)) return undefined;
+      let inFlight = this.probesInFlight.get(desc.id);
+      if (!inFlight) {
+        inFlight = this.probeProvider(desc).finally(() => { this.probesInFlight.delete(desc.id); });
+        this.probesInFlight.set(desc.id, inFlight);
+      }
+      return inFlight;
+    }));
+  }
+
+  /**
+   * A provider's recommended model for one tier: Latest where it can
+   * recommend the tier from its catalog, else its default for the tier, else
+   * (a local server with no defaults) the first model it has.
+   */
+  private recommendedRoute(desc: LLMProviderDescription, tier: ModelTierName): TierRoute | null {
+    if (!servesChat(desc)) return null;
+    if (hasTierRules(desc, tier)) return { provider: desc.id, model: LATEST_MODEL };
+    const d = desc.defaultTierModels;
+    const model = d?.[tier] || d?.smart || this.catalogFor(desc.id)[0]?.id;
+    return model ? { provider: desc.id, model } : null;
+  }
+
+  /** Route every tier to one provider's recommended models. False when it has none to recommend. */
+  private async routeAllTo(desc: LLMProviderDescription): Promise<boolean> {
+    this.modelCatalog.delete(desc.id);
+    await this.refreshCatalog(desc.id);
+    const tiers: Record<string, TierRoute> = {};
+    for (const tier of TIER_NAMES) {
+      const route = this.recommendedRoute(desc, tier);
+      if (route) tiers[tier] = route;
+    }
+    if (Object.keys(tiers).length === 0) return false;
+    const builtin = this.builtinPresets().find(b => b.name === `${desc.label} recommended`)?.preset;
+    await this.setSection('ai', { tiers, ...(builtin?.vision ? { vision: builtin.vision } : {}) });
+    return true;
+  }
+
+  /**
+   * Connect one provider. An API key is checked with the provider before it
+   * is saved, so a wrong key never lands in the settings; a local server
+   * must answer at its address; a CLI must be installed. With no tier set
+   * yet, the tiers then go to this provider's recommended models.
+   */
+  private async connect(desc: LLMProviderDescription, credential: string, unchecked: boolean, route: boolean): Promise<ConnectResult> {
+    let check: CredentialCheck = { state: 'unchecked' };
+    if (desc.credentialMode === 'apiKey' && credential === '' && this.isReady(desc.id)) {
+      // Already keyed and no new key given: nothing to check or save.
+    } else if (desc.credentialMode === 'apiKey') {
+      precondition(credential !== '', `Paste the ${desc.label} key first.`);
+      if (!unchecked) check = await this.askProbe(desc.id, credential);
+      if (check.state === 'rejected') return { ok: false, reason: 'rejected', message: `${desc.label} did not accept this key.` };
+      if (check.state === 'unreachable') return { ok: false, reason: 'unreachable', message: `Could not reach ${desc.label} to check the key.` };
+      this.modelCatalog.delete(desc.id);
+      await this.setSection('ai', { credentials: { [desc.id]: credential } });
+    } else if (desc.credentialMode === 'url') {
+      const address = credential || this.credentials[desc.id] || desc.credentialPlaceholder || '';
+      check = await this.askProbe(desc.id, address);
+      const where = address.replace(/^https?:\/\//, '');
+      if (check.state !== 'ok') {
+        this.probes.set(desc.id, { state: 'unreachable', detail: `Nothing answering at ${where}` });
+        return { ok: false, reason: 'unreachable', message: `Nothing answered at ${where}.` };
+      }
+      this.probes.set(desc.id, { state: 'connected', detail: `Running at ${where}`, ...(check.models !== undefined ? { models: check.models } : {}) });
+      this.modelCatalog.delete(desc.id);
+      await this.setSection('ai', { credentials: { [desc.id]: address } });
+    } else if (desc.credentialMode === 'cli') {
+      check = await this.askProbe(desc.id);
+      if (check.state !== 'ok') {
+        this.probes.set(desc.id, { state: 'missing', detail: 'Not installed on this computer' });
+        return { ok: false, reason: 'missing', message: `${desc.cli?.binary ?? desc.label} is not installed on this computer. ${desc.cli?.installHint ?? ''}`.trim() };
+      }
+      this.probes.set(desc.id, { state: 'connected', detail: 'Found on this computer' });
+    }
+    const routed = servesChat(desc) && (route || TIER_NAMES.every(t => this.tiers[t] === null)) ? await this.routeAllTo(desc) : false;
+    await this.applyPending();
+    if (!routed && desc.credentialMode === 'cli') this.changed('settingsChanged', { section: 'ai' });
+    return { ok: true, routed, checked: check.state === 'ok', ...(check.models !== undefined ? { models: check.models } : {}) };
+  }
+
+  private async persistPending(): Promise<void> {
+    if (this.pending) await this.store('set', STORAGE_KEY_PENDING_ROUTES, JSON.stringify(this.pending));
+    else await this.store('delete', STORAGE_KEY_PENDING_ROUTES);
+  }
+
+  /** Put waiting preset routes into effect for every provider that is ready now. */
+  private async applyPending(): Promise<void> {
+    if (!this.pending) return;
+    const ready = Object.entries(this.pending.slots).filter(([, route]) => route && this.isReady(route.provider)) as Array<[SlotKey, TierRoute]>;
+    if (ready.length === 0) return;
+    const values: Record<string, unknown> = {};
+    for (const [key, route] of ready) {
+      if ((TIER_NAMES as string[]).includes(key)) values.tiers = { ...(values.tiers as Record<string, unknown> | undefined), [key]: route };
+      else values[key] = { provider: route.provider, model: route.model };
+    }
+    try {
+      // Writing them takes them off the waiting list (see setAi).
+      await this.setSection('ai', values);
+      log.info(`Applied waiting preset routes: ${ready.map(([key]) => key).join(', ')}`);
+    } catch (err) {
+      // A route the settings no longer accept stops waiting.
+      const slots = Object.fromEntries(Object.entries(this.pending?.slots ?? {}).filter(([key]) => !ready.some(([k]) => k === key)));
+      this.pending = this.pending && Object.keys(slots).length > 0 ? { preset: this.pending.preset, slots } : null;
+      await this.persistPending();
+      log.warn(`Dropped waiting preset routes: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -1399,6 +1791,9 @@ export class SettingsManager extends Abject {
             throw new UndoRefused(`The ${AI_UNDO_LABELS[key] ?? key} changed since, so "${step.label}" can no longer be ${verb}`);
           }
         }
+        // Taking a preset back takes back what it left waiting too.
+        this.pending = null;
+        await this.persistPending();
         await this.setSection('ai', this.aiValuesFrom(target as Record<string, unknown>));
       } else {
         if (!sameValue(this.savedPresets[data.name] ?? null, expect)) {
@@ -1452,10 +1847,15 @@ The global settings as data. The Settings window and the terminal client edit th
 ### Read
 - getSettingsSchema(): sections (ai, auth, filesystem, shell, web, permissions) and their fields.
 - getSettings({ section? }): current values; secrets read as { set: true|false }.
-- listPresets(), listModels({ provider }), isConfigured().
+- listPresets(): each preset with the providers it still needs (needs) and whether the tiers match it (inUse).
+- listProviders({ probe? }): every provider and whether it can serve: connected, needsKey, unreachable, missing.
+- listModels({ provider }), recommendedRoute({ provider, tier }), isConfigured().
+- ai.pending: preset routes waiting for their provider to connect.
+
+No provider connected and no tier set is a valid state, not an error: the person has not chosen an AI yet.
 
 ### Change
-setSettings, applyPreset, savePreset and deletePreset are taken from the Settings window, the terminal client, and objects in a local workspace this machine hosts (never from shared or public workspaces):
+setSettings, connectProvider, applyPreset, savePreset and deletePreset are taken from the Settings window, the terminal client, and objects in a local workspace this machine hosts (never from shared or public workspaces):
 changing settings is the person's call. To change something, open the Settings window (GlobalSettings.show) or ask the user.
 
 ### Undo

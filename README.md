@@ -468,9 +468,10 @@ ollama pull qwen3:4b      # Fast tier (quick tasks, low latency)
 Leave Ollama running; Abject finds it at `http://localhost:11434`. Then pick
 the models in Settings:
 1. Click the gear in the System section of the dock to open Settings, AI tab
-2. Under **1 · Credentials**, pick **Ollama** and set its URL (default: `http://localhost:11434`)
-3. Under **3 · Model Tiers**, assign a model to each tier (Smart, Balanced, Fast, and Code)
-4. Click **Save Settings**
+2. On the **Providers** sub-tab, Ollama shows as running. Press **Manage**, then **Use for every tier**
+   (to reach Ollama on another machine, enter its address there first and press **Connect**)
+3. On the **Models** sub-tab, change any tier (Smart, Balanced, Fast, and Code) to the model you pulled for it.
+   Each change saves as you make it
 
 From a terminal the same is `abject setup`, or one tier at a time:
 `/set ai.tiers.smart ollama qwen3:32b`.

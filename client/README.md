@@ -78,7 +78,9 @@ reaches a desktop over WebRTC.
   keyboard proxy and file-upload inputs, and the phone's palette and Exposé
   buttons.
 - **`index.ts`**: entry point. Builds the WebSocket URL (`VITE_WS_URL`, else
-  `wss://<host>/ws` on https, else `ws://127.0.0.1:<VITE_WS_PORT>`), chooses a
+  `wss://<host>/ws` on https, else the port the page was opened with (`?ws=PORT`,
+  which the desktop app sets to its own backend's `WS_PORT`), else
+  `ws://127.0.0.1:<VITE_WS_PORT>`), chooses a
   transport (a `?pair=` link pairs over WebRTC, a saved paired desktop
   reconnects over WebRTC, otherwise WebSocket; the p2p build connects to the
   selected instance or shows the picker), starts the backdrop, creates the

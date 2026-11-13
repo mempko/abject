@@ -20,6 +20,14 @@
  *   and this object (see terminal-session.ts). This object keeps the map so a
  *   view can list and close only its own sessions.
  *
+ * One other caller gets a terminal, by a separate door: the LLM object, for a
+ * model provider that runs a CLI as a warm interactive session (`openProgram`).
+ * That is not a shell handed to anything: the LLM object names the provider's
+ * own binary and arguments, the person chose that provider in Settings, and
+ * no agent, package or peer can reach the method. It asks no question, as
+ * the same provider's one-shot calls ask none, and it is not behind the
+ * shell switch, which governs commands objects run, not which model answers.
+ *
  * The emulator is libghostty's VT engine via `@slopus/ghostty-wasm`, and the pty
  * is `@lydell/node-pty`; both are reached inside the session, lazily, so nothing
  * else in the system loads a native addon or a wasm module to know about
@@ -32,7 +40,7 @@ import { Abject } from '../../core/abject.js';
 import type { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { request } from '../../core/message.js';
 import { PermissionDenied, type PermissionReceipt } from '../../core/permission-outcome.js';
-import { TerminalSession, type TerminalSessionSpec } from './terminal-session.js';
+import { MAX_SCREEN_CELLS, TerminalSession, type TerminalSessionSpec } from './terminal-session.js';
 
 export const TERMINAL_ID = 'abjects:terminal' as AbjectId;
 export const TERMINAL_INTERFACE = 'abjects:terminal' as InterfaceId;
@@ -43,6 +51,12 @@ const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
 const MAX_COLS = 500;
 const MAX_ROWS = 200;
+/**
+ * A program read off its screen needs room a person's window never does: a
+ * reply that scrolls off the alternate screen is gone, so its terminal is as
+ * tall as a long reply.
+ */
+const PROGRAM_MAX_CELLS = 1000;
 
 /** One open session, with what the person approved for it. */
 interface SessionRecord {
@@ -56,6 +70,8 @@ interface SessionRecord {
 
 /** The objects allowed to ask for a terminal: the built-in view, and the CLI gateway. */
 const TERMINAL_CALLERS = ['TerminalView', 'CliServer'] as const;
+/** The object allowed to run a named program in a terminal: the LLM object, for a CLI model provider. */
+const PROGRAM_CALLERS = ['LLM'] as const;
 
 export class Terminal extends Abject {
   /** Mirrors SettingsManager's shell.enabled, pushed in like ShellExecutor's. */
@@ -86,6 +102,20 @@ export class Terminal extends Abject {
               ],
               returns: { kind: 'object', properties: {} },
             },
+            {
+              name: 'openProgram',
+              description: 'Run one named program in a terminal of its own, for the LLM object only: the CLI of a model provider the person chose, driven as a warm interactive session. Asks no question. Returns the TerminalSession AbjectId.',
+              parameters: [
+                { name: 'command', type: { kind: 'primitive', primitive: 'string' }, description: 'The program to run' },
+                { name: 'args', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Its arguments', optional: true },
+                { name: 'cwd', type: { kind: 'primitive', primitive: 'string' }, description: 'Working directory (an absolute path)' },
+                { name: 'cols', type: { kind: 'primitive', primitive: 'number' }, description: 'Columns', optional: true },
+                { name: 'rows', type: { kind: 'primitive', primitive: 'number' }, description: 'Rows', optional: true },
+                { name: 'dropEnvPrefixes', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Inherited environment variables to withhold, by name prefix', optional: true },
+                { name: 'label', type: { kind: 'primitive', primitive: 'string' }, description: 'What the process is, for diagnostics', optional: true },
+              ],
+              returns: { kind: 'object', properties: {} },
+            },
             { name: 'list', description: 'The calling view\u2019s own open sessions', parameters: [], returns: { kind: 'object', properties: {} } },
             { name: 'close', description: 'Close one of the calling view\u2019s sessions', parameters: [{ name: 'sessionId', type: { kind: 'primitive', primitive: 'string' }, description: 'Session AbjectId' }], returns: { kind: 'object', properties: {} } },
             { name: 'updatePermissions', description: 'Applied by SettingsManager: the shell master switch', parameters: [{ name: 'enabled', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Whether shells may be opened', optional: true }], returns: { kind: 'object', properties: {} } },
@@ -100,6 +130,7 @@ export class Terminal extends Abject {
 
   private setupHandlers(): void {
     this.on('open', async (msg: AbjectMessage) => this.openSession(msg));
+    this.on('openProgram', async (msg: AbjectMessage) => this.openProgram(msg));
 
     this.on('list', async (msg: AbjectMessage) => {
       const mine = [...this.sessions.entries()]
@@ -117,6 +148,9 @@ export class Terminal extends Abject {
       }
       await record.session.close();
       this.sessions.delete(sessionId as AbjectId);
+      // Closed for good: off the bus too, so sessions opened and closed over
+      // a long run (a provider recycles its warm ones) do not pile up.
+      try { await record.session.stop(); } catch { /* already stopped */ }
       this.changed('sessionsChanged', { sessionId, state: 'closed' });
       this.checkInvariants();
       return { success: true };
@@ -181,6 +215,46 @@ export class Terminal extends Abject {
     this.changed('sessionsChanged', { sessionId: session.id, state: 'open', cwd });
     this.checkInvariants();
     return { success: true, sessionId: session.id, cwd, cols, rows, command, permission };
+  }
+
+  /**
+   * A terminal for a model provider's CLI, opened for the LLM object alone.
+   * The caller is admitted by what it is (the built-in LLM object), never by
+   * what the message says.
+   */
+  private async openProgram(msg: AbjectMessage): Promise<Record<string, unknown>> {
+    if (!await this.isBuiltInCaller(msg.routing.from, PROGRAM_CALLERS)) {
+      throw new Error('A program terminal is opened by the LLM object for a model provider; this caller holds no such capability');
+    }
+    const payload = (msg.payload ?? {}) as {
+      command?: unknown; args?: unknown; cwd?: unknown; cols?: number; rows?: number; dropEnvPrefixes?: unknown; label?: unknown;
+    };
+    const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string');
+    contractRequire(typeof payload.command === 'string' && payload.command.length > 0, 'openProgram: command is the program to run');
+    contractRequire(payload.args === undefined || isStrings(payload.args), 'openProgram: args is a list of strings');
+    contractRequire(typeof payload.cwd === 'string' && path.isAbsolute(payload.cwd), 'openProgram: cwd is an absolute path');
+    contractRequire(payload.dropEnvPrefixes === undefined || isStrings(payload.dropEnvPrefixes), 'openProgram: dropEnvPrefixes is a list of strings');
+    const callerId = msg.routing.from;
+    const command = payload.command as string;
+    const cwd = payload.cwd as string;
+    const cols = clampInt(payload.cols, DEFAULT_COLS, 2, PROGRAM_MAX_CELLS);
+    const rows = clampInt(payload.rows, DEFAULT_ROWS, 2, PROGRAM_MAX_CELLS);
+    contractRequire(cols * rows <= MAX_SCREEN_CELLS, `openProgram: a screen holds at most ${MAX_SCREEN_CELLS} cells (${cols}x${rows} asked)`);
+
+    const session = new TerminalSession({
+      command, args: (payload.args as string[] | undefined) ?? [], cwd, cols, rows,
+      dropEnvPrefixes: (payload.dropEnvPrefixes as string[] | undefined) ?? [],
+      ...(typeof payload.label === 'string' && payload.label ? { label: payload.label } : {}),
+      // An interactive UI on the alternate screen keeps no scrollback worth holding.
+      maxScrollback: 1000,
+      owner: callerId,
+      supervisor: this.id,
+    });
+    await session.init(this.bus, this.id);
+    this.sessions.set(session.id, { owner: callerId, cwd, command, session });
+    this.changed('sessionsChanged', { sessionId: session.id, state: 'open', cwd });
+    this.checkInvariants();
+    return { success: true, sessionId: session.id, cwd, cols, rows, command };
   }
 
   /** The working directory is its own question, exactly as it is for a single command. */

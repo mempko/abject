@@ -116,6 +116,7 @@ export class DeepSeekProvider extends OpenAIProvider {
       label: 'DeepSeek',
       storageSuffix: 'deepseekApiKey',
       credentialMode: 'apiKey',
+      credentialUrl: 'https://platform.deepseek.com/api_keys',
       credentialLabel: 'DeepSeek API Key',
       credentialPlaceholder: 'sk-...',
       models: [

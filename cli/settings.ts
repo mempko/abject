@@ -322,7 +322,7 @@ export const SETTINGS_HELP: string[] = [
   '                         /set ai.credentials.anthropic sk-...   /set shell.objectRules.Builder allow make deny rm',
   '  /add /remove <path> <item>   one item of a list: /add web.allowedDomains example.com',
   '  /wget, /wset <path> <value>  this workspace: /wset general.description …, /wset appearance.theme agitprop',
-  '  /presets, /preset apply|save|delete <name>, /models <provider>',
+  '  /presets, /preset apply|ready|save|delete <name>, /models <provider>',
   '  /packages, /package enable|disable <name>, /skills, /skill enable|disable <name>',
   '  /update [check|download|restart|auto on|off]   software updates (desktop app)',
   '  values: on/off for switches, a,b,c for lists, none to clear',
@@ -411,18 +411,33 @@ export async function runSettingsCommand(
       return ok(`${ws.name}: ${path} = ${shown}`);
     }
     case 'presets': {
-      const list = await client.request<Array<{ name: string; builtin: boolean }>>('listPresets', {}, 60_000);
+      const list = await client.request<Array<{ name: string; builtin: boolean; needs?: string[]; inUse?: boolean }>>('listPresets', {}, 60_000);
       return [
         { text: 'presets (saved first, then built-in):', color: 'bold' },
-        ...list.map(p => ({ text: `  ${p.name}${p.builtin ? '' : '  (saved)'}`, color: 'normal' as const })),
+        ...list.map(p => ({
+          text: `  ${p.name}${p.builtin ? '' : '  (saved)'}${p.inUse ? '  (in use)' : p.needs?.length ? `  (needs ${p.needs.join(', ')})` : ''}`,
+          color: 'normal' as const,
+        })),
       ];
     }
     case 'preset': {
       const [action, ...rest] = args;
       const name = rest.join(' ').trim();
-      if (!['apply', 'save', 'delete'].includes(action ?? '') || !name) throw new Error('usage: /preset apply|save|delete <name>');
+      if (!['apply', 'ready', 'save', 'delete'].includes(action ?? '') || !name) throw new Error('usage: /preset apply|ready|save|delete <name>');
+      // ready: apply the part whose providers are connected; the rest waits for its provider.
+      if (action === 'ready') {
+        await client.request('applyPreset', { name, onlyReady: true }, 60_000);
+        return ok(`preset applied where its providers are connected: ${name}`);
+      }
       const op = action === 'apply' ? 'applyPreset' : action === 'save' ? 'savePreset' : 'deletePreset';
-      await client.request(op, { name }, 60_000);
+      try {
+        await client.request(op, { name }, 60_000);
+      } catch (err) {
+        if (action === 'apply' && /not connected/.test(err instanceof Error ? err.message : '')) {
+          throw new Error(`${(err as Error).message} For the ready part: /preset ready ${name}`);
+        }
+        throw err;
+      }
       return ok(`preset ${action === 'apply' ? 'applied' : action === 'save' ? 'saved' : 'deleted'}: ${name}`);
     }
     case 'models': {

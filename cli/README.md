@@ -158,7 +158,8 @@ conversationId?, data }`. The server side is documented in
 - The instance: `instanceInfo`, `isConfigured`, `shutdown`.
 - External projects: `listProjects`, `setProjectTrusted`, `setProjectAutonomy`.
 - Settings: `getSettingsSchema`, `getSettings`, `setSettings`, `listPresets`,
-  `applyPreset`, `savePreset`, `deletePreset`, `listModels`,
+  `applyPreset`, `savePreset`, `deletePreset`, `listModels`, `listProviders`,
+  `connectProvider`,
   `getWorkspaceSettings`, `setWorkspaceSettings`, `listPackages`,
   `setPackageEnabled`, `listSkills`, `setSkillEnabled`, `getUpdateStatus`,
   `updateAction`.

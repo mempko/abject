@@ -196,7 +196,7 @@ the socket may have no login:
 | `listDialogs`, `respondDialog` | DialogBroker |
 | `instanceInfo`, `shutdown`, `isConfigured` | InstanceInfo, the backend's shutdown, SettingsManager |
 | `listProjects`, `setProjectTrusted`, `setProjectAutonomy` | the workspace's ExternalProjectRegistry |
-| `getSettingsSchema`, `getSettings`, `setSettings`, `listPresets`, `applyPreset`, `savePreset`, `deletePreset`, `listModels` | SettingsManager |
+| `getSettingsSchema`, `getSettings`, `setSettings`, `listPresets`, `applyPreset`, `savePreset`, `deletePreset`, `listModels`, `listProviders`, `connectProvider` | SettingsManager |
 | `getWorkspaceSettings`, `setWorkspaceSettings` (sections `general`, `access`, `web`, `appearance`) | WorkspaceManager, the workspace's WebExposure and Theme |
 | `listPackages`, `setPackageEnabled`, `setPackageSettings` | Packages |
 | `listSkills`, `setSkillEnabled` | SkillRegistry |

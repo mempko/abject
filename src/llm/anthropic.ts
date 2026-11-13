@@ -378,6 +378,7 @@ export class AnthropicProvider extends BaseLLMProvider {
       label: 'Anthropic',
       storageSuffix: 'anthropicApiKey',
       credentialMode: 'apiKey',
+      credentialUrl: 'https://console.anthropic.com/settings/keys',
       credentialLabel: 'Anthropic API Key',
       credentialPlaceholder: 'sk-ant-...',
       models: this.fallbackModels(),

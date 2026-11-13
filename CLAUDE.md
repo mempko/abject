@@ -263,7 +263,8 @@ Global settings (AI keys and tiers, auth, filesystem, shell, web, capability
 enforcement) are owned by `SettingsManager` (`src/objects/settings-manager.ts`):
 it persists them, validates writes, applies them to LLM, UIServer and the
 capability objects, and emits `settingsChanged`. `GlobalSettings` is only its
-window, and `CliServer` exposes the same `getSettingsSchema` / `getSettings` /
+window (its AI tab is drawn by `src/objects/ai-settings-pane.ts`, which saves each
+change as it is made: an AI setting gets its control there, not a Save button), and `CliServer` exposes the same `getSettingsSchema` / `getSettings` /
 `setSettings` to the `abject` command. Add a field to the section's type, `schema()`
 and the section's setter in SettingsManager; then show it in the window. Only
 GlobalSettings, CliServer and abjects in a local workspace this machine hosts may write (shared and public workspaces may not), and only GlobalSettings may read secrets.
@@ -287,7 +288,11 @@ A built-in provider (compiled into the server):
    (`src/llm/context-window.ts`) into each `ModelInfo`. A provider that reports none makes every
    agent on its models trim at a small fixed budget, unless the public model catalog knows the model
 5. Add configuration to `LLMObject.configure()` and an entry to `LLMObject.PROVIDER_DESCRIPTORS`
-   (which also reserves its name against abject-backed providers)
+   (which also reserves its name against abject-backed providers). An API-keyed provider goes in
+   `LLMObject.KEYED_PROVIDERS` instead of `configure()`: that list is what registers it when a key
+   is saved, withdraws it when the key is removed, and checks a key before Settings saves it. Make
+   its model listing go through `BaseLLMProvider.fetch`, which is how a wrong key is told from a
+   right one; set `credentialUrl` in `describe()` so the Settings window can link to where keys are made
 6. Export from `src/index.ts`
 
 ## Common Pitfalls

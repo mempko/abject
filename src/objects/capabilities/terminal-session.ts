@@ -1,6 +1,7 @@
 /**
- * One approved interactive shell, addressed and controlled through Abject
- * messages.
+ * One program in a pseudo-terminal, addressed and controlled through Abject
+ * messages: a shell the person approved for a terminal view, or the CLI of a
+ * model provider they chose, run for the LLM object (see Terminal).
  *
  * The pseudo-terminal is `@lydell/node-pty` (loaded lazily, so importing this
  * module never touches a native addon) and the screen is libghostty's VT
@@ -34,6 +35,14 @@ export interface TerminalSessionSpec {
   /** The approved working directory; the whole session is scoped to it by consent. */
   cwd: string;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Inherited environment variables the program must not see, by name
+   * prefix. Named here and removed in this process, so an environment never
+   * travels in a message.
+   */
+  dropEnvPrefixes?: readonly string[];
+  /** What the process is, for the list of children stopped at shutdown. */
+  label?: string;
   cols: number;
   rows: number;
   maxScrollback?: number;
@@ -62,6 +71,15 @@ const MAX_RETAINED_CHARS = 1 << 20;
 const DEFAULT_SCROLLBACK = 5000;
 const MAX_COLS = 500;
 const MAX_ROWS = 200;
+/**
+ * The most cells a screen may have. libghostty-vt 1.3.6 traps (a wasm
+ * `unreachable`, after which the emulator is dead) when a program clears
+ * lines and then enters the alternate screen on a screen of roughly 90,000
+ * to 170,000 cells, which is what Claude Code does at startup; smaller
+ * screens, the sizes terminals normally have, take the same bytes without
+ * trouble. Found at 400x400; this stays clear of the range.
+ */
+export const MAX_SCREEN_CELLS = 80_000;
 const MAX_READ_CHARS = 65536;
 /** One repaint event per frame at most, however many pty chunks arrive. */
 const OUTPUT_EVENT_MS = 16;
@@ -101,6 +119,9 @@ export class TerminalSession extends Abject {
   private stopping = false;
   private closed = false;
   private exitCode?: number;
+  private exitSignal?: number;
+  /** The screen as text, kept until output, a resize or a scroll changes it. */
+  private textCache?: { outputChars: number; lines: string[]; wrapped: boolean[] };
   private sessionStartedAt = Date.now();
   private lastDataAt = 0;
 
@@ -114,6 +135,7 @@ export class TerminalSession extends Abject {
     contractRequire(typeof spec.cwd === 'string' && spec.cwd.length > 0, 'a terminal session needs a working directory');
     contractRequire(Number.isInteger(spec.cols) && spec.cols > 1, 'a terminal session needs at least two columns');
     contractRequire(Number.isInteger(spec.rows) && spec.rows > 1, 'a terminal session needs at least two rows');
+    contractRequire(spec.cols * spec.rows <= MAX_SCREEN_CELLS, `a terminal session's screen holds at most ${MAX_SCREEN_CELLS} cells`);
     super({
       manifest: {
         name: 'TerminalSession',
@@ -127,6 +149,7 @@ export class TerminalSession extends Abject {
             { name: 'status', description: 'Session state, size, title, pid and retained output size', parameters: [], returns: { kind: 'object', properties: {} } },
             { name: 'screen', description: 'The visible screen as styled rows with a cursor, palette and default colours', parameters: [{ name: 'sinceSeq', type: { kind: 'primitive', primitive: 'number' }, description: 'Only answer when the revision is newer than this', optional: true }], returns: { kind: 'object', properties: {} } },
             { name: 'text', description: 'The visible screen as plain text lines', parameters: [], returns: { kind: 'object', properties: {} } },
+            { name: 'read', description: 'For a program driving the session: every visible row as text, which rows the terminal soft-wrapped onto the next, how long the program has been quiet, and whether it has exited', parameters: [], returns: { kind: 'object', properties: {} } },
             { name: 'write', description: 'Send keyboard input exactly as typed (an escape-sequence string)', parameters: [{ name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Bytes to type' }], returns: { kind: 'object', properties: {} } },
             { name: 'paste', description: 'Paste text, bracketed when the program asked for it', parameters: [{ name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Text to paste' }], returns: { kind: 'object', properties: {} } },
             { name: 'resize', description: 'Resize the pty and the screen together (cols/rows come from the view\u2019s cell metrics)', parameters: [{ name: 'cols', type: { kind: 'primitive', primitive: 'number' }, description: 'Columns' }, { name: 'rows', type: { kind: 'primitive', primitive: 'number' }, description: 'Rows' }], returns: { kind: 'object', properties: {} } },
@@ -154,6 +177,19 @@ export class TerminalSession extends Abject {
       return screen;
     });
     this.on('text', (msg: AbjectMessage) => { this.authorize(msg); return { lines: this.plainLines() }; });
+    this.on('read', (msg: AbjectMessage) => {
+      this.authorize(msg);
+      const { lines, wrapped } = this.screenText();
+      return {
+        lines, wrapped,
+        idleMs: this.lastDataAt > 0 ? Date.now() - this.lastDataAt : 0,
+        exited: this.closed,
+        // The emulator failed: what is on the screen can no longer be trusted.
+        ...(this.screenError ? { screenError: this.screenError } : {}),
+        ...(this.exitCode !== undefined ? { exitCode: this.exitCode } : {}),
+        ...(this.exitSignal ? { signal: this.exitSignal } : {}),
+      };
+    });
     this.on('write', (msg: AbjectMessage) => {
       this.authorize(msg);
       const { text } = msg.payload as { text?: string };
@@ -182,7 +218,7 @@ export class TerminalSession extends Abject {
       this.authorize(msg);
       const { delta } = msg.payload as { delta?: number };
       const rows = Math.trunc(delta ?? 0);
-      if (rows !== 0) this.term?.scrollBy(rows);
+      if (rows !== 0) { this.term?.scrollBy(rows); this.textCache = undefined; }
       const cursor = this.term?.snapshot().cursor ?? null;
       return { success: true, scrolled: rows, cursor };
     });
@@ -230,26 +266,36 @@ export class TerminalSession extends Abject {
       try { this.proc?.write(reply); } catch { /* the shell is gone */ }
     });
 
+    const inherited: NodeJS.ProcessEnv = { ...process.env };
+    const drop = this.spec.dropEnvPrefixes ?? [];
+    if (drop.length > 0) {
+      for (const key of Object.keys(inherited)) if (drop.some(prefix => key.startsWith(prefix))) delete inherited[key];
+    }
     const proc = this.pty.spawn(this.spec.command, this.spec.args ?? [], {
       name: 'xterm-256color',
       cols: this.cols,
       rows: this.rows,
       cwd: this.spec.cwd,
-      env: { ...process.env, ...this.spec.env, TERM: 'xterm-256color' },
+      env: { ...inherited, ...this.spec.env, TERM: 'xterm-256color' },
     });
     this.proc = proc;
     // A pty child leads its own session, so the whole group is signalled at shutdown.
-    trackChild(proc.pid, `terminal: ${this.spec.command}`, { group: true });
+    trackChild(proc.pid, this.spec.label ?? `terminal: ${this.spec.command}`, { group: true });
     this.lastDataAt = Date.now();
 
     proc.onData(data => {
       this.lastDataAt = Date.now();
       this.retain(data);
-      try { term.write(data); } catch (err) { this.screenError = message(err); }
+      // A failed write leaves the emulator unusable: later output is kept
+      // (readOutput) but no longer drawn, and readers are told (screenError).
+      if (!this.screenError) {
+        try { term.write(data); } catch (err) { this.screenError = message(err); }
+      }
       this.scheduleOutputEvent();
     });
     proc.onExit(event => {
       this.exitCode = event.exitCode;
+      this.exitSignal = event.signal;
       this.closed = true;
       if (this.killTimer) { clearTimeout(this.killTimer); this.killTimer = undefined; }
       untrackIfGone(proc.pid);
@@ -278,10 +324,11 @@ export class TerminalSession extends Abject {
 
   private applyResize(cols?: number, rows?: number): void {
     const nextCols = Math.max(2, Math.min(MAX_COLS, Math.trunc(cols ?? this.cols)));
-    const nextRows = Math.max(2, Math.min(MAX_ROWS, Math.trunc(rows ?? this.rows)));
+    const nextRows = Math.max(2, Math.min(MAX_ROWS, Math.floor(MAX_SCREEN_CELLS / nextCols), Math.trunc(rows ?? this.rows)));
     if (nextCols === this.cols && nextRows === this.rows) return;
     this.cols = nextCols;
     this.rows = nextRows;
+    this.textCache = undefined;
     try { this.proc?.resize(nextCols, nextRows); } catch { /* exiting */ }
     try { this.term?.resize(nextCols, nextRows); } catch { /* disposed */ }
     this.changed('resize', { sessionId: this.id, cols: nextCols, rows: nextRows });
@@ -340,10 +387,17 @@ export class TerminalSession extends Abject {
   }
 
   private rowPayload(row: GhosttyRow, palette: readonly GhosttyColor[]): RowPayload {
+    // The emulator lists only the cells a program wrote, each with its
+    // column. A program that moves the cursor over a gap instead of printing
+    // spaces (most full-screen UIs do) leaves that gap out, so it is filled
+    // here: the receiver lays cells out one after another.
     const cells: CellPayload[] = [];
+    let column = 0;
     for (const cell of row.cells) {
+      for (; column < cell.x; column++) cells.push({ text: ' ', width: 1 });
       const cellPayload = this.cellPayload(cell.text, cell.width, cell.style, cell.hyperlink, palette);
       cells.push(cellPayload);
+      column = cell.x + cell.width;
     }
     // Trailing default-styled spaces carry no information; dropping them keeps
     // a full-screen repaint small without shifting any earlier cell.
@@ -383,11 +437,47 @@ export class TerminalSession extends Abject {
     return entry ? this.css(entry, palette, depth - 1) : undefined;
   }
 
+  /**
+   * Every visible row as text, with the rows the terminal soft-wrapped onto
+   * the next. A wrapped row keeps its trailing spaces (they belong to the
+   * line it is part of); any other row loses them. Read from the emulator
+   * only when something changed: a program polling a large screen for a
+   * reply asks many times between outputs.
+   */
+  private screenText(): { lines: string[]; wrapped: boolean[] } {
+    if (!this.term) return { lines: [], wrapped: [] };
+    if (this.textCache?.outputChars === this.outputChars) return this.textCache;
+    // An emulator that failed on a write stays failed; do not ask it again.
+    if (this.screenError) return this.textCache ?? { lines: [], wrapped: [] };
+    let snapshot;
+    try {
+      snapshot = this.term.snapshot();
+    } catch (err) {
+      this.screenError = message(err);
+      return this.textCache ?? { lines: [], wrapped: [] };
+    }
+    const lines: string[] = [];
+    const wrapped: boolean[] = [];
+    for (const row of snapshot.rows) {
+      // Cells carry their column, and the ones a program skipped with a
+      // cursor move are not listed: put the spaces back.
+      let text = '';
+      let column = 0;
+      for (const cell of row.cells) {
+        if (cell.x > column) text += ' '.repeat(cell.x - column);
+        text += cell.text;
+        column = cell.x + cell.width;
+      }
+      lines.push(row.wrapped ? text : text.replace(/\s+$/, ''));
+      wrapped.push(row.wrapped);
+    }
+    this.textCache = { outputChars: this.outputChars, lines, wrapped };
+    return this.textCache;
+  }
+
   /** The visible screen as plain lines, for a caller that wants text rather than cells. */
   private plainLines(): string[] {
-    if (!this.term) return [];
-    const snapshot = this.term.snapshot();
-    const lines = snapshot.rows.map(row => row.cells.map(cell => cell.text).join('').replace(/\s+$/, ''));
+    const lines = this.screenText().lines.map(line => line.replace(/\s+$/, ''));
     while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
     return lines;
   }

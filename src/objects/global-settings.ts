@@ -16,18 +16,15 @@ import { event, request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 import { require as contractRequire, ensure } from '../core/contracts.js';
 import { undoMethods, type UndoAction, type UndoResult, type UndoState } from '../core/undo.js';
-import { chromeCase, shapeOf } from '../core/theme-data.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
-import { LLMProviderDescription, servesChat } from '../llm/provider.js';
-import { LATEST_MODEL, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
-import type { DecisionGates } from '../core/decision-sites.js';
 import { TITLE_BAR_HEIGHT } from './widgets/widget-types.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 import type { PackageView, PackageDirView, PackageProblem } from './packages.js';
 import type { PackageSettingSpec } from '../sandbox/extensions.js';
 import { parsePrivateHost } from './capabilities/address-policy.js';
 import type { UpdateStatus } from './app-updater.js';
-import type { SettingsBySection, SettingsSectionId, TierPreset as ManagedPreset } from './settings-manager.js';
+import type { SettingsBySection, SettingsSectionId } from './settings-manager.js';
+import { AiSettingsPane, settingsError, type AiPaneHost } from './ai-settings-pane.js';
 
 const log = new Log('GlobalSettings');
 
@@ -109,12 +106,6 @@ function megabytes(bytes: number): string {
   return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
 }
 
-/** A SettingsManager refusal as a sentence: the contract prefix dropped. */
-function settingsError(err: unknown): string {
-  const text = err instanceof Error ? err.message : String(err);
-  return text.replace(/^.*\[(REQUIRE|ENSURE|INVARIANT)\]\s*/, '').slice(0, 200);
-}
-
 function toListItems(
   arr: string[],
 ): Array<{ label: string; value: string; actions: Array<{ id: string; label: string }> }> {
@@ -147,79 +138,6 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
-/** Which provider's credential panel was open last: the window's own view state. */
-const STORAGE_KEY_AI_ACTIVE_PROVIDER = 'global-settings:aiActiveProvider';
-const DECISION_GATE_OPTIONS: Array<{ gates: DecisionGates; label: string }> = [
-  { gates: 'on', label: 'On (decision sites advise and act live)' },
-  { gates: 'off', label: 'Off (built-in decision sites do not run)' },
-];
-
-/**
- * Provider list, labels, default tier models, credential metadata, and
- * CLI binary detection are all derived from per-provider `describe()`
- * via `LLMObject.listProviderDescriptions`. Each provider self-describes
- * (see `src/llm/provider.ts` — `LLMProviderDescription`); GlobalSettings
- * has no per-provider knowledge.
- */
-type LLMProviderName = string;
-
-type ModelTierName = 'smart' | 'balanced' | 'fast' | 'code';
-const TIER_LABELS: string[] = ['Smart', 'Balanced', 'Fast', 'Code'];
-const TIER_NAMES: ModelTierName[] = ['smart', 'balanced', 'fast', 'code'];
-
-/** 'Default' = no override (provider's tier default applies). */
-const EFFORT_DEFAULT_LABEL = 'Default';
-
-/** One tier's saved routing row: provider + model + optional effort override. */
-interface TierRoutingRow {
-  provider: string | null;
-  model: string | null;
-  /** Reasoning-effort override; null/undefined = provider default. */
-  effort?: string | null;
-}
-
-/** A tier preset (SettingsManager keeps the saved ones and derives the built-ins). */
-type TierPreset = ManagedPreset;
-
-/**
- * The two optional single-model rows under the tiers: which model stands in
- * on image-bearing steps when a tier's model is text-only, and which stands
- * in for any tier whose own model has failed. Same row shape, same
- * persistence, same preset handling; only the label, the storage keys, and
- * the default pick differ.
- */
-type AuxRowKey = 'vision' | 'fallback' | 'decision';
-interface AuxRowSpec {
-  label: string;
-  /** Land on the first vision-capable model when nothing better is selected. */
-  preferVision: boolean;
-  /** How the save-time credential toast names the row. */
-  toastName: string;
-  /**
-   * The Decision row: offers decision providers as well as chat ones, lists
-   * decision models ahead of chat models, and its empty choice means Auto
-   * (a keyed decision provider, else emulation on the Fast tier).
-   */
-  decision?: boolean;
-}
-const AUX_ROWS: Record<AuxRowKey, AuxRowSpec> = {
-  vision: { label: 'Vision', preferVision: true, toastName: 'Vision fallback' },
-  fallback: { label: 'Fallback', preferVision: false, toastName: 'Tier fallback' },
-  decision: { label: 'Decision', preferVision: false, toastName: 'Decision model', decision: true },
-};
-const AUX_ROW_KEYS: AuxRowKey[] = ['vision', 'fallback', 'decision'];
-/** One aux row's widgets and the intended model id (same stale-label protection as the tier rows). */
-interface AuxRowState {
-  providerSelectId?: AbjectId;
-  modelSelectId?: AbjectId;
-  capLabelId?: AbjectId;
-  desiredModelId: string | null;
-}
-type AuxModel = { provider: string | null; model: string | null };
-const emptyAuxModels = (): Record<AuxRowKey, AuxModel> => ({ vision: { provider: null, model: null }, fallback: { provider: null, model: null }, decision: { provider: null, model: null } });
-
-interface ModelInfo { id: string; name: string; vision?: boolean; efforts?: string[]; created?: number; pricing?: { inputPerMTok: number; outputPerMTok: number }; }
-
 /**
  * GlobalSettings object that provides a configuration UI for LLM API keys.
  *
@@ -229,14 +147,11 @@ interface ModelInfo { id: string; name: string; vision?: boolean; efforts?: stri
  */
 export class GlobalSettings extends Abject {
   private llmId?: AbjectId;
-  private storageId?: AbjectId;
   private widgetManagerId?: AbjectId;
   /** Owns the settings this window edits. */
   private settingsManagerId?: AbjectId;
   /** The settings as last loaded from SettingsManager (secrets included: this window may read them). */
   private managed?: SettingsBySection;
-  /** Saved and built-in presets, as SettingsManager lists them. */
-  private presetList: Array<{ name: string; builtin: boolean; preset: TierPreset }> = [];
   /**
    * The section this window saved last, and when: its own change comes back
    * as a settingsChanged event, which needs no repaint.
@@ -247,84 +162,9 @@ export class GlobalSettings extends Abject {
   private showInFlight?: Promise<boolean>;
   private rootLayoutId?: AbjectId;
 
-  // Provider dropdown + single credential panel
-  private providerSelectorId?: AbjectId;
-  private credentialLabelId?: AbjectId;
-  private credentialInputId?: AbjectId;
-  private credentialToggleId?: AbjectId;
-  private providerModelsLabelId?: AbjectId;
-  private activeAiProvider: LLMProviderName = 'anthropic';
-  // In-memory cache of unsaved credential values (keyed by provider). Survives
-  // provider-switches within the panel; flushed to Storage on Save.
-  private credentialValues: Partial<Record<LLMProviderName, string>> = {};
+  /** The AI tab: providers, presets and the model behind each tier. */
+  private readonly aiPane: AiSettingsPane = new AiSettingsPane(this.aiPaneHost());
 
-  /**
-   * Cached binary-detection state for CLI providers. `undefined` means the
-   * detection probe hasn't completed yet; `null` means probed and not found;
-   * a string is the resolved binary path (or just the binary name).
-   */
-  private cliDetected: Partial<Record<LLMProviderName, string | null>> = {};
-
-  /** Detection-status label widget for the AI tab (visible only for CLI providers). */
-  private cliStatusLabelId?: AbjectId;
-  /** Refresh button next to the detection label. */
-  private cliRefreshBtnId?: AbjectId;
-
-  // Per-tier provider + model select widgets
-  private tierProviderSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
-  private tierModelSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
-  /** Per-tier capability label ("vision" / "text-only") next to the model dropdown. */
-  private tierCapLabelIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
-  /**
-   * Per-tier reasoning-effort dropdown. Options come from the selected
-   * model's ModelInfo.efforts (plus a leading 'Default' = no override);
-   * hidden (never created / options ['—']) for models with no effort knob.
-   */
-  private tierEffortSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
-  /** The effort each tier is meant to show (null = Default/no override). */
-  private tierDesiredEfforts: Record<ModelTierName, string | null> = { smart: null, balanced: null, fast: null, code: null };
-  /**
-   * The model id each tier is meant to show: the saved routing at build time,
-   * then the user's latest dropdown pick. Dropdowns render by display name,
-   * and the name list changes when a provider's live model fetch lands after
-   * the tab was built from the small fallback catalog. Without this id, that
-   * refresh silently resets the selection to the list's first model (and a
-   * subsequent Save would persist the reset).
-   */
-  private tierDesiredModelIds: Record<ModelTierName, string | null> = { smart: null, balanced: null, fast: null, code: null };
-
-  // Optional aux rows (vision substitute, tier fallback): provider dropdown
-  // (with a leading 'None'), model dropdown, capability label, and the
-  // intended model id, keyed by row.
-  private auxRows: Record<AuxRowKey, AuxRowState> = { vision: { desiredModelId: null }, fallback: { desiredModelId: null }, decision: { desiredModelId: null } };
-  /** Provider-dropdown label meaning "this row is not configured". */
-  private static readonly AUX_NONE_LABEL = 'None';
-  /** The Decision row's empty choice: a keyed decision provider, else emulation on the Fast tier. */
-  private static readonly AUX_AUTO_LABEL = 'Auto';
-  private decisionGates: DecisionGates = 'on';
-  private decisionGatesSelectId?: AbjectId;
-
-  // Prompt-cache keepalive: LLMObject pings large prompt prefixes between
-  // agent steps so provider caches stay warm. Off by default (it spends
-  // cached-read pings to avoid full re-prefills).
-  private cacheKeepaliveEnabled = false;
-  private cacheKeepaliveCheckboxId?: AbjectId;
-  // Daily learning budget (USD): what TaskReviewer may spend on models per
-  // day across all workspaces. SettingsManager owns the value and its bounds.
-  private learningBudget = 3;
-  private learningBudgetInputId?: AbjectId;
-  private learningBudgetHintId?: AbjectId;
-
-  // Tier presets: a named bundle of tier routing + vision fallback. Built-in
-  // presets are derived from each provider's defaultTierModels; user-saved
-  // presets persist in storage and are listed first.
-  private presetSelectId?: AbjectId;
-  private presetNameInputId?: AbjectId;
-  private presetApplyBtnId?: AbjectId;
-  private presetSaveBtnId?: AbjectId;
-  private presetDeleteBtnId?: AbjectId;
-
-  private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
   /** Permission list id -> its empty-state note. */
   private listEmptyNoteIds = new Map<AbjectId, AbjectId>();
@@ -454,21 +294,6 @@ export class GlobalSettings extends Abject {
 
   private unmasked: Set<AbjectId> = new Set();
 
-  /**
-   * Provider descriptions fetched from LLMObject at init. Used to render
-   * the AI tab dropdown, default tier models, credential metadata, and
-   * CLI detection — everything that used to be hardcoded per-provider.
-   */
-  private providerDescriptions: LLMProviderDescription[] = [];
-  private providerDescById: Map<string, LLMProviderDescription> = new Map();
-
-  /**
-   * Cached model lists per provider, keyed by provider id. Seeded from
-   * each description's static `models` list so tier dropdowns render
-   * immediately; live `listProviderModels` results override.
-   */
-  private providerModelCache: Map<string, ModelInfo[]> = new Map();
-
   constructor() {
     super({
       manifest: {
@@ -526,28 +351,33 @@ undo() / redo() take back the last change made in this window to the AI settings
 - On first boot with nothing configured, the window opens by itself.`;
   }
 
-  /** Display face for section titles and captions. */
-  private headerFont(): { fontFamily?: 'display' } {
-    return { fontFamily: 'display' };
+  /** What the AI tab needs from this window: its ids, its status line, and requests sent as this object. */
+  private aiPaneHost(): AiPaneHost {
+    const window = this;
+    return {
+      get widgetManagerId() { return window.widgetManagerId!; },
+      get settingsManagerId() { return window.settingsManagerId!; },
+      get llmId() { return window.llmId!; },
+      theme: () => this.theme,
+      ask: <T>(to: AbjectId, method: string, payload?: unknown, timeoutMs?: number) =>
+        this.request<T>(request(this.id, to, method, payload ?? {}), timeoutMs),
+      status: (text, color) => this.setStatus(text, color),
+      reject: (text, color) => this.rejectWith(text, color),
+      flash: () => this.windowEffect('flash'),
+      ownChange: (section) => { this.lastOwnSave = { section, at: Date.now() }; },
+      undo: () => this.undoSettings('undo', { fromAiTab: true }),
+    };
   }
 
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.llmId = await this.requireDep('LLM');
-    this.storageId = await this.requireDep('Storage');
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.settingsManagerId = await this.requireDep('SettingsManager');
     // Its settingsChanged events repaint an open window.
     try { await this.request(request(this.id, this.settingsManagerId, 'addDependent', {})); } catch { /* repaints on reopen */ }
     // Packaged desktop app only: AppUpdater (spawned before us) feeds the Updates tab.
     await this.connectAppUpdater();
-
-    // Provider descriptions drive the AI tab's dropdowns and labels.
-    await this.loadProviderDescriptions();
-    const savedActive = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AI_ACTIVE_PROVIDER })
-    );
-    if (savedActive && this.providerDescById.has(savedActive)) this.activeAiProvider = savedActive;
 
     // First boot with nothing configured: open so the person can add a key.
     const configured = await this.request<boolean>(request(this.id, this.settingsManagerId, 'isConfigured', {}));
@@ -578,11 +408,6 @@ undo() / redo() take back the last change made in this window to the AI settings
     this.managed = await this.request<SettingsBySection>(
       request(this.id, this.settingsManagerId!, 'getSettings', { reveal: true }));
     const m = this.managed;
-    this.credentialValues = Object.fromEntries(
-      Object.entries(m.ai.credentials).filter(([, v]) => v.value).map(([id, v]) => [id, v.value!]));
-    this.decisionGates = m.ai.decisionGates;
-    this.cacheKeepaliveEnabled = m.ai.cacheKeepalive;
-    if (typeof m.ai.learningBudgetUsdPerDay === 'number') this.learningBudget = m.ai.learningBudgetUsdPerDay;
     this.fsAllowedPaths = [...m.filesystem.allowedPaths];
     this.fsReadOnly = m.filesystem.readOnly;
     this.shellEnabled = m.shell.enabled;
@@ -595,16 +420,6 @@ undo() / redo() take back the last change made in this window to the AI settings
     this.webDeniedDomains = [...m.web.deniedDomains];
     this.webPrivateHosts = [...m.web.privateHosts];
     this.promptMode = m.permissions.mode;
-    await this.loadPresetList();
-  }
-
-  private async loadPresetList(): Promise<void> {
-    try {
-      this.presetList = await this.request<Array<{ name: string; builtin: boolean; preset: TierPreset }>>(
-        request(this.id, this.settingsManagerId!, 'listPresets', {}), 60_000);
-    } catch (err) {
-      log.warn(`Could not list presets: ${err instanceof Error ? err.message : String(err)}`);
-    }
   }
 
   /**
@@ -732,118 +547,13 @@ undo() / redo() take back the last change made in this window to the AI settings
         return;
       }
 
-      if (fromId === this.saveBtnId && aspect === 'click') {
-        await this.saveSettings();
-        return;
-      }
-
       if (fromId === this.takeWheelBtnId && aspect === 'click') {
         await this.takeTheWheel();
         return;
       }
 
-      if (fromId === this.credentialToggleId && aspect === 'click') {
-        if (this.credentialInputId) {
-          await this.toggleMask(this.credentialInputId, this.credentialToggleId);
-        }
-        return;
-      }
-
-      if (fromId === this.providerSelectorId && aspect === 'change') {
-        await this.onProviderSelectorChanged();
-        return;
-      }
-
-      // CLI detection refresh button — re-probe the binary and update the
-      // status label without saving anything.
-      if (fromId === this.cliRefreshBtnId && aspect === 'click') {
-        await this.refreshCliDetection(this.activeAiProvider);
-        return;
-      }
-
-      // Tier provider dropdown changed -- refresh model list for that tier
-      for (const tier of TIER_NAMES) {
-        if (fromId === this.tierProviderSelectIds[tier] && aspect === 'change') {
-          await this.refreshTierModelOptions(tier);
-          // Also kick off a background live fetch for the newly-selected provider
-          const providerSelectId = this.tierProviderSelectIds[tier];
-          if (providerSelectId) {
-            const label = await this.request<string>(
-              request(this.id, providerSelectId, 'getValue', {})
-            );
-            const id = this.idForLabel(label);
-            if (id) void this.refreshProviderModels(id);
-          }
-          return;
-        }
-      }
-
-      // Tier model dropdown changed -- record the pick + repaint capability label
-      for (const tier of TIER_NAMES) {
-        if (fromId === this.tierModelSelectIds[tier] && aspect === 'change') {
-          await this.onTierModelChanged(tier);
-          return;
-        }
-      }
-
-      // Tier effort dropdown changed -- record the override pick
-      for (const tier of TIER_NAMES) {
-        if (fromId === this.tierEffortSelectIds[tier] && aspect === 'change') {
-          await this.onTierEffortChanged(tier);
-          return;
-        }
-      }
-
-      // Learning budget typed: keep the monthly hint in step (saved on Save)
-      if (fromId === this.learningBudgetInputId && aspect === 'change') {
-        const perDay = Number(String(value ?? '').trim().replace(/^\$/, ''));
-        if (this.learningBudgetHintId) {
-          try { this.send(event(this.id, this.learningBudgetHintId, 'update', { text: this.learningBudgetHint(String(value ?? '').trim() === '' ? NaN : perDay) })); } catch { /* widget gone */ }
-        }
-        return;
-      }
-
-      // Cache keepalive checkbox toggled (persisted + applied on Save)
-      if (fromId === this.cacheKeepaliveCheckboxId && aspect === 'change') {
-        this.cacheKeepaliveEnabled = value as boolean;
-        return;
-      }
-
-      // Decision gates dropdown (persisted + applied on Save)
-      if (fromId === this.decisionGatesSelectId && aspect === 'change') {
-        const label = await this.request<string>(request(this.id, this.decisionGatesSelectId, 'getValue', {}));
-        this.decisionGates = DECISION_GATE_OPTIONS.find(o => o.label === label)?.gates ?? 'on';
-        return;
-      }
-
-      // Aux row (vision substitute, tier fallback, decision route) dropdowns
-      for (const key of AUX_ROW_KEYS) {
-        const row = this.auxRows[key];
-        if (fromId === row.providerSelectId && aspect === 'change') {
-          await this.refreshAuxModelOptions(key);
-          const provider = await this.auxSelectedProvider(key);
-          if (provider) void this.refreshProviderModels(provider);
-          return;
-        }
-        if (fromId === row.modelSelectId && aspect === 'change') {
-          await this.onAuxModelChanged(key);
-          return;
-        }
-      }
-
-      // Tier preset buttons
-      if (fromId === this.presetApplyBtnId && aspect === 'click') {
-        await this.onPresetApply();
-        return;
-      }
-      if (fromId === this.presetSaveBtnId && aspect === 'click') {
-        await this.onPresetSave();
-        return;
-      }
-      if (fromId === this.presetDeleteBtnId && aspect === 'click') {
-        await this.onPresetDelete();
-        return;
-      }
+      // AI tab widgets: every control there belongs to the pane
+      if (await this.aiPane.handleEvent(fromId, aspect, value)) return;
 
       // Auth checkbox toggled
       if (fromId === this.authCheckboxId && aspect === 'change') {
@@ -1079,13 +789,9 @@ undo() / redo() take back the last change made in this window to the AI settings
         return;
       }
 
-      // Text input submit triggers save
-      if (aspect === 'submit') {
-        if (fromId === this.authUserInputId || fromId === this.authPassInputId) {
-          await this.saveAuthSettings();
-        } else {
-          await this.saveSettings();
-        }
+      // Enter in a login field saves the login
+      if (aspect === 'submit' && (fromId === this.authUserInputId || fromId === this.authPassInputId)) {
+        await this.saveAuthSettings();
       }
     });
   }
@@ -1110,9 +816,6 @@ undo() / redo() take back the last change made in this window to the AI settings
   private async openWindow(): Promise<boolean> {
     contractRequire(this.windowId === undefined, 'GlobalSettings: one settings window at a time');
 
-    // Providers other abjects register (LLM registerProvider) arrive after
-    // boot, so re-read the list each time the window opens.
-    await this.loadProviderDescriptions();
     await this.loadFromManager();
 
     // Get display dimensions
@@ -1120,8 +823,8 @@ undo() / redo() take back the last change made in this window to the AI settings
       request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
-    const winW = 520;
-    const winH = Math.min(720, Math.max(480, displayInfo.height - 40));
+    const winW = Math.min(720, Math.max(520, displayInfo.width - 40));
+    const winH = Math.min(800, Math.max(480, displayInfo.height - 40));
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -1161,9 +864,10 @@ undo() / redo() take back the last change made in this window to the AI settings
       preferredSize: { height: 30 },
     }));
 
-    // AI container (scrollable VBox)
+    // AI container (plain VBox: the pane puts its status line and sub-tabs in
+    // it, and each sub-tab scrolls by itself)
     this.aiContainerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
@@ -1257,8 +961,8 @@ undo() / redo() take back the last change made in this window to the AI settings
       preferredSize: { height: 18 },
     }));
 
-    // Build AI tab content
-    await this.buildAiTab();
+    // Build AI tab content (the pane re-reads the provider list each time the window opens)
+    await this.aiPane.build(this.windowId, this.aiContainerId, winW);
     // Build Auth tab content
     await this.buildAuthTab();
     // Build Permissions tab content
@@ -2026,520 +1730,6 @@ undo() / redo() take back the last change made in this window to the AI settings
     }
   }
 
-  /** Build AI tab content into aiContainerId. */
-  private async buildAiTab(): Promise<void> {
-    const cId = this.aiContainerId!;
-
-    // Tier routing and the single-model rows, as SettingsManager holds them.
-    const savedTierRouting: Record<ModelTierName, TierRoutingRow> = {
-      smart: { provider: null, model: null },
-      balanced: { provider: null, model: null },
-      fast: { provider: null, model: null },
-      code: { provider: null, model: null },
-    };
-    const savedAux = emptyAuxModels();
-    for (const tier of TIER_NAMES) {
-      const route = this.managed?.ai.tiers[tier];
-      if (route) savedTierRouting[tier] = { provider: route.provider, model: route.model, effort: route.effort ?? null };
-    }
-    for (const key of AUX_ROW_KEYS) {
-      const ref = this.managed?.ai[key];
-      if (ref) savedAux[key] = { provider: ref.provider, model: ref.model };
-    }
-
-    // Populate cache with defaults synchronously so the UI can render now.
-    // Live per-provider fetches run lazily (when the user looks at a provider
-    // or hits Save) to avoid blocking the window paint.
-    this.populateDefaultModelCache();
-
-    // ── 1 · Credentials (card) ──
-    const credCard = await this.sectionCard(cId, '1 · Credentials',
-      'Pick a provider and enter its API key. Configured keys persist across restarts.');
-
-    // Provider selector row
-    const providerSelectRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: credCard,
-        margins: { top: 4, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, credCard, 'addLayoutChild', {
-      widgetId: providerSelectRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    const { widgetIds: [providerPickerLabelId, providerSelectorId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Provider',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-        { type: 'select', windowId: this.windowId,
-          options: this.credentialProviderLabels(),
-          selectedIndex: Math.max(0, this.credentialProviderIds().indexOf(this.activeAiProvider)) },
-      ]})
-    );
-    this.providerSelectorId = providerSelectorId;
-    await this.request(request(this.id, providerPickerLabelId, 'update', {}));
-    await this.request(request(this.id, providerSelectRowId, 'addLayoutChild', {
-      widgetId: providerPickerLabelId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 65, height: 32 },
-    }));
-    await this.request(request(this.id, this.providerSelectorId, 'addDependent', {}));
-    await this.request(request(this.id, providerSelectRowId, 'addLayoutChild', {
-      widgetId: this.providerSelectorId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    // Credential label (shows "Anthropic API Key" etc.)
-    const activeDesc = this.descById(this.activeAiProvider);
-    const credentialLabel = activeDesc?.credentialLabel ?? activeDesc?.label ?? this.activeAiProvider;
-    const credentialPlaceholder = activeDesc?.credentialPlaceholder ?? '';
-    const isUrl = activeDesc?.credentialMode === 'url';
-    const { widgetIds: [credentialLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: credentialLabel,
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-      ]})
-    );
-    this.credentialLabelId = credentialLabelId;
-    await this.request(request(this.id, credCard, 'addLayoutChild', {
-      widgetId: this.credentialLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // Credential input row (input + Show/Hide toggle)
-    const credentialRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: credCard,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, credCard, 'addLayoutChild', {
-      widgetId: credentialRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    const initialValue = this.credentialValues[this.activeAiProvider]
-      ?? (isUrl ? credentialPlaceholder : '');
-    const { widgetIds: [credentialInputId, credentialToggleId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId,
-          placeholder: credentialPlaceholder,
-          masked: !isUrl,
-          text: initialValue },
-        { type: 'button', windowId: this.windowId, text: 'Show',
-          style: isUrl ? { disabled: true } : undefined },
-      ]})
-    );
-    this.credentialInputId = credentialInputId;
-    this.credentialToggleId = credentialToggleId;
-    await this.request(request(this.id, this.credentialInputId, 'addDependent', {}));
-    await this.request(request(this.id, credentialRowId, 'addLayoutChild', {
-      widgetId: this.credentialInputId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-    await this.request(request(this.id, this.credentialToggleId, 'addDependent', {}));
-    await this.request(request(this.id, credentialRowId, 'addLayoutChild', {
-      widgetId: this.credentialToggleId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 56, height: 32 },
-    }));
-
-    // CLI detection-status row — visible only when the active provider is
-    // a CLI provider (claude-cli / codex-cli). Replaces the credential
-    // value with a "Detected at /path" or "not detected" line plus a
-    // Refresh button. For non-CLI providers the row stays present but
-    // collapsed (height 0) so the layout slot is stable across switches.
-    const isCli = this.isCliProvider(this.activeAiProvider);
-    const cliRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: credCard,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, credCard, 'addLayoutChild', {
-      widgetId: cliRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: isCli ? 28 : 0 },
-    }));
-    const { widgetIds: [cliStatusLabelId, cliRefreshBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId,
-          text: this.formatCliStatus(this.activeAiProvider),
-          style: { color: this.cliStatusColor(this.activeAiProvider), fontSize: 12, visible: isCli } },
-        { type: 'button', windowId: this.windowId, text: 'Refresh',
-          style: { visible: isCli, fontSize: 12 } },
-      ]})
-    );
-    this.cliStatusLabelId = cliStatusLabelId;
-    this.cliRefreshBtnId = cliRefreshBtnId;
-    await this.request(request(this.id, this.cliRefreshBtnId, 'addDependent', {}));
-    await this.request(request(this.id, cliRowId, 'addLayoutChild', {
-      widgetId: this.cliStatusLabelId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: isCli ? 28 : 0 },
-    }));
-    await this.request(request(this.id, cliRowId, 'addLayoutChild', {
-      widgetId: this.cliRefreshBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: isCli ? 28 : 0 },
-    }));
-
-    // Disable / hide the credential input for CLI providers so the user
-    // doesn't enter an irrelevant API key.
-    if (isCli) {
-      await this.request(request(this.id, this.credentialInputId, 'update', {
-        style: { visible: false },
-      }));
-      await this.request(request(this.id, this.credentialToggleId, 'update', {
-        style: { visible: false },
-      }));
-      await this.request(request(this.id, this.credentialLabelId, 'update', {
-        style: { visible: false },
-      }));
-    }
-
-    // Kick off detection in the background — first show or after switch.
-    if (isCli) void this.refreshCliDetection(this.activeAiProvider);
-
-    // Models list label (read-only, shows discovered models for the active provider)
-    const { widgetIds: [providerModelsLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId,
-          text: this.formatModelListLine(this.activeAiProvider),
-          style: { color: this.theme.textDescription, fontSize: 12 } },
-      ]})
-    );
-    this.providerModelsLabelId = providerModelsLabelId;
-    await this.request(request(this.id, credCard, 'addLayoutChild', {
-      widgetId: this.providerModelsLabelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 18 },
-    }));
-
-    // ── 2 · Preset (card) ──
-    // [Preset] [dropdown: saved + built-in] [Apply] [Delete], then
-    // [Name] [text input] [Save Preset]. Built-ins are derived from each
-    // provider's live catalog (builtinPresets), so every provider ships a
-    // starter preset that follows new releases.
-    {
-      const presetCard = await this.sectionCard(cId, '2 · Preset',
-        'Start from a preset (a provider\'s recommended models, which follow new releases, or one you saved), then fine-tune the tiers below. Saving records the current models under a name.', 34);
-
-      const presetRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: presetCard,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, presetCard, 'addLayoutChild', {
-        widgetId: presetRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 32 },
-      }));
-
-      const { widgetIds: [presetLabelId, presetSelectId, applyBtnId, deleteBtnId] } =
-        await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: 'Preset',
-              style: { color: this.theme.textHeading, fontSize: 13 } },
-            { type: 'select', windowId: this.windowId,
-              options: this.presetOptionNames(), selectedIndex: 0 },
-            { type: 'button', windowId: this.windowId, text: 'Apply',
-              style: { fontSize: 12, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
-            { type: 'button', windowId: this.windowId, text: 'Delete',
-              style: { fontSize: 12, background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
-          ]})
-        );
-      this.presetSelectId = presetSelectId;
-      this.presetApplyBtnId = applyBtnId;
-      this.presetDeleteBtnId = deleteBtnId;
-      await this.request(request(this.id, presetSelectId, 'addDependent', {}));
-      await this.request(request(this.id, applyBtnId, 'addDependent', {}));
-      await this.request(request(this.id, deleteBtnId, 'addDependent', {}));
-      await this.request(request(this.id, presetRowId, 'addLayoutChildren', {
-        children: [
-          { widgetId: presetLabelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 } },
-          { widgetId: presetSelectId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 } },
-          { widgetId: applyBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 32 } },
-          { widgetId: deleteBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 32 } },
-        ],
-      }));
-
-      const nameRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: presetCard,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, presetCard, 'addLayoutChild', {
-        widgetId: nameRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 32 },
-      }));
-
-      const { widgetIds: [nameLabelId, nameInputId, savePresetBtnId] } =
-        await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: 'Name',
-              style: { color: this.theme.textHeading, fontSize: 13 } },
-            { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. Everyday / Cheap / Coding' },
-            { type: 'button', windowId: this.windowId, text: 'Save Preset', style: { fontSize: 12 } },
-          ]})
-        );
-      this.presetNameInputId = nameInputId;
-      this.presetSaveBtnId = savePresetBtnId;
-      await this.request(request(this.id, savePresetBtnId, 'addDependent', {}));
-      await this.request(request(this.id, nameRowId, 'addLayoutChildren', {
-        children: [
-          { widgetId: nameLabelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 } },
-          { widgetId: nameInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 } },
-          { widgetId: savePresetBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: 32 } },
-        ],
-      }));
-    }
-
-    // ── 3 · Model Tiers (card) ──
-    const tiersCard = await this.sectionCard(cId, '3 · Model Tiers',
-      'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a ◉ vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only. The optional Fallback row names a model that stands in for any tier whose own model fails (outage cover; the switch is recorded in the LLM ledger).', 86);
-
-    // Column captions over the tier rows, so the unlabeled effort and
-    // capability columns say what they are.
-    {
-      const capRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: tiersCard,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, tiersCard, 'addLayoutChild', {
-        widgetId: capRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 16 },
-      }));
-      const captionStyle = { color: this.theme.textMeta, fontSize: 11, ...this.headerFont() };
-      const captions: Array<[string, number | undefined]> = [
-        ['Tier', 65], ['Provider', 120], ['Model', undefined], ['Reasoning', 92], ['Sees', 62],
-      ];
-      const { widgetIds: captionIds } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: captions.map(([text]) => (
-          { type: 'label', windowId: this.windowId, text: chromeCase(this.theme, text), style: captionStyle }
-        )) })
-      );
-      await this.request(request(this.id, capRowId, 'addLayoutChildren', {
-        children: captions.map(([, width], i) => width === undefined
-          ? { widgetId: captionIds[i], sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 16 } }
-          : { widgetId: captionIds[i], sizePolicy: { horizontal: 'fixed' }, preferredSize: { width, height: 16 } }),
-      }));
-    }
-
-    // Per-tier rows: [Label] [Provider dropdown] [Model dropdown]
-    for (let i = 0; i < TIER_NAMES.length; i++) {
-      const tier = TIER_NAMES[i];
-      const tierLabel = TIER_LABELS[i];
-      const savedProvider = savedTierRouting[tier].provider as LLMProviderName | null;
-      const savedModel = savedTierRouting[tier].model;
-      this.tierDesiredModelIds[tier] = savedModel;
-
-      // Row container
-      const tierRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: tiersCard,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, tiersCard, 'addLayoutChild', {
-        widgetId: tierRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 32 },
-      }));
-
-      // Tier label
-      const { widgetIds: [tierLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: tierLabel,
-            style: { color: this.theme.textHeading, fontSize: 13 } },
-        ]})
-      );
-      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
-        widgetId: tierLabelId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 65, height: 32 },
-      }));
-
-      // Provider dropdown
-      const providerIds = this.providerIds();
-      const providerIdx = savedProvider ? providerIds.indexOf(savedProvider) : 0;
-      const { widgetIds: [providerSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'select', windowId: this.windowId,
-            options: this.providerLabels(),
-            selectedIndex: providerIdx >= 0 ? providerIdx : 0 },
-        ]})
-      );
-      this.tierProviderSelectIds[tier] = providerSelectId;
-      await this.request(request(this.id, providerSelectId, 'addDependent', {}));
-      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
-        widgetId: providerSelectId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 120, height: 32 },
-      }));
-
-      // Model dropdown (populated from provider's model list)
-      const activeProvider = savedProvider && providerIds.includes(savedProvider) ? savedProvider : providerIds[0];
-      const modelList = this.withWanted(this.tierModelList(activeProvider, tier), savedModel);
-      const modelOptions = modelList.length > 0
-        ? modelList.map(m => m.name)
-        : ['(no models)'];
-      let modelIdx = 0;
-      if (savedModel && modelList.length > 0) {
-        const idx = modelList.findIndex(m => m.id === savedModel);
-        if (idx >= 0) modelIdx = idx;
-      }
-
-      const { widgetIds: [modelSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'select', windowId: this.windowId,
-            options: modelOptions,
-            selectedIndex: modelIdx },
-        ]})
-      );
-      this.tierModelSelectIds[tier] = modelSelectId;
-      await this.request(request(this.id, modelSelectId, 'addDependent', {}));
-      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
-        widgetId: modelSelectId,
-        sizePolicy: { horizontal: 'expanding' },
-        preferredSize: { height: 32 },
-      }));
-
-      // Reasoning-effort dropdown: 'Default' + the selected model's supported
-      // levels. Disabled (single '—') when the model has no effort knob.
-      const savedEffort = savedTierRouting[tier].effort ?? null;
-      this.tierDesiredEfforts[tier] = savedEffort;
-      const effortOptions = this.effortOptionsFor(activeProvider, modelList[modelIdx]?.id ?? null, tier);
-      const effortIdx = savedEffort ? Math.max(0, effortOptions.indexOf(savedEffort)) : 0;
-      const { widgetIds: [effortSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'select', windowId: this.windowId,
-            options: effortOptions,
-            selectedIndex: effortIdx,
-            style: effortOptions.length <= 1 ? { disabled: true } : undefined },
-        ]})
-      );
-      this.tierEffortSelectIds[tier] = effortSelectId;
-      await this.request(request(this.id, effortSelectId, 'addDependent', {}));
-      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
-        widgetId: effortSelectId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 92, height: 32 },
-      }));
-
-      // Capability label for the selected model (vision / text-only)
-      const initialCap = this.capabilityLabelFor(activeProvider, modelOptions[modelIdx] ?? '', tier);
-      const { widgetIds: [capLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: initialCap.text,
-            style: { color: initialCap.color, fontSize: 11 } },
-        ]})
-      );
-      this.tierCapLabelIds[tier] = capLabelId;
-      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
-        widgetId: capLabelId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 62, height: 32 },
-      }));
-    }
-
-    // ── Aux rows ──
-    // Vision: substitute model for image-bearing steps when a tier's model
-    // is text-only. Fallback: substitute for any tier whose own model has
-    // failed. 'None' disables either. Same row shape as the tiers.
-    for (const key of AUX_ROW_KEYS) {
-      await this.renderAuxRow(key, tiersCard, savedAux[key]);
-    }
-    await this.renderDecisionGatesRow(tiersCard);
-
-    // ── Cache keepalive row ──
-    // Opt-in: LLMObject re-reads large prompt prefixes on a timer between
-    // agent steps so provider prompt caches stay warm (cached reads instead
-    // of full re-prefills after the pause). Spends money, hence off by default.
-    {
-      const { widgetIds: [keepaliveCheckboxId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'checkbox', windowId: this.windowId,
-            checked: this.cacheKeepaliveEnabled,
-            text: 'Keep prompt caches warm between agent steps (pings spend cached-read tokens to avoid re-prefills)' },
-        ]})
-      );
-      this.cacheKeepaliveCheckboxId = keepaliveCheckboxId;
-      await this.request(request(this.id, keepaliveCheckboxId, 'addDependent', {}));
-      await this.request(request(this.id, tiersCard, 'addLayoutChild', {
-        widgetId: keepaliveCheckboxId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 28 },
-      }));
-    }
-    await this.renderLearningBudgetRow(tiersCard);
-
-    // Save button row (HBox: spacer + button)
-    const saveRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: saveRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 36 },
-    }));
-
-    await this.request(request(this.id, saveRowId, 'addLayoutSpacer', {}));
-
-    const { widgetIds: [saveBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Save Settings',
-          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
-      ]})
-    );
-    this.saveBtnId = saveBtnId;
-    await this.request(request(this.id, this.saveBtnId, 'addDependent', {}));
-    await this.request(request(this.id, saveRowId, 'addLayoutChild', {
-      widgetId: this.saveBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 130, height: 36 },
-    }));
-
-    // Kick off background live fetches for providers the user is currently
-    // looking at or that a tier is pointed at. Fire-and-forget so the window
-    // paints immediately. Each fetch updates its dropdown/label when it lands.
-    const toPrefetch = new Set<LLMProviderName>([this.activeAiProvider]);
-    for (const tier of TIER_NAMES) {
-      const p = savedTierRouting[tier].provider;
-      if (p && this.providerDescById.has(p)) toPrefetch.add(p);
-    }
-    for (const key of AUX_ROW_KEYS) {
-      const p = savedAux[key].provider;
-      if (p && this.providerDescById.has(p)) toPrefetch.add(p);
-    }
-    for (const p of toPrefetch) {
-      void this.refreshProviderModels(p);
-    }
-  }
-
   /** Build Auth tab content into authContainerId. */
   private async buildAuthTab(): Promise<void> {
     const cId = this.authContainerId!;
@@ -2705,28 +1895,7 @@ undo() / redo() take back the last change made in this window to the AI settings
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
-    this.providerSelectorId = undefined;
-    this.credentialLabelId = undefined;
-    this.credentialInputId = undefined;
-    this.credentialToggleId = undefined;
-    this.providerModelsLabelId = undefined;
-    this.tierProviderSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
-    this.tierModelSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
-    this.tierCapLabelIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
-    this.tierEffortSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
-    for (const key of AUX_ROW_KEYS) {
-      this.auxRows[key] = { desiredModelId: this.auxRows[key].desiredModelId };
-    }
-    this.cacheKeepaliveCheckboxId = undefined;
-    this.learningBudgetInputId = undefined;
-    this.learningBudgetHintId = undefined;
-    this.decisionGatesSelectId = undefined;
-    this.presetSelectId = undefined;
-    this.presetNameInputId = undefined;
-    this.presetApplyBtnId = undefined;
-    this.presetSaveBtnId = undefined;
-    this.presetDeleteBtnId = undefined;
-    this.saveBtnId = undefined;
+    this.aiPane.reset();
     this.statusLabelId = undefined;
     this.listEmptyNoteIds.clear();
     this.scrollBodyListLayouts.clear();
@@ -2927,26 +2096,6 @@ undo() / redo() take back the last change made in this window to the AI settings
     );
   }
 
-  private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
-    const style = { disabled };
-    const ids: (AbjectId | undefined)[] = [
-      this.saveBtnId, this.providerSelectorId, this.credentialInputId, this.credentialToggleId,
-      ...Object.values(this.tierProviderSelectIds),
-      ...Object.values(this.tierModelSelectIds),
-      ...AUX_ROW_KEYS.flatMap(key => [this.auxRows[key].providerSelectId, this.auxRows[key].modelSelectId]),
-      this.decisionGatesSelectId,
-      this.presetSelectId,
-      this.presetApplyBtnId,
-      this.presetSaveBtnId,
-      this.presetDeleteBtnId,
-    ];
-    for (const id of ids) {
-      if (id) {
-        try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
-      }
-    }
-  }
-
   // ========== CHANGES FROM ELSEWHERE ==========
 
   /**
@@ -2961,17 +2110,13 @@ undo() / redo() take back the last change made in this window to the AI settings
     if (own && (own.section === section || section === 'presets') && Date.now() - own.at < 5000) return;
     if (section === 'presets') {
       // Presets follow the provider list (SettingsManager announces a
-      // provider registering or leaving this way), so the AI tab's provider
-      // dropdowns are refreshed with them.
-      await this.loadProviderDescriptions();
-      await this.loadPresetList();
-      await this.refreshPresetOptions();
-      await this.showAiSettings();
+      // provider registering or leaving this way), so the AI tab re-reads both.
+      await this.aiPane.reload(true);
       return;
     }
     await this.loadFromManager();
     switch (section) {
-      case 'ai': await this.showAiSettings(); break;
+      case 'ai': await this.aiPane.reload(); break;
       case 'auth': await this.showAuthSettings(); break;
       default: await this.showPermissionSettings(); break;
     }
@@ -2982,7 +2127,7 @@ undo() / redo() take back the last change made in this window to the AI settings
    * Undo or redo this window's last settings change through SettingsManager,
    * then repaint the AI tab (the only one undo touches) from what it holds.
    */
-  private async undoSettings(action: UndoAction): Promise<UndoResult> {
+  private async undoSettings(action: UndoAction, opts: { fromAiTab?: boolean } = {}): Promise<UndoResult> {
     // The change comes back as settingsChanged; this repaint answers it.
     const prior = this.lastOwnSave;
     this.lastOwnSave = { section: 'ai', at: Date.now() };
@@ -2990,14 +2135,8 @@ undo() / redo() take back the last change made in this window to the AI settings
     if (!result.ok) this.lastOwnSave = prior;
     if (!result.ok || !this.windowId) return result;
     await this.loadFromManager();
-    await this.refreshPresetOptions();
-    await this.showAiSettings();
-    if (this.learningBudgetInputId) {
-      try { await this.request(request(this.id, this.learningBudgetInputId, 'update', { text: String(this.learningBudget) })); } catch { /* widget gone */ }
-    }
-    if (this.learningBudgetHintId) {
-      try { await this.request(request(this.id, this.learningBudgetHintId, 'update', { text: this.learningBudgetHint(this.learningBudget) })); } catch { /* widget gone */ }
-    }
+    // The AI tab's own Undo button repaints the tab itself once this returns.
+    if (!opts.fromAiTab) await this.aiPane.reload();
     await this.setStatus(`${action === 'undo' ? 'Undid' : 'Redid'} ${result.label ?? 'the last change'}.`, this.theme.statusSuccess);
     return result;
   }
@@ -3035,1036 +2174,6 @@ undo() / redo() take back the last change made in this window to the AI settings
     await set(this.shellEnabledCheckboxId, { checked: this.shellEnabled });
     await set(this.webEnabledCheckboxId, { checked: this.webEnabled });
     await set(this.promptModeSelectId, { selectedIndex: Math.max(0, PROMPT_MODE_OPTIONS.indexOf(this.promptMode)) });
-  }
-
-  // ========== TIER PRESETS ==========
-
-  /** Dropdown options: saved presets first, then the built-ins (SettingsManager's order). */
-  private presetOptionNames(): string[] {
-    const names = this.presetList.map(p => p.name);
-    return names.length > 0 ? names : ['(no presets)'];
-  }
-
-  private async refreshPresetOptions(): Promise<void> {
-    if (!this.presetSelectId) return;
-    try {
-      await this.request(request(this.id, this.presetSelectId, 'update', {
-        options: this.presetOptionNames(), selectedIndex: 0,
-      }));
-    } catch { /* widget gone */ }
-  }
-
-  /**
-   * Read the tier and single-model dropdowns as a preset: the form as it
-   * stands, before Save. SettingsManager freezes moving models when saving.
-   */
-  private async readCurrentTierSelections(): Promise<TierPreset> {
-    const routing: TierPreset['routing'] = {};
-    for (const tier of TIER_NAMES) {
-      const providerSelectId = this.tierProviderSelectIds[tier];
-      const modelSelectId = this.tierModelSelectIds[tier];
-      if (!providerSelectId || !modelSelectId) continue;
-      const providerLabel = await this.request<string>(
-        request(this.id, providerSelectId, 'getValue', {})
-      );
-      const providerName = this.idForLabel(providerLabel);
-      const modelName = await this.request<string>(
-        request(this.id, modelSelectId, 'getValue', {})
-      );
-      if (providerName && modelName && modelName !== '(no models)') {
-        const info = this.tierModelList(providerName, tier).find(m => m.name === modelName);
-        const effort = this.tierDesiredEfforts[tier];
-        routing[tier] = { provider: providerName, model: info ? info.id : modelName, ...(effort ? { effort } : {}) };
-      }
-    }
-    const vision = await this.readAuxRow('vision');
-    const fallback = await this.readAuxRow('fallback');
-    const decision = await this.readAuxRow('decision');
-    return {
-      routing,
-      vision: vision.provider && vision.model ? { provider: vision.provider, model: vision.model } : null,
-      fallback: fallback.provider && fallback.model ? { provider: fallback.provider, model: fallback.model } : null,
-      decision: decision.provider && decision.model ? { provider: decision.provider, model: decision.model } : null,
-    };
-  }
-
-  /** Point every tier and single-model dropdown at a routing, without saving. */
-  private async showTierSelections(preset: TierPreset): Promise<void> {
-    const providerIds = this.providerIds();
-    const providerLabels = this.providerLabels();
-    for (const tier of TIER_NAMES) {
-      const entry = preset.routing[tier];
-      const providerSelectId = this.tierProviderSelectIds[tier];
-      if (!entry || !providerSelectId) continue;
-      const pIdx = providerIds.indexOf(entry.provider);
-      if (pIdx < 0) continue; // provider not known in this build — leave the tier as-is
-      await this.request(request(this.id, providerSelectId, 'update', {
-        options: providerLabels, selectedIndex: pIdx,
-      }));
-      this.tierDesiredModelIds[tier] = entry.model;
-      this.tierDesiredEfforts[tier] = entry.effort ?? null;
-      await this.refreshTierModelOptions(tier);
-      void this.refreshProviderModels(entry.provider);
-    }
-    for (const key of AUX_ROW_KEYS) {
-      const row = this.auxRows[key];
-      // A preset saved before presets carried the Decision row leaves it be.
-      if (!row.providerSelectId || (key === 'decision' && preset.decision === undefined)) continue;
-      const wanted = preset[key] ?? null;
-      const rowIds = this.auxProviderIds(key);
-      const emptyLabel = AUX_ROWS[key].decision ? GlobalSettings.AUX_AUTO_LABEL : GlobalSettings.AUX_NONE_LABEL;
-      const providerOptions = [emptyLabel, ...rowIds.map(id => this.labelForId(id) ?? id)];
-      const vIdx = wanted ? rowIds.indexOf(wanted.provider) : -1;
-      await this.request(request(this.id, row.providerSelectId, 'update', {
-        options: providerOptions, selectedIndex: vIdx >= 0 ? vIdx + 1 : 0,
-      }));
-      row.desiredModelId = vIdx >= 0 ? (wanted?.model ?? null) : null;
-      await this.refreshAuxModelOptions(key);
-    }
-  }
-
-  /** Repaint the AI tab from the settings as SettingsManager holds them. */
-  private async showAiSettings(): Promise<void> {
-    const ai = this.managed?.ai;
-    if (!ai || !this.windowId) return;
-    await this.showTierSelections({
-      routing: Object.fromEntries(TIER_NAMES.filter(t => ai.tiers[t]).map(t => [t, ai.tiers[t]!])),
-      vision: ai.vision, fallback: ai.fallback, decision: ai.decision,
-    });
-    if (this.credentialInputId) {
-      const desc = this.descById(this.activeAiProvider);
-      const value = this.credentialValues[this.activeAiProvider]
-        ?? (desc?.credentialMode === 'url' ? (desc.credentialPlaceholder ?? '') : '');
-      try { await this.request(request(this.id, this.credentialInputId, 'update', { text: value })); } catch { /* widget gone */ }
-    }
-    if (this.decisionGatesSelectId) {
-      const idx = Math.max(0, DECISION_GATE_OPTIONS.findIndex(o => o.gates === this.decisionGates));
-      try { await this.request(request(this.id, this.decisionGatesSelectId, 'update', { selectedIndex: idx })); } catch { /* widget gone */ }
-    }
-    if (this.cacheKeepaliveCheckboxId) {
-      try { await this.request(request(this.id, this.cacheKeepaliveCheckboxId, 'update', { checked: this.cacheKeepaliveEnabled })); } catch { /* widget gone */ }
-    }
-  }
-
-  private async onPresetApply(): Promise<void> {
-    if (!this.presetSelectId) return;
-    const name = await this.request<string>(
-      request(this.id, this.presetSelectId, 'getValue', {})
-    );
-    if (!name || !this.presetList.some(p => p.name === name)) {
-      await this.rejectWith('Pick a preset to apply.', this.theme.statusWarning);
-      return;
-    }
-    await this.setSaveControlsDisabled(true);
-    this.lastOwnSave = { section: 'ai', at: Date.now() };
-    try {
-      await this.request(request(this.id, this.settingsManagerId!, 'applyPreset', { name }), 60_000);
-    } catch (err) {
-      await this.rejectWith(settingsError(err));
-      await this.setSaveControlsDisabled(false);
-      return;
-    }
-    await this.loadFromManager();
-    await this.showAiSettings();
-    this.windowEffect('flash');
-    await this.setStatus(`Preset '${name}' applied.`, this.theme.statusSuccess);
-    await this.setSaveControlsDisabled(false);
-  }
-
-  private async onPresetSave(): Promise<void> {
-    if (!this.presetNameInputId) return;
-    const name = (await this.request<string>(
-      request(this.id, this.presetNameInputId, 'getValue', {})
-    ))?.trim();
-    if (!name) {
-      await this.rejectWith('Give the preset a name first.', this.theme.statusWarning);
-      return;
-    }
-    const preset = await this.readCurrentTierSelections();
-    if (Object.keys(preset.routing).length === 0) {
-      await this.rejectWith('Configure at least one tier before saving a preset.', this.theme.statusWarning);
-      return;
-    }
-    try {
-      await this.request(request(this.id, this.settingsManagerId!, 'savePreset', { name, preset }), 60_000);
-    } catch (err) {
-      await this.rejectWith(`Could not save preset '${name}': ${settingsError(err)}`);
-      return;
-    }
-    await this.loadPresetList();
-    await this.refreshPresetOptions();
-    this.windowEffect('flash');
-    await this.setStatus(`Preset '${name}' saved.`, this.theme.statusSuccess);
-  }
-
-  private async onPresetDelete(): Promise<void> {
-    if (!this.presetSelectId) return;
-    const name = await this.request<string>(
-      request(this.id, this.presetSelectId, 'getValue', {})
-    );
-    if (!name || !this.presetList.some(p => p.name === name && !p.builtin)) {
-      await this.rejectWith('Only saved presets can be deleted (built-ins stay).', this.theme.statusWarning);
-      return;
-    }
-    try {
-      await this.request(request(this.id, this.settingsManagerId!, 'deletePreset', { name }));
-    } catch (err) {
-      await this.rejectWith(settingsError(err));
-      return;
-    }
-    await this.loadPresetList();
-    await this.refreshPresetOptions();
-    await this.setStatus(`Preset '${name}' deleted.`, this.theme.statusSuccess);
-  }
-
-  // ========== TIER MODEL REFRESH ==========
-
-  /** Tracks providers whose live models have been fetched this session. */
-  private fetchedLiveModels: Set<LLMProviderName> = new Set();
-  /** Tracks in-flight fetches so we don't kick off duplicates. */
-  private modelFetchInFlight: Set<LLMProviderName> = new Set();
-
-  /**
-   * Seed the model cache from each provider's description so the UI can
-   * render immediately. Live fetches happen lazily via refreshProviderModels.
-   *
-   * Runs on every AI-tab (re)build, so it must NOT clobber a list already
-   * fetched live this session: doing so reverts the dropdown to the small
-   * fallback catalog, and the `fetchedLiveModels` guard then blocks a re-fetch,
-   * leaving the tier dropdowns stuck on the fallback after the first reopen.
-   * Only seed providers we have not fetched live yet.
-   */
-  private populateDefaultModelCache(): void {
-    for (const desc of this.providerDescriptions) {
-      if (this.fetchedLiveModels.has(desc.id)) continue;
-      this.providerModelCache.set(desc.id, [...desc.models]);
-    }
-  }
-
-  /**
-   * Fetch provider descriptions from LLMObject and index them by id. Run
-   * once at init, before any storage reads — every per-provider thing
-   * (credential keys, dropdown labels, default tier models, CLI binary
-   * detection) flows from this list.
-   */
-  private async loadProviderDescriptions(): Promise<void> {
-    if (!this.llmId) return;
-    try {
-      this.providerDescriptions = await this.request<LLMProviderDescription[]>(
-        request(this.id, this.llmId, 'listProviderDescriptions', {})
-      );
-    } catch (err) {
-      log.warn(`Failed to load provider descriptions: ${err instanceof Error ? err.message : String(err)}`);
-      this.providerDescriptions = [];
-    }
-    this.providerDescById = new Map(this.providerDescriptions.map(d => [d.id, d]));
-    if (!this.providerDescById.has(this.activeAiProvider) && this.providerDescriptions.length > 0) {
-      this.activeAiProvider = this.providerDescriptions[0].id;
-    }
-  }
-
-  // ── Provider description helpers ─────────────────────────────────────
-
-  /** Provider id → description (or undefined if unknown). */
-  private descById(id: string): LLMProviderDescription | undefined {
-    return this.providerDescById.get(id);
-  }
-
-  /** Chat provider ids in dropdown order (the tier rows, presets, and chat aux rows). */
-  private providerIds(): string[] {
-    return this.providerDescriptions.filter(servesChat).map(d => d.id);
-  }
-
-  /** Chat provider labels in dropdown order. */
-  private providerLabels(): string[] {
-    return this.providerDescriptions.filter(servesChat).map(d => d.label);
-  }
-
-  /** Every provider, decision-only ones included: the credential panel and the Decision row. */
-  private credentialProviderIds(): string[] {
-    return this.providerDescriptions.map(d => d.id);
-  }
-
-  private credentialProviderLabels(): string[] {
-    return this.providerDescriptions.map(d => d.label);
-  }
-
-  /** An aux row's provider ids: the Decision row also offers decision-only providers. */
-  private auxProviderIds(key: AuxRowKey): string[] {
-    return AUX_ROWS[key].decision ? this.credentialProviderIds() : this.providerIds();
-  }
-
-  /**
-   * An aux row's model list for one provider. The Decision row lists the
-   * provider's decision models first (answered natively), then its chat
-   * models (which emulate a decision model).
-   */
-  private auxModelList(key: AuxRowKey, provider: LLMProviderName): ModelInfo[] {
-    const chat = this.providerModelCache.get(provider) ?? [];
-    if (!AUX_ROWS[key].decision) return chat;
-    const desc = this.descById(provider);
-    const decisionModels = desc?.decisionModels ?? [];
-    const seen = new Set(decisionModels.map(m => m.id));
-    const chatModels = desc && servesChat(desc) ? chat.filter(m => !seen.has(m.id)) : [];
-    return [...decisionModels, ...chatModels];
-  }
-
-  /** The label beside an aux row's model: vision capability, or native vs emulated for decisions. */
-  private auxCapLabel(key: AuxRowKey, provider: LLMProviderName, modelName: string): { text: string; color: string } {
-    if (!AUX_ROWS[key].decision) return this.capabilityLabelFor(provider, modelName);
-    const desc = this.descById(provider);
-    const native = (desc?.decisionModels ?? []).some(m => m.name === modelName || m.id === modelName);
-    return native
-      ? { text: 'native', color: this.theme.statusSuccess }
-      : { text: 'emulated', color: this.theme.textTertiary };
-  }
-
-  /** Resolve a dropdown label back to its provider id. */
-  private idForLabel(label: string): string | undefined {
-    return this.providerDescriptions.find(d => d.label === label)?.id;
-  }
-
-  /** Resolve a provider id to its display label. */
-  private labelForId(id: string): string | undefined {
-    return this.providerDescById.get(id)?.label;
-  }
-
-  /** True when a provider authenticates via an external CLI binary. */
-  private isCliProvider(id: string): boolean {
-    return this.providerDescById.get(id)?.credentialMode === 'cli';
-  }
-
-  /** Default URL for a `url` provider (Ollama). */
-  private defaultUrlPlaceholder(id: string): string {
-    return this.providerDescById.get(id)?.credentialPlaceholder ?? '';
-  }
-
-  /**
-   * Lazily refresh one provider's model list from its API. Non-blocking when
-   * awaitResult is false — call-sites can fire-and-forget to avoid freezing
-   * the UI. Updates visible widgets (provider-panel label and any matching
-   * tier dropdown) when the fetch completes.
-   */
-  private async refreshProviderModels(
-    name: LLMProviderName,
-    opts: { force?: boolean } = {},
-  ): Promise<void> {
-    if (!this.llmId) return;
-    if (this.modelFetchInFlight.has(name)) return;
-    if (!opts.force && this.fetchedLiveModels.has(name)) return;
-    // Skip providers that have no way to reach their models. URL-keyed
-    // (Ollama) and CLI-driven providers don't need credentials — they
-    // fetch via the binary or local URL.
-    const desc = this.descById(name);
-    const noCredentialNeeded = !!desc && (desc.credentialMode === 'url' || desc.credentialMode === 'cli');
-    if (!noCredentialNeeded && !this.credentialValues[name]) return;
-
-    this.modelFetchInFlight.add(name);
-    try {
-      const payload: Record<string, unknown> = { provider: name };
-      if (desc?.credentialMode === 'url') {
-        payload.ollamaUrl = this.credentialValues[name] || desc.credentialPlaceholder || '';
-      }
-      const models = await this.request<ModelInfo[]>(
-        request(this.id, this.llmId, 'listProviderModels', payload)
-      );
-      if (models.length > 0) {
-        log.info(`refreshProviderModels: ${name} returned ${models.length} models`);
-        this.providerModelCache.set(name, models);
-        this.fetchedLiveModels.add(name);
-        await this.onProviderModelsUpdated(name);
-      } else {
-        log.warn(`refreshProviderModels: ${name} returned an empty model list; keeping the fallback catalog`);
-      }
-    } catch (err) {
-      // Network error or provider not registered; keep defaults but surface why.
-      log.warn(`refreshProviderModels: ${name} live model fetch failed: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      this.modelFetchInFlight.delete(name);
-    }
-  }
-
-  /** Update any visible widgets that depend on the given provider's model list. */
-  private async onProviderModelsUpdated(name: LLMProviderName): Promise<void> {
-    if (!this.windowId) return;
-    if (name === this.activeAiProvider && this.providerModelsLabelId) {
-      await this.request(request(this.id, this.providerModelsLabelId, 'update', {
-        text: this.formatModelListLine(name),
-      }));
-    }
-    // Update any tier dropdown currently pointed at this provider
-    for (const tier of TIER_NAMES) {
-      const providerSelectId = this.tierProviderSelectIds[tier];
-      if (!providerSelectId) continue;
-      try {
-        const label = await this.request<string>(
-          request(this.id, providerSelectId, 'getValue', {})
-        );
-        const tierProvider = this.idForLabel(label);
-        if (tierProvider === name) {
-          await this.refreshTierModelOptions(tier);
-        }
-      } catch { /* widget gone */ }
-    }
-
-    // Same for the aux rows
-    for (const key of AUX_ROW_KEYS) {
-      if (!this.auxRows[key].providerSelectId) continue;
-      try {
-        if (await this.auxSelectedProvider(key) === name) {
-          await this.refreshAuxModelOptions(key);
-        }
-      } catch { /* widget gone */ }
-    }
-
-    // Built-in presets derive from the live catalog (recommendations, vendor
-    // ladders), so a fresh catalog can change them.
-    if (this.descById(name)?.tierRules) await this.refreshPresetOptions();
-  }
-
-  /** Format the models-list label for a provider ("3 models: Claude Opus 4.7, …"). */
-  private formatModelListLine(provider: LLMProviderName): string {
-    const desc = this.descById(provider);
-    const models = this.providerModelCache.get(provider) ?? [];
-    if (models.length === 0) {
-      return desc?.credentialMode === 'url'
-        ? 'No local models found. Start the service and save.'
-        : 'Save credentials to discover models.';
-    }
-    const names = models.slice(0, 6).map(m => m.name);
-    const more = models.length > names.length ? `, …(+${models.length - names.length})` : '';
-    const visionCount = models.filter(m => m.vision === true).length;
-    const visionNote = visionCount > 0 ? ` (${visionCount} with vision)` : '';
-    return `${models.length} models${visionNote}: ${names.join(', ')}${more}`;
-  }
-
-  /** Handle provider-dropdown change: snapshot the current input, then swap panel. */
-  private async onProviderSelectorChanged(): Promise<void> {
-    if (!this.providerSelectorId || !this.credentialInputId || !this.credentialLabelId || !this.credentialToggleId) return;
-
-    // Snapshot the current input into credentialValues for the old provider
-    const oldValue = await this.request<string>(request(this.id, this.credentialInputId, 'getValue', {}));
-    this.credentialValues[this.activeAiProvider] = oldValue ?? '';
-
-    // Figure out the new provider
-    const newLabel = await this.request<string>(request(this.id, this.providerSelectorId, 'getValue', {}));
-    const newProvider = this.idForLabel(newLabel) ?? this.credentialProviderIds()[0];
-    this.activeAiProvider = newProvider;
-
-    const desc = this.descById(newProvider);
-    if (!desc) return;
-    const isCli = desc.credentialMode === 'cli';
-    const isUrl = desc.credentialMode === 'url';
-    let newValue = this.credentialValues[newProvider];
-    if (!newValue) newValue = isUrl ? (desc.credentialPlaceholder ?? '') : '';
-
-    // Reset masking state for the input
-    this.unmasked.delete(this.credentialInputId);
-
-    // Toggle credential input vs CLI detection row based on provider type.
-    await this.request(request(this.id, this.credentialLabelId, 'update', {
-      text: desc.credentialLabel ?? desc.label,
-      style: { visible: !isCli, color: this.theme.textHeading, fontSize: 13 },
-    }));
-    await this.request(request(this.id, this.credentialInputId, 'update', {
-      text: newValue,
-      placeholder: desc.credentialPlaceholder ?? '',
-      masked: !isUrl,
-      style: { visible: !isCli },
-    }));
-    await this.request(request(this.id, this.credentialToggleId, 'update', {
-      text: 'Show',
-      style: isUrl
-        ? { disabled: true, visible: !isCli }
-        : { disabled: false, visible: !isCli },
-    }));
-    if (this.cliStatusLabelId) {
-      await this.request(request(this.id, this.cliStatusLabelId, 'update', {
-        text: this.formatCliStatus(newProvider),
-        style: { color: this.cliStatusColor(newProvider), fontSize: 12, visible: isCli },
-      }));
-    }
-    if (this.cliRefreshBtnId) {
-      await this.request(request(this.id, this.cliRefreshBtnId, 'update', {
-        style: { visible: isCli, fontSize: 12 },
-      }));
-    }
-    if (this.providerModelsLabelId) {
-      await this.request(request(this.id, this.providerModelsLabelId, 'update', {
-        text: this.formatModelListLine(newProvider),
-      }));
-    }
-
-    // Preselect the provider's default preset so applying it is one click.
-    // Deliberately NOT auto-applied: applying saves, so it would silently
-    // overwrite the user's custom tier routing every time they browse the
-    // provider dropdown.
-    const presetName = `${desc.label} recommended`;
-    if (this.presetList.some(p => p.name === presetName) && this.presetSelectId) {
-      const options = this.presetOptionNames();
-      const pIdx = options.indexOf(presetName);
-      if (pIdx >= 0) {
-        try {
-          await this.request(request(this.id, this.presetSelectId, 'update', {
-            options, selectedIndex: pIdx,
-          }));
-        } catch { /* widget gone */ }
-      }
-    }
-
-    // Background refresh for the newly-active provider (idempotent + deduped)
-    if (isCli) void this.refreshCliDetection(newProvider);
-    else void this.refreshProviderModels(newProvider);
-  }
-
-  // ── CLI detection helpers ─────────────────────────────────────────
-
-  /** Re-probe whether the CLI binary for `provider` is on PATH and update the status label. */
-  private async refreshCliDetection(provider: LLMProviderName): Promise<void> {
-    const desc = this.descById(provider);
-    if (!desc?.cli) return;
-    const bin = desc.cli.binary;
-    let path: string | null = null;
-    try {
-      // Spawn the CLI's --version flag through ShellExecutor if available,
-      // otherwise via a direct child_process spawn. Either approach is
-      // fine for a one-shot detection probe.
-      path = await this.probeCliPath(bin);
-    } catch { path = null; }
-    this.cliDetected[provider] = path;
-
-    // Update label only if we're still on this provider in the panel.
-    if (this.activeAiProvider === provider && this.cliStatusLabelId) {
-      await this.request(request(this.id, this.cliStatusLabelId, 'update', {
-        text: this.formatCliStatus(provider),
-        style: { color: this.cliStatusColor(provider), fontSize: 12, visible: true },
-      }));
-    }
-  }
-
-  /** Run `<bin> --version` and return the binary name on success, or null. */
-  private async probeCliPath(bin: string): Promise<string | null> {
-    let spawn: typeof import('node:child_process').spawn;
-    try {
-      // Lazily import `node:child_process` so the browser bundle never
-      // pulls it (this Abject runs server-side, but be defensive). A dynamic
-      // import rather than require(): this package is ESM, and under tsx
-      // require is not defined.
-      const mod = 'node:child_process';
-      ({ spawn } = await import(/* @vite-ignore */ mod) as typeof import('node:child_process'));
-    } catch {
-      return null;
-    }
-    return new Promise((resolve) => {
-      try {
-        const proc = spawn(bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
-        let resolved = false;
-        const timer = setTimeout(() => {
-          if (resolved) return;
-          resolved = true;
-          proc.kill('SIGTERM');
-          resolve(null);
-        }, 5_000);
-        proc.on('error', () => {
-          if (resolved) return;
-          resolved = true;
-          clearTimeout(timer);
-          resolve(null);
-        });
-        proc.on('close', (code) => {
-          if (resolved) return;
-          resolved = true;
-          clearTimeout(timer);
-          resolve(code === 0 ? bin : null);
-        });
-      } catch {
-        resolve(null);
-      }
-    });
-  }
-
-  private formatCliStatus(provider: LLMProviderName): string {
-    const cli = this.descById(provider)?.cli;
-    const bin = cli?.binary ?? '';
-    const detected = this.cliDetected[provider];
-    if (detected === undefined) return `Detecting \`${bin}\` …`;
-    if (detected === null) {
-      const hint = cli?.installHint ?? '';
-      return `\`${bin}\` not found on PATH. ${hint}`;
-    }
-    return `Detected \`${bin}\` on PATH. The CLI manages its own auth — run \`${bin} login\` if you haven't already.`;
-  }
-
-  private cliStatusColor(provider: LLMProviderName): string {
-    const detected = this.cliDetected[provider];
-    if (detected === undefined) return this.theme.textTertiary;
-    if (detected === null)      return this.theme.statusErrorBright;
-    return this.theme.statusSuccess;
-  }
-
-  /**
-   * Refresh the model dropdown for a specific tier after its provider changed
-   * or the model cache was updated. Preserves the current selection when
-   * still present in the new list.
-   */
-  /**
-   * A tier's model choices on one provider: "Latest (…)" first when the
-   * provider can recommend the tier from its live catalog (stored as
-   * `latest`, re-resolved on every call so it follows new releases), then
-   * the catalog. The Latest entry carries the recommended model's vision
-   * and effort information.
-   */
-  private tierModelList(provider: LLMProviderName, tier: ModelTierName): ModelInfo[] {
-    const list = this.providerModelCache.get(provider) ?? [];
-    const desc = this.descById(provider);
-    if (!desc || list.length === 0 || !hasTierRules(desc, tier)) return list;
-    const recommended = resolveTier(desc, list, tier).model;
-    const info = list.find(m => m.id === recommended);
-    return [{ ...(info ?? { id: recommended, name: recommended }), id: LATEST_MODEL, name: `Latest (${info?.name ?? recommended})` }, ...list];
-  }
-
-  /**
-   * A model list that still holds the wanted model. Until a provider's live
-   * catalog arrives the cached list is a short fallback, and a dropdown that
-   * cannot find the wanted model would land on its first entry, which the
-   * next save then persists in place of what was chosen (an applied preset
-   * came out all "Latest" this way). The wanted id is shown as itself until
-   * the catalog names it.
-   */
-  private withWanted(list: ModelInfo[], wanted: string | null | undefined): ModelInfo[] {
-    if (!wanted || list.some(m => m.id === wanted)) return list;
-    return [{ id: wanted, name: wanted }, ...list];
-  }
-
-  private async refreshTierModelOptions(tier: ModelTierName): Promise<void> {
-    const providerSelectId = this.tierProviderSelectIds[tier];
-    const modelSelectId = this.tierModelSelectIds[tier];
-    if (!providerSelectId || !modelSelectId) return;
-
-    const providerLabel = await this.request<string>(
-      request(this.id, providerSelectId, 'getValue', {})
-    );
-    const providerName = this.idForLabel(providerLabel) ?? this.providerIds()[0];
-
-    const currentLabel = await this.request<string>(
-      request(this.id, modelSelectId, 'getValue', {})
-    );
-
-    const modelList = this.withWanted(this.tierModelList(providerName, tier), this.tierDesiredModelIds[tier]);
-    const options = modelList.length > 0
-      ? modelList.map(m => m.name)
-      : ['(no models)'];
-
-    // Prefer the tier's intended model id (saved routing / the user's last
-    // pick): the visible label is stale when this refresh replaces a fallback
-    // catalog with the live list, whose display names differ.
-    const desired = this.tierDesiredModelIds[tier];
-    const desiredIdx = desired ? modelList.findIndex(m => m.id === desired) : -1;
-    const keepIdx = desiredIdx >= 0 ? desiredIdx : options.indexOf(currentLabel);
-    const selectedIndex = keepIdx >= 0 ? keepIdx : 0;
-
-    await this.request(
-      request(this.id, modelSelectId, 'update', { options, selectedIndex })
-    );
-    await this.updateTierCapabilityLabel(tier, providerName, options[selectedIndex] ?? '');
-    await this.refreshTierEffortOptions(tier, providerName, modelList[selectedIndex]?.id ?? null);
-  }
-
-  // ── Tier capability display ───────────────────────────────────────
-
-  /**
-   * Capability text + color for a provider model, from the cached model
-   * list's vision flag. Unknown capability renders as empty rather than
-   * guessing.
-   */
-  private capabilityLabelFor(provider: LLMProviderName, modelName: string, tier?: ModelTierName): { text: string; color: string } {
-    const models = tier ? this.tierModelList(provider, tier) : this.providerModelCache.get(provider) ?? [];
-    const info = models.find(m => m.name === modelName);
-    if (info?.vision === true) return { text: '◉ vision', color: this.theme.statusSuccess };
-    if (info?.vision === false) return { text: 'text-only', color: this.theme.textTertiary };
-    return { text: '', color: this.theme.textTertiary };
-  }
-
-  /** Repaint one tier's capability label for the given provider + model name. */
-  private async updateTierCapabilityLabel(tier: ModelTierName, provider: LLMProviderName, modelName: string): Promise<void> {
-    const capLabelId = this.tierCapLabelIds[tier];
-    if (!capLabelId) return;
-    const cap = this.capabilityLabelFor(provider, modelName, tier);
-    try {
-      await this.request(request(this.id, capLabelId, 'update', {
-        text: cap.text,
-        style: { color: cap.color, fontSize: 11 },
-      }));
-    } catch { /* widget gone */ }
-  }
-
-  // ── Aux rows (vision substitute, tier fallback) ───────────────────
-
-  /**
-   * Render one aux row under the tiers: label, provider dropdown with a
-   * leading 'None', model dropdown, capability label. Same row shape as the
-   * tiers; 'None' disables the row.
-   */
-  /**
-   * Whether built-in decision sites run: on (each at its own mode, advising
-   * or acting) or off (explicit decide calls still run).
-   */
-  /** "About $X a month" for a daily budget, or what 0 means. */
-  private learningBudgetHint(perDay: number): string {
-    if (!Number.isFinite(perDay) || perDay < 0) return 'Enter dollars per day, 0 or more';
-    if (perDay === 0) return 'Learning reviews and repairs are off';
-    return `USD a day, about $${Math.round(perDay * 30)} a month. Reviews and repairs of what agents learn pause for the day once it is spent.`;
-  }
-
-  /**
-   * Daily learning budget: what reviewing finished work and repairing what
-   * agents learned may spend on models per day, across all workspaces.
-   * Applied on Save with the rest of the AI tab.
-   */
-  private async renderLearningBudgetRow(tiersCard: AbjectId): Promise<void> {
-    const rowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: tiersCard,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, tiersCard, 'addLayoutChild', {
-      widgetId: rowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-    const { widgetIds: [labelId, inputId, hintId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Learning budget',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-        { type: 'textInput', windowId: this.windowId, placeholder: '3', text: String(this.learningBudget) },
-        { type: 'label', windowId: this.windowId, text: this.learningBudgetHint(this.learningBudget),
-          style: { color: this.theme.textSecondary, fontSize: 12 } },
-      ]})
-    );
-    this.learningBudgetInputId = inputId;
-    this.learningBudgetHintId = hintId;
-    await this.request(request(this.id, inputId, 'addDependent', {}));
-    await this.request(request(this.id, rowId, 'addLayoutChild', {
-      widgetId: labelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 120, height: 32 },
-    }));
-    await this.request(request(this.id, rowId, 'addLayoutChild', {
-      widgetId: inputId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 72, height: 32 },
-    }));
-    await this.request(request(this.id, rowId, 'addLayoutChild', {
-      widgetId: hintId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 },
-    }));
-  }
-
-  private async renderDecisionGatesRow(tiersCard: AbjectId): Promise<void> {
-    const rowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: tiersCard,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, tiersCard, 'addLayoutChild', {
-      widgetId: rowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-    const selected = Math.max(0, DECISION_GATE_OPTIONS.findIndex(o => o.gates === this.decisionGates));
-    const { widgetIds: [labelId, selectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Gates',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-        { type: 'select', windowId: this.windowId,
-          options: DECISION_GATE_OPTIONS.map(o => o.label), selectedIndex: selected },
-      ]})
-    );
-    this.decisionGatesSelectId = selectId;
-    await this.request(request(this.id, selectId, 'addDependent', {}));
-    await this.request(request(this.id, rowId, 'addLayoutChild', {
-      widgetId: labelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 },
-    }));
-    await this.request(request(this.id, rowId, 'addLayoutChild', {
-      widgetId: selectId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 },
-    }));
-  }
-
-  private async renderAuxRow(key: AuxRowKey, tiersCard: AbjectId, saved: AuxModel): Promise<void> {
-    const spec = AUX_ROWS[key];
-    const row = this.auxRows[key];
-    row.desiredModelId = saved.model;
-
-    const rowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: tiersCard,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, tiersCard, 'addLayoutChild', {
-      widgetId: rowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: spec.label,
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-      ]})
-    );
-    await this.request(request(this.id, rowId, 'addLayoutChild', {
-      widgetId: labelId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 65, height: 32 },
-    }));
-
-    const providerIds = this.auxProviderIds(key);
-    const savedProvider = saved.provider;
-    const emptyLabel = spec.decision ? GlobalSettings.AUX_AUTO_LABEL : GlobalSettings.AUX_NONE_LABEL;
-    const providerOptions = [emptyLabel, ...providerIds.map(id => this.labelForId(id) ?? id)];
-    const savedProviderIdx = savedProvider ? providerIds.indexOf(savedProvider) : -1;
-    const { widgetIds: [providerSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'select', windowId: this.windowId,
-          options: providerOptions,
-          selectedIndex: savedProviderIdx >= 0 ? savedProviderIdx + 1 : 0 },
-      ]})
-    );
-    row.providerSelectId = providerSelectId;
-    await this.request(request(this.id, providerSelectId, 'addDependent', {}));
-    await this.request(request(this.id, rowId, 'addLayoutChild', {
-      widgetId: providerSelectId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 120, height: 32 },
-    }));
-
-    const activeProvider = savedProviderIdx >= 0 ? (savedProvider as LLMProviderName) : null;
-    const modelList = activeProvider ? this.withWanted(this.auxModelList(key, activeProvider), saved.model) : [];
-    const modelOptions = activeProvider
-      ? (modelList.length > 0 ? modelList.map(m => m.name) : ['(no models)'])
-      : [spec.decision ? '(decision model if keyed, else Fast tier)' : '(none)'];
-    let modelIdx = 0;
-    if (saved.model && modelList.length > 0) {
-      const idx = modelList.findIndex(m => m.id === saved.model);
-      if (idx >= 0) modelIdx = idx;
-    }
-
-    const { widgetIds: [modelSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'select', windowId: this.windowId,
-          options: modelOptions,
-          selectedIndex: modelIdx },
-      ]})
-    );
-    row.modelSelectId = modelSelectId;
-    await this.request(request(this.id, modelSelectId, 'addDependent', {}));
-    await this.request(request(this.id, rowId, 'addLayoutChild', {
-      widgetId: modelSelectId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    const cap = activeProvider
-      ? this.auxCapLabel(key, activeProvider, modelOptions[modelIdx] ?? '')
-      : { text: '', color: this.theme.textTertiary };
-    const { widgetIds: [capLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: cap.text,
-          style: { color: cap.color, fontSize: 11 } },
-      ]})
-    );
-    row.capLabelId = capLabelId;
-    await this.request(request(this.id, rowId, 'addLayoutChild', {
-      widgetId: capLabelId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 62, height: 32 },
-    }));
-  }
-
-  /**
-   * Read an aux row as saved settings would see it: provider id plus model
-   * id (falling back to the visible name when the model list has not
-   * arrived). Also refreshes the row's intended model id, so a later
-   * option-list refresh keeps what the user picked.
-   */
-  private async readAuxRow(key: AuxRowKey): Promise<AuxModel> {
-    const row = this.auxRows[key];
-    const out: AuxModel = { provider: null, model: null };
-    if (!row.providerSelectId || !row.modelSelectId) return out;
-    const provider = await this.auxSelectedProvider(key);
-    if (!provider) {
-      row.desiredModelId = null;
-      return out;
-    }
-    const modelName = await this.request<string>(
-      request(this.id, row.modelSelectId, 'getValue', {})
-    );
-    if (modelName && modelName !== '(no models)' && modelName !== '(none)') {
-      const modelList = this.auxModelList(key, provider);
-      const info = modelList.find(m => m.name === modelName);
-      out.provider = provider;
-      out.model = info ? info.id : modelName;
-      row.desiredModelId = out.model;
-    }
-    return out;
-  }
-
-  /** An aux row's selected provider id, or null when set to 'None'. */
-  private async auxSelectedProvider(key: AuxRowKey): Promise<LLMProviderName | null> {
-    const row = this.auxRows[key];
-    if (!row.providerSelectId) return null;
-    const label = await this.request<string>(
-      request(this.id, row.providerSelectId, 'getValue', {})
-    );
-    if (label === GlobalSettings.AUX_NONE_LABEL || label === GlobalSettings.AUX_AUTO_LABEL) return null;
-    return this.idForLabel(label) ?? null;
-  }
-
-  /** Rebuild an aux row's model options after its provider changed or models arrived. */
-  private async refreshAuxModelOptions(key: AuxRowKey): Promise<void> {
-    const row = this.auxRows[key];
-    if (!row.modelSelectId) return;
-    const provider = await this.auxSelectedProvider(key);
-
-    if (!provider) {
-      const empty = AUX_ROWS[key].decision ? '(decision model if keyed, else Fast tier)' : '(none)';
-      await this.request(
-        request(this.id, row.modelSelectId, 'update', { options: [empty], selectedIndex: 0 })
-      );
-      await this.updateAuxCapLabel(key, '', this.theme.textTertiary);
-      return;
-    }
-
-    const currentLabel = await this.request<string>(
-      request(this.id, row.modelSelectId, 'getValue', {})
-    );
-    const modelList = this.withWanted(this.auxModelList(key, provider), row.desiredModelId);
-    const options = modelList.length > 0 ? modelList.map(m => m.name) : ['(no models)'];
-
-    // Same intended-id preservation as the tier rows. The vision row exists
-    // to pick a vision model, so it lands on the first one rather than the
-    // list head when there is no better selection.
-    const desiredIdx = row.desiredModelId
-      ? modelList.findIndex(m => m.id === row.desiredModelId)
-      : -1;
-    let keepIdx = desiredIdx >= 0 ? desiredIdx : options.indexOf(currentLabel);
-    if (keepIdx < 0 && AUX_ROWS[key].preferVision) keepIdx = modelList.findIndex(m => m.vision === true);
-    const selectedIndex = keepIdx >= 0 ? keepIdx : 0;
-
-    await this.request(
-      request(this.id, row.modelSelectId, 'update', { options, selectedIndex })
-    );
-    const cap = this.auxCapLabel(key, provider, options[selectedIndex] ?? '');
-    await this.updateAuxCapLabel(key, cap.text, cap.color);
-  }
-
-  /** The user picked an aux-row model: remember the id + repaint the label. */
-  private async onAuxModelChanged(key: AuxRowKey): Promise<void> {
-    const row = this.auxRows[key];
-    if (!row.modelSelectId) return;
-    const provider = await this.auxSelectedProvider(key);
-    if (!provider) return;
-    try {
-      const modelName = await this.request<string>(
-        request(this.id, row.modelSelectId, 'getValue', {})
-      );
-      const info = this.auxModelList(key, provider).find(m => m.name === modelName);
-      // A name not in the list is a wanted id shown as itself (withWanted).
-      row.desiredModelId = info?.id ?? (modelName && !modelName.startsWith('(') ? modelName : null);
-      const cap = this.auxCapLabel(key, provider, modelName);
-      await this.updateAuxCapLabel(key, cap.text, cap.color);
-    } catch { /* widget gone */ }
-  }
-
-  private async updateAuxCapLabel(key: AuxRowKey, text: string, color: string): Promise<void> {
-    const capLabelId = this.auxRows[key].capLabelId;
-    if (!capLabelId) return;
-    try {
-      await this.request(request(this.id, capLabelId, 'update', {
-        text,
-        style: { color, fontSize: 11 },
-      }));
-    } catch { /* widget gone */ }
-  }
-
-  /**
-   * The user picked a model for a tier: remember the picked id (so later
-   * option-list refreshes keep the selection) and repaint the capability label.
-   */
-  private async onTierModelChanged(tier: ModelTierName): Promise<void> {
-    const providerSelectId = this.tierProviderSelectIds[tier];
-    const modelSelectId = this.tierModelSelectIds[tier];
-    if (!providerSelectId || !modelSelectId) return;
-    try {
-      const providerLabel = await this.request<string>(
-        request(this.id, providerSelectId, 'getValue', {})
-      );
-      const provider = this.idForLabel(providerLabel) ?? this.providerIds()[0];
-      const modelName = await this.request<string>(
-        request(this.id, modelSelectId, 'getValue', {})
-      );
-      const info = this.tierModelList(provider, tier).find(m => m.name === modelName);
-      // A name not in the list is a wanted id shown as itself (withWanted).
-      this.tierDesiredModelIds[tier] = info?.id ?? (modelName && modelName !== '(no models)' ? modelName : null);
-      await this.updateTierCapabilityLabel(tier, provider, modelName);
-      await this.refreshTierEffortOptions(tier, provider, info?.id ?? null);
-    } catch { /* widget gone */ }
-  }
-
-  /**
-   * Effort dropdown options for one provider model: 'Default' plus the
-   * model's supported levels (from ModelInfo.efforts). A model with no
-   * selectable effort gets the single placeholder '—'.
-   */
-  private effortOptionsFor(provider: LLMProviderName, modelId: string | null, tier?: ModelTierName): string[] {
-    if (!modelId) return ['—'];
-    const models = tier ? this.tierModelList(provider, tier) : this.providerModelCache.get(provider) ?? [];
-    const info = models.find(m => m.id === modelId);
-    const efforts = info?.efforts ?? [];
-    if (efforts.length === 0) return ['—'];
-    return [EFFORT_DEFAULT_LABEL, ...efforts];
-  }
-
-  /**
-   * Repaint a tier's effort dropdown for a newly-selected model: new option
-   * list, previous pick kept when the new model supports it, disabled state
-   * when there is nothing to select. Clears the desired effort when the new
-   * model doesn't support the old level (so Save persists reality).
-   */
-  private async refreshTierEffortOptions(tier: ModelTierName, provider: LLMProviderName, modelId: string | null): Promise<void> {
-    const effortSelectId = this.tierEffortSelectIds[tier];
-    if (!effortSelectId) return;
-    const desired = this.tierDesiredEfforts[tier];
-    // A model the catalog has not named yet (shown by id, see withWanted) has
-    // unknown efforts: keep the chosen one until the catalog says otherwise.
-    const known = !modelId || this.tierModelList(provider, tier).some(m => m.id === modelId);
-    const options = !known && desired ? [EFFORT_DEFAULT_LABEL, desired] : this.effortOptionsFor(provider, modelId, tier);
-    let selectedIndex = 0;
-    if (desired) {
-      const idx = options.indexOf(desired);
-      if (idx >= 0) selectedIndex = idx;
-      else this.tierDesiredEfforts[tier] = null;
-    }
-    try {
-      await this.request(request(this.id, effortSelectId, 'update', {
-        options,
-        selectedIndex,
-        style: { disabled: options.length <= 1 },
-      }));
-    } catch { /* widget gone */ }
-  }
-
-  /** Record a tier's effort-dropdown pick ('Default'/'—' → no override). */
-  private async onTierEffortChanged(tier: ModelTierName): Promise<void> {
-    const effortSelectId = this.tierEffortSelectIds[tier];
-    if (!effortSelectId) return;
-    try {
-      const value = await this.request<string>(
-        request(this.id, effortSelectId, 'getValue', {})
-      );
-      this.tierDesiredEfforts[tier] = (value === EFFORT_DEFAULT_LABEL || value === '—') ? null : value;
-    } catch { /* widget gone */ }
   }
 
   // ========== AUTH HELPERS ==========
@@ -5038,109 +3147,6 @@ undo() / redo() take back the last change made in this window to the AI settings
 
   // ========== API KEYS ACTIONS ==========
 
-  /**
-   * Read the AI tab's form and save it through SettingsManager, which
-   * validates it (a tier configured, a key for every provider that needs
-   * one), persists it and configures the LLM.
-   */
-  private async saveSettings(): Promise<void> {
-    if (!this.windowId) return;
-
-    await this.setSaveControlsDisabled(true);
-
-    // Snapshot the currently visible credential into the cache so it persists.
-    if (this.credentialInputId) {
-      const currentValue = await this.request<string>(
-        request(this.id, this.credentialInputId, 'getValue', {})
-      );
-      this.credentialValues[this.activeAiProvider] = currentValue ?? '';
-    }
-
-    // Read per-tier provider + model selections
-    const tiers: Record<string, { provider: string; model: string; effort?: string } | null> = {};
-    for (const tier of TIER_NAMES) {
-      const providerSelectId = this.tierProviderSelectIds[tier];
-      const modelSelectId = this.tierModelSelectIds[tier];
-      if (!providerSelectId || !modelSelectId) continue;
-      const providerLabel = await this.request<string>(
-        request(this.id, providerSelectId, 'getValue', {})
-      );
-      const providerName = this.idForLabel(providerLabel) ?? null;
-      const modelName = await this.request<string>(
-        request(this.id, modelSelectId, 'getValue', {})
-      );
-      if (providerName && modelName && modelName !== '(no models)') {
-        const modelInfo = this.tierModelList(providerName, tier).find(m => m.name === modelName);
-        const model = modelInfo ? modelInfo.id : modelName;
-        const effort = this.tierDesiredEfforts[tier];
-        tiers[tier] = { provider: providerName, model, ...(effort ? { effort } : {}) };
-        this.tierDesiredModelIds[tier] = model;
-      } else {
-        tiers[tier] = null;
-      }
-    }
-
-    // Read the optional single-model rows (vision substitute, tier fallback, decision)
-    const aux: Record<string, { provider: string; model: string } | null> = {};
-    for (const key of AUX_ROW_KEYS) {
-      const { provider, model } = await this.readAuxRow(key);
-      aux[key] = provider && model ? { provider, model } : null;
-    }
-
-    // Every credential the form holds, CLI providers excepted (their auth lives in the binary).
-    const credentials: Record<string, string | null> = {};
-    for (const desc of this.providerDescriptions) {
-      if (desc.credentialMode === 'cli' || desc.credentialMode === 'none') continue;
-      if (this.credentialValues[desc.id] !== undefined) credentials[desc.id] = this.credentialValues[desc.id] || null;
-    }
-
-    // The learning budget as typed; SettingsManager checks its bounds.
-    let learningBudgetUsdPerDay: unknown = this.learningBudget;
-    if (this.learningBudgetInputId) {
-      const typed = String(await this.request<string>(request(this.id, this.learningBudgetInputId, 'getValue', {})) ?? '').trim().replace(/^\$/, '');
-      learningBudgetUsdPerDay = typed === '' ? NaN : Number(typed);
-    }
-    if (typeof learningBudgetUsdPerDay !== 'number' || !Number.isFinite(learningBudgetUsdPerDay)) {
-      await this.rejectWith('The learning budget must be a number of dollars per day (0 turns learning reviews off).');
-      await this.setSaveControlsDisabled(false);
-      return;
-    }
-
-    const error = await this.saveSection('ai', {
-      credentials, tiers, ...aux,
-      decisionGates: this.decisionGates,
-      cacheKeepalive: this.cacheKeepaliveEnabled,
-      learningBudgetUsdPerDay,
-    });
-    if (error) {
-      await this.rejectWith(error);
-      await this.setSaveControlsDisabled(false);
-      return;
-    }
-    this.learningBudget = learningBudgetUsdPerDay;
-    // The window's own view state: which provider's panel was open.
-    try {
-      await this.request(request(this.id, this.storageId!, 'set', { key: STORAGE_KEY_AI_ACTIVE_PROVIDER, value: this.activeAiProvider }));
-    } catch { /* a view preference */ }
-
-    log.info('Saved provider settings with per-tier routing');
-    // Keys saved, providers configured: the window lights up.
-    this.windowEffect('flash');
-    await this.setStatus('Settings saved!');
-    await this.setSaveControlsDisabled(false);
-
-    // Kick off background live model refreshes now that providers are
-    // registered. Each completing fetch re-renders only the widgets bound to
-    // that provider, so the UI never blocks on a slow API.
-    this.fetchedLiveModels.clear();
-    const prefetch = new Set<LLMProviderName>([this.activeAiProvider]);
-    for (const route of [...Object.values(tiers), ...Object.values(aux)]) {
-      if (route && this.providerDescById.has(route.provider)) prefetch.add(route.provider);
-    }
-    for (const p of prefetch) {
-      void this.refreshProviderModels(p, { force: true });
-    }
-  }
 }
 
 // Well-known global settings ID

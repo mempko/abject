@@ -486,7 +486,16 @@ export class CliServer extends Abject {
         section: this.str(params, 'section'), values: this.obj(params, 'values'),
       }, 60_000);
       case 'listPresets': return this.settingsRequest('listPresets', {}, 60_000);
-      case 'applyPreset': return this.settingsRequest('applyPreset', { name: this.str(params, 'name') }, 60_000);
+      case 'applyPreset': return this.settingsRequest('applyPreset', {
+        name: this.str(params, 'name'), ...(params.onlyReady === true ? { onlyReady: true } : {}),
+      }, 60_000);
+      case 'listProviders': return this.settingsRequest('listProviders', { probe: params.probe === true }, 90_000);
+      case 'connectProvider': return this.settingsRequest('connectProvider', {
+        provider: this.str(params, 'provider'),
+        ...(typeof params.credential === 'string' ? { credential: params.credential } : {}),
+        ...(params.unchecked === true ? { unchecked: true } : {}),
+        ...(params.route === true ? { route: true } : {}),
+      }, 90_000);
       case 'savePreset': return this.settingsRequest('savePreset', { name: this.str(params, 'name') }, 60_000);
       case 'deletePreset': return this.settingsRequest('deletePreset', { name: this.str(params, 'name') });
       case 'listModels': return this.settingsRequest('listModels', { provider: this.str(params, 'provider') }, 60_000);

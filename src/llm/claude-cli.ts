@@ -27,7 +27,7 @@ import {
   runCliIdle,
   runCliIdleStreaming,
 } from './cli-process.js';
-import { PtySessionPool, removeSandboxDir, sessionSandboxDir } from './pty-session.js';
+import { PtySessionPool, removeSandboxDir, sessionSandboxDir, type TerminalHost } from './pty-session.js';
 import { claudeDialect } from './pty-dialects.js';
 import {
   discoverModels,
@@ -267,14 +267,22 @@ export class ClaudeCliProvider extends BaseLLMProvider {
    * manifests; constructing one must never start a process.
    */
   private readonly pools = new Map<string, PtySessionPool>();
+  /**
+   * Where warm sessions get their terminals: the system's Terminal object,
+   * reached through the LLM object. Absent on an instance built only to be
+   * described, which never runs a session.
+   */
+  private readonly terminal?: TerminalHost;
 
   constructor(config: {
     bin?: string;
     idleTimeoutMs?: number;
     maxSessions?: number;
     transport?: CliTransport;
+    terminal?: TerminalHost;
   } = {}) {
     super({});
+    this.terminal = config.terminal;
     this.transport = config.transport ?? 'stream-json';
     this.name = this.transport === 'terminal' ? 'claude-cli-pty' : 'claude-cli';
     this.bin = config.bin ?? 'claude';
@@ -482,6 +490,9 @@ export class ClaudeCliProvider extends BaseLLMProvider {
   private poolFor(model: string): PtySessionPool {
     let pool = this.pools.get(model);
     if (!pool) {
+      if (!this.terminal) {
+        throw new Error(`${this.name}: a warm terminal session runs in the Terminal object, which this provider was not given`);
+      }
       // Append to the dialect's argv rather than replacing it: that argv
       // carries the flags that disable tools and MCP, and dropping them
       // would hand the model a tool layer Abjects means to own.
@@ -491,6 +502,7 @@ export class ClaudeCliProvider extends BaseLLMProvider {
       pool = new PtySessionPool(
         { ...claudeDialect, bin: this.bin, argv },
         {
+          terminal: this.terminal,
           idleTimeoutMs: this.idleTimeoutMs,
           maxSessions: this.maxSessions,
         },

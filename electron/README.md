@@ -145,10 +145,15 @@ minute after boot.
 
 ## Gotchas
 
-- **The client's WebSocket port is baked in at build time** (`VITE_WS_PORT`,
-  default 7719). The backend reads `WS_PORT` at boot, but the bundled client
-  does not follow it, so build test copies with another port when a real
-  instance is running.
+- **A second instance needs three things of its own**: a data directory
+  (`ABJECTS_DATA_DIR`), a port (`WS_PORT`; the terminal and HTTP gateways
+  follow at +4 and +5) and an Electron profile (`--user-data-dir=<dir>`, where
+  the single-instance lock lives). The window is told the port in its URL
+  (`?ws=<WS_PORT>`): the client bundle is built once with 7719 as its
+  default, so without that a second instance's window would dial the first
+  one's backend and be refused. `run-test-instance.sh` at the repository root
+  starts such a copy from an AppImage (`--reset` wipes its data for a clean
+  first run).
 - **One backend per data directory.** The app and a headless backend share
   the default data directory; the app asks before stopping a headless one, and
   refuses to start beside another desktop backend.

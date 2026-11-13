@@ -14,7 +14,6 @@
  */
 
 import type { PtyDialect } from './pty-session.js';
-import { scrubAgentEnv } from './pty-session.js';
 
 /**
  * Wide and tall on purpose.
@@ -27,8 +26,14 @@ import { scrubAgentEnv } from './pty-session.js';
  * scrollback, so anything that scrolls past the top is unrecoverable. A
  * 400-line reply needs 400 rows. Cost is one cell per row/column pair in
  * memory, which is nothing next to a language model call.
+ *
+ * Height wins over width where the two compete, because a row lost off the
+ * top is a reply lost, while a narrower screen only means more UI-inserted
+ * breaks to rejoin. They do compete: a terminal session holds at most
+ * `MAX_SCREEN_CELLS` cells (terminal-session.ts), since the emulator fails
+ * on larger screens, so 400 rows leaves 200 columns.
  */
-const COLS = 400;
+const COLS = 200;
 const ROWS = 400;
 
 /** Long horizontal rules the UIs draw around their input boxes. */
@@ -59,6 +64,8 @@ const CLAUDE_INPUT = /^❯/m;
 
 /** First-run dialog that blocks input until the directory is trusted. */
 const CLAUDE_TRUST = /Is this a project you created or one you trust/i;
+/** The dialog's option that trusts the folder (the other one exits). */
+const CLAUDE_TRUST_OPTION = /^\s*(?:❯\s*)?(?:\d+\.\s*)?Yes, I trust/i;
 
 /**
  * The status bar, e.g. "● high · /effort". It opens with the same bullet
@@ -111,10 +118,18 @@ export const claudeDialect: PtyDialect = {
   },
 
   dismissKeys(screen) {
-    // "1. Yes, I trust this folder" is preselected and the dialog's own
-    // footer says "Enter to confirm", so Enter takes the safe branch.
-    if (CLAUDE_TRUST.test(screen)) return ['\r'];
-    return undefined;
+    if (!CLAUDE_TRUST.test(screen)) return undefined;
+    // Move the selection onto "Yes, I trust this folder", then confirm. Which
+    // option is preselected, and their order, has changed between releases
+    // ("Yes" first and selected, then "No, exit" first and selected), and
+    // Enter on "No, exit" ends the session with exit code 1. So the keys are
+    // worked out from where the marker and the option are on this screen.
+    const lines = screen.split('\n');
+    const selected = lines.findIndex(line => /^\s*❯/.test(line));
+    const trust = lines.findIndex(line => CLAUDE_TRUST_OPTION.test(line));
+    if (selected < 0 || trust < 0) return ['\r'];
+    const move = trust > selected ? '\x1b[B' : '\x1b[A';
+    return [...Array<string>(Math.abs(trust - selected)).fill(move), '\r'];
   },
 
   clearCommand: '/clear',
@@ -151,12 +166,10 @@ export const claudeDialect: PtyDialect = {
     return t.startsWith('●') && !CLAUDE_STATUS_BAR.test(t);
   },
 
-  env(base) {
-    // A session launched from inside Claude Code inherits markers that make
-    // the child believe it is a nested run, which silently changes its
-    // behaviour (observed: transcript persistence turned off).
-    return scrubAgentEnv(base, ['CLAUDE_CODE_']);
-  },
+  // A session launched from inside Claude Code inherits markers that make
+  // the child believe it is a nested run, which silently changes its
+  // behaviour (observed: transcript persistence turned off).
+  dropEnvPrefixes: ['CLAUDE_CODE_'],
 };
 
 // Codex uses structured execution (codex-cli.ts). A terminal transcript cannot

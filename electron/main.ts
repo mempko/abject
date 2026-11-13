@@ -167,6 +167,13 @@ function startClientServer(): Promise<number> {
   });
 }
 
+/**
+ * True when Abject is the whole screen of a desktop session, as on Abject OS,
+ * whose session launcher sets `ABJECTS_SESSION=1`. There is no desktop around
+ * it, so the window shows no menu bar; the menu stays, so its shortcuts work.
+ */
+const wholeScreen = process.env.ABJECTS_SESSION === '1';
+
 function createWindow(port: number): void {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -178,11 +185,14 @@ function createWindow(port: number): void {
       contextIsolation: true,
     },
   });
+  if (wholeScreen) mainWindow.setMenuBarVisibility(false);
 
-  // Load via HTTP so Google Fonts, WebSocket, and localStorage all work. When
-  // rendering in software the page is told why, so it can say so.
+  // Load via HTTP so Google Fonts, WebSocket, and localStorage all work. The
+  // page is told which port this instance's backend listens on (the client
+  // bundle is built once, so an instance started with its own WS_PORT has no
+  // other way to say), and, when rendering in software, why.
   const software = gpu?.softwareReason;
-  mainWindow.loadURL(`http://127.0.0.1:${port}/${software ? `?render=software&why=${encodeURIComponent(software)}` : ''}`);
+  mainWindow.loadURL(`http://127.0.0.1:${port}/?ws=${WS_PORT}${software ? `&render=software&why=${encodeURIComponent(software)}` : ''}`);
   gpu?.windowOpened();
 
   mainWindow.on('closed', () => {

@@ -1,28 +1,32 @@
 /**
  * PtySession / PtySessionPool - drive an interactive CLI agent inside a real
- * pseudo-terminal and reuse the warm process across requests. The only
- * dialect today is `claude` (`pty-dialects.ts`); codex runs one-shot
- * `codex exec` instead (`codex-cli.ts`).
+ * terminal and reuse the warm process across requests. The only dialect today
+ * is `claude` (`pty-dialects.ts`); codex runs one-shot `codex exec` instead
+ * (`codex-cli.ts`).
  *
  * Why: a CLI provider that spawns a fresh process per request pays the
  * binary's whole boot cost every time (measured: ~0.74s for `claude`).
  * Keeping one process alive and resetting its context between requests
- * removes that cost. A pseudo-terminal is what lets the
- * binary run its normal interactive session: it sees a TTY, starts its full
- * UI, and accepts keystrokes exactly as it would from a terminal emulator.
+ * removes that cost. A terminal is what lets the binary run its normal
+ * interactive session: it sees a TTY, starts its full UI, and accepts
+ * keystrokes exactly as it would from a terminal emulator.
  *
- * How: `@lydell/node-pty` allocates the pty (prebuilt N-API binaries for
- * every desktop target, so no node-gyp and no per-Electron rebuild), and
- * `@xterm/headless` maintains a virtual screen from the raw byte stream.
- * Reading that screen is the same operation `tmux capture-pane` performs,
- * which is what makes this a tmux-shaped design without depending on tmux.
+ * How: the terminal is the system's own. Each session is a `TerminalSession`
+ * abject opened through the `Terminal` capability (the pseudo-terminal and
+ * the libghostty screen live there, see
+ * `src/objects/capabilities/terminal.ts`), reached through a
+ * {@link TerminalHost} the LLM object supplies. This file holds no pty and
+ * no emulator: it types into the session, reads its screen as text, and
+ * decides what the screen means. Reading that screen is the same operation
+ * `tmux capture-pane` performs, which is what makes this a tmux-shaped
+ * design without depending on tmux.
  *
  * KNOWN LIMITATION - this reads *rendered* text, so line breaks have to be
  * sorted into ones the model wrote and ones the layout added. Three things
  * do that, in descending order of certainty:
  *
- *   1. Terminal soft wraps are rejoined exactly: xterm records them on the
- *      buffer line as `isWrapped`, so there is nothing to infer.
+ *   1. Terminal soft wraps are rejoined exactly: the screen marks each row
+ *      that continues onto the next, so there is nothing to infer.
  *   2. UI-inserted breaks are rejoined by inference, since the byte stream
  *      does not mark them. See {@link rejoinHardWraps}.
  *   3. {@link PtyDialect.cols} is set very wide so (2) is needed rarely.
@@ -31,10 +35,8 @@
  * equal the UI's content width loses one newline. Callers needing byte-exact
  * output should prefer a provider that does not scrape a TUI.
  *
- * Everything here is backend-only. The pty and terminal modules load through
- * a dynamic import so this file stays importable from the client bundle and
- * from `PROVIDER_DESCRIPTORS`, which constructs providers purely to read
- * their manifests and must never start a process.
+ * Everything here is backend-only, and nothing here starts a process:
+ * `PROVIDER_DESCRIPTORS` constructs providers purely to read their manifests.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -42,7 +44,6 @@ import { mkdirSync, mkdtempSync, readdirSync, rm, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { require as requires, ensure, invariant, requirePositive } from '../core/contracts.js';
-import { trackChild, untrackIfGone } from '../runtime/child-processes.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -157,14 +158,53 @@ export interface PtyDialect {
   isReplyStart(line: string): boolean;
 
   /**
-   * Environment overrides for the child. The base environment is the
-   * parent's with the caller's additions applied.
+   * Environment variables the child must not inherit, by name prefix: the
+   * markers a parent CLI agent exports to its children. With them a session
+   * launched from inside one of these agents believes it is a nested run,
+   * which changes its behaviour (observed: transcript persistence silently
+   * disabled).
    */
-  env(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
+  readonly dropEnvPrefixes: readonly string[];
+}
+
+/** What a session's terminal showed when it was last read. */
+export interface TerminalReading {
+  /** The visible screen, one string per row, top to bottom. */
+  lines: string[];
+  /** Per row: true when the terminal soft-wrapped it onto the next row. */
+  wrapped: boolean[];
+  /** How long the program has produced no output. */
+  idleMs: number;
+  /** The program has exited. */
+  exited: boolean;
+  exitCode?: number;
+  signal?: number;
+  /** Set when the terminal's emulator failed: the screen is no longer what the program drew. */
+  screenError?: string;
+}
+
+/**
+ * The terminal a session runs its program in: the `Terminal` capability and
+ * the `TerminalSession` it opens, reached by messages. The LLM object
+ * supplies this; a provider has no way to start a terminal of its own.
+ */
+export interface TerminalHost {
+  /** Start `command` in a fresh terminal. Returns the session's id. */
+  open(spec: {
+    command: string; args: string[]; cwd: string; cols: number; rows: number;
+    dropEnvPrefixes: string[]; label: string;
+  }): Promise<string>;
+  read(sessionId: string): Promise<TerminalReading>;
+  /** Type into the session exactly as a keyboard would. */
+  write(sessionId: string, text: string): Promise<void>;
+  /** End the program and release the terminal. Safe to repeat. */
+  close(sessionId: string): Promise<void>;
 }
 
 /** Tunables shared by every session. */
 export interface PtySessionOptions {
+  /** Where sessions get their terminals. */
+  terminal: TerminalHost;
   /** Working directory for the child process. */
   cwd?: string;
   /**
@@ -183,8 +223,11 @@ const DEFAULT_IDLE_TIMEOUT_MS = 360_000;
 const DEFAULT_TURN_TIMEOUT_MS = 900_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 90_000;
 
-/** Poll interval for screen predicates. Cheap: reads an in-memory buffer. */
-const POLL_MS = 120;
+/**
+ * Poll interval for screen predicates. Each poll is one message to the
+ * session, which reads its screen again only when output arrived since.
+ */
+const POLL_MS = 150;
 
 /**
  * Quiet period after a completion marker before the screen is read. The UI
@@ -233,66 +276,22 @@ const WRAP_DETECT_RATIO = 0.8;
 const WRITE_CHUNK = 2048;
 const WRITE_CHUNK_PAUSE_MS = 6;
 
-// Minimal structural types for the lazily imported modules, so this file
-// carries no compile-time dependency on their shapes.
-interface PtyProcess {
-  readonly pid: number;
-  onData(cb: (data: string) => void): void;
-  onExit(cb: (e: { exitCode: number; signal?: number }) => void): void;
-  write(data: string): void;
-  resize(cols: number, rows: number): void;
-  kill(signal?: string): void;
-}
-interface BufferLine { translateToString(trimRight?: boolean): string; readonly isWrapped: boolean; }
-interface TerminalBuffer { readonly viewportY: number; getLine(y: number): BufferLine | undefined; }
-interface TerminalLike {
-  readonly rows: number;
-  readonly buffer: { readonly active: TerminalBuffer };
-  write(data: string): void;
-  dispose(): void;
-}
-
-let ptyModule: { spawn(file: string, args: string[], opts: Record<string, unknown>): PtyProcess } | undefined;
-let terminalCtor: (new (opts: Record<string, unknown>) => TerminalLike) | undefined;
-
-/**
- * Load the native pty binding and the headless terminal on first use.
- *
- * Dynamic so that merely importing this module (which the provider registry
- * does at startup, and the client bundle does transitively) never touches a
- * native addon.
- */
-async function loadPtyDeps(): Promise<void> {
-  if (ptyModule && terminalCtor) return;
-  const [pty, xterm] = await Promise.all([
-    import('@lydell/node-pty'),
-    import('@xterm/headless'),
-  ]);
-  // Both ship CommonJS, so the useful shape may sit under `default`.
-  const ptyNs = (pty as unknown as { default?: unknown }).default ?? pty;
-  const xtermNs = (xterm as unknown as { default?: unknown }).default ?? xterm;
-  ptyModule = ptyNs as typeof ptyModule;
-  terminalCtor = (xtermNs as { Terminal: NonNullable<typeof terminalCtor> }).Terminal;
-  ensure(!!ptyModule?.spawn, 'node-pty exposes spawn()');
-  ensure(!!terminalCtor, '@xterm/headless exposes Terminal');
-}
-
 // ── Session ────────────────────────────────────────────────────────────
 
 export type PtySessionState = 'new' | 'starting' | 'ready' | 'busy' | 'dead';
 
 /**
- * One warm interactive CLI process plus the virtual screen it draws on.
+ * One warm interactive CLI process, running in a terminal session of its own.
  *
  * Not safe for concurrent turns: {@link ask} takes the session busy for its
  * whole duration. Concurrency comes from running several sessions in a
  * {@link PtySessionPool}.
  */
 export class PtySession {
-  private proc?: PtyProcess;
-  private term?: TerminalLike;
+  /** The TerminalSession this session types into and reads, once started. */
+  private sessionId?: string;
+  private readonly terminal: TerminalHost;
   private state: PtySessionState = 'new';
-  private lastDataAt = 0;
   private exitInfo?: { exitCode: number; signal?: number };
 
   /** Turns served since spawn; drives pool recycling. */
@@ -310,8 +309,10 @@ export class PtySession {
 
   constructor(
     private readonly dialect: PtyDialect,
-    options: PtySessionOptions = {},
+    options: PtySessionOptions,
   ) {
+    requires(!!options?.terminal, 'a session needs a terminal to run in');
+    this.terminal = options.terminal;
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
     this.startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
@@ -329,12 +330,8 @@ export class PtySession {
   checkInvariants(): void {
     invariant(this.turns >= 0, 'turns served never negative');
     invariant(
-      this.state === 'new' || this.state === 'dead' || this.proc !== undefined,
-      'a started session owns a pty process',
-    );
-    invariant(
-      this.proc === undefined || this.term !== undefined,
-      'a session with a pty also has a screen',
+      this.state === 'new' || this.state === 'dead' || this.sessionId !== undefined,
+      'a started session owns a terminal session',
     );
   }
 
@@ -345,48 +342,28 @@ export class PtySession {
   async start(): Promise<void> {
     requires(this.state === 'new', `cannot start a session in state '${this.state}'`);
     this.state = 'starting';
-    await loadPtyDeps();
 
-    const term = new terminalCtor!({
-      cols: this.dialect.cols,
-      rows: this.dialect.rows,
-      allowProposedApi: true,
-      // The UI runs on the alternate buffer, which keeps no scrollback, so
-      // this only matters for the brief pre-UI phase.
-      scrollback: 1000,
-    });
-    this.term = term;
-
-    const env = this.dialect.env({ ...process.env });
     // Each session gets its own empty directory unless told otherwise, and
     // removes it again in dispose().
     if (this.cwd === undefined) this.ownedDir = sessionSandboxDir();
-    let proc: PtyProcess;
     try {
-      proc = ptyModule!.spawn(this.dialect.bin, [...this.dialect.argv], {
-        name: 'xterm-256color',
+      this.sessionId = await this.terminal.open({
+        command: this.dialect.bin,
+        args: [...this.dialect.argv],
+        cwd: (this.cwd ?? this.ownedDir)!,
         cols: this.dialect.cols,
         rows: this.dialect.rows,
-        cwd: this.cwd ?? this.ownedDir,
-        env,
+        dropEnvPrefixes: [...this.dialect.dropEnvPrefixes],
+        label: `CLI session: ${this.dialect.bin}`,
       });
     } catch (err) {
       this.state = 'dead';
-      this.term?.dispose();
-      this.term = undefined;
       this.releaseOwnedDir();
       throw new Error(
-        `${this.dialect.id}: failed to spawn '${this.dialect.bin}' in a pty: ` +
+        `${this.dialect.id}: failed to start '${this.dialect.bin}' in a terminal: ` +
         `${err instanceof Error ? err.message : String(err)}`,
       );
     }
-
-    this.proc = proc;
-    // A pty child leads its own session, so the whole group is signalled.
-    trackChild(proc.pid, `CLI session: ${this.dialect.bin}`, { group: true });
-    this.lastDataAt = Date.now();
-    proc.onData((d) => { this.lastDataAt = Date.now(); term.write(d); });
-    proc.onExit((e) => { this.exitInfo = e; this.state = 'dead'; untrackIfGone(proc.pid); });
 
     try {
       await this.waitForReady(this.startupTimeoutMs);
@@ -449,16 +426,16 @@ export class PtySession {
       // The third exists for UIs that print no end-of-turn marker at all,
       // and as the backstop when a model omits the terminator.
       await this.waitFor(
-        (screen, lines) =>
+        (screen, lines, idleMs) =>
           lines.some(l => l.trim() === nonce)
           || this.dialect.isTurnComplete(screen)
-          || (this.dialect.isIdle(screen) && Date.now() - this.lastDataAt >= IDLE_COMPLETION_MS),
+          || (this.dialect.isIdle(screen) && idleMs >= IDLE_COMPLETION_MS),
         'turn to complete',
         this.turnTimeoutMs,
       );
       await this.settle();
 
-      const reply = this.extractReply(nonce);
+      const reply = this.extractReply(nonce, await this.read());
       this.turns++;
       this.state = 'ready';
       this.checkInvariants();
@@ -498,24 +475,23 @@ export class PtySession {
     // up a command-completion list as soon as "/" is typed, and a carriage
     // return arriving in the same write is consumed by that list instead of
     // running the command, which silently leaves the conversation intact.
-    this.write(this.dialect.clearCommand);
+    await this.write(this.dialect.clearCommand);
     await sleep(COMMAND_SUBMIT_DELAY_MS);
-    this.write('\r');
+    await this.write('\r');
     await this.settle();
     await this.waitForReady(30_000);
     await this.settle();
   }
 
-  /** Kill the child, release the screen, and remove the session's directory. */
+  /**
+   * End the child, release its terminal, and remove the session's directory.
+   * The terminal is closed by message and not waited for: the Terminal
+   * capability ends the program (and kills it if it lingers) on its own.
+   */
   dispose(): void {
-    if (this.proc) {
-      try { this.proc.kill(); } catch { /* already gone */ }
-      untrackIfGone(this.proc.pid);
-      this.proc = undefined;
-    }
-    if (this.term) {
-      try { this.term.dispose(); } catch { /* nothing to release */ }
-      this.term = undefined;
+    if (this.sessionId !== undefined) {
+      void this.terminal.close(this.sessionId).catch(() => { /* already gone */ });
+      this.sessionId = undefined;
     }
     this.releaseOwnedDir();
     this.state = 'dead';
@@ -529,9 +505,24 @@ export class PtySession {
 
   // ── Internals ────────────────────────────────────────────────────────
 
-  private write(data: string): void {
-    requires(this.proc !== undefined, 'cannot write to a session with no pty');
-    this.proc.write(data);
+  private async write(data: string): Promise<void> {
+    requires(this.sessionId !== undefined, 'cannot write to a session with no terminal');
+    await this.terminal.write(this.sessionId, data);
+  }
+
+  /** Read the terminal: its screen, how long it has been quiet, whether the program exited. */
+  private async read(): Promise<TerminalReading> {
+    requires(this.sessionId !== undefined, 'cannot read a session with no terminal');
+    const reading = await this.terminal.read(this.sessionId);
+    if (reading.screenError) {
+      this.state = 'dead';
+      throw new Error(`${this.dialect.id}: the terminal's screen failed (${reading.screenError}), so the reply cannot be read`);
+    }
+    if (reading.exited && !this.exitInfo) {
+      this.exitInfo = { exitCode: reading.exitCode ?? -1, ...(reading.signal ? { signal: reading.signal } : {}) };
+      this.state = 'dead';
+    }
+    return reading;
   }
 
   /**
@@ -543,16 +534,16 @@ export class PtySession {
    * follows the closing bracket is the actual submit keystroke.
    */
   private async inject(text: string): Promise<void> {
-    this.write('\x1b[200~');
+    await this.write('\x1b[200~');
     for (let i = 0; i < text.length; i += WRITE_CHUNK) {
-      this.write(text.slice(i, i + WRITE_CHUNK));
+      await this.write(text.slice(i, i + WRITE_CHUNK));
       await sleep(WRITE_CHUNK_PAUSE_MS);
     }
-    this.write('\x1b[201~');
+    await this.write('\x1b[201~');
     // Let the UI finish laying out the pasted block before submitting;
     // submitting into a still-rendering input box can drop the tail.
     await sleep(400);
-    this.write('\r');
+    await this.write('\r');
   }
 
   /**
@@ -571,13 +562,14 @@ export class PtySession {
     let dismissals = 0;
 
     for (;;) {
-      if (this.state === 'dead' && this.exitInfo) {
+      const reading = await this.read();
+      if (this.exitInfo) {
         throw new Error(
           `${this.dialect.id}: process exited (code=${this.exitInfo.exitCode}) while waiting for the UI to become ready`,
         );
       }
 
-      const screen = this.screenLines().join('\n');
+      const screen = reading.lines.join('\n');
       if (this.dialect.isReady(screen)) return;
 
       const blocked = this.dialect.blockedReason?.(screen);
@@ -589,7 +581,7 @@ export class PtySession {
       if (keys && dismissals < MAX_DIALOG_DISMISSALS) {
         dismissals++;
         for (const key of keys) {
-          this.write(key);
+          await this.write(key);
           await sleep(DIALOG_KEY_GAP_MS);
         }
         // Let the UI act on the answer before deciding whether to answer
@@ -598,7 +590,7 @@ export class PtySession {
         continue;
       }
 
-      const idleFor = Date.now() - this.lastDataAt;
+      const idleFor = reading.idleMs;
       if (idleFor >= this.idleTimeoutMs) {
         throw new Error(
           `${this.dialect.id}: no output for ${idleFor}ms while waiting for the UI to become ready`,
@@ -620,22 +612,23 @@ export class PtySession {
    * output.
    */
   private async waitFor(
-    pred: (screen: string, lines: string[]) => boolean,
+    pred: (screen: string, lines: string[], idleMs: number) => boolean,
     what: string,
     capMs: number,
   ): Promise<void> {
     const deadline = Date.now() + capMs;
     for (;;) {
-      if (this.state === 'dead' && this.exitInfo) {
+      const reading = await this.read();
+      if (this.exitInfo) {
         throw new Error(
           `${this.dialect.id}: process exited (code=${this.exitInfo.exitCode}` +
           `${this.exitInfo.signal ? `, signal=${this.exitInfo.signal}` : ''}) while waiting for ${what}`,
         );
       }
-      const lines = this.screenLines();
-      if (pred(lines.join('\n'), lines)) return;
+      const lines = reading.lines;
+      if (pred(lines.join('\n'), lines, reading.idleMs)) return;
 
-      const idleFor = Date.now() - this.lastDataAt;
+      const idleFor = reading.idleMs;
       if (idleFor >= this.idleTimeoutMs) {
         throw new Error(
           `${this.dialect.id}: no output for ${idleFor}ms while waiting for ${what} (session abandoned)`,
@@ -652,42 +645,28 @@ export class PtySession {
   private async settle(): Promise<void> {
     const deadline = Date.now() + SETTLE_CAP_MS;
     while (Date.now() < deadline) {
-      if (Date.now() - this.lastDataAt >= SETTLE_QUIET_MS) return;
-      await sleep(60);
+      const reading = await this.read();
+      if (reading.exited || reading.idleMs >= SETTLE_QUIET_MS) return;
+      await sleep(90);
     }
-  }
-
-  /** The visible screen as plain text lines, chrome included. */
-  private screenLines(): string[] {
-    if (!this.term) return [];
-    const buf = this.term.buffer.active;
-    const out: string[] = [];
-    for (let y = 0; y < this.term.rows; y++) {
-      const line = buf.getLine(buf.viewportY + y);
-      out.push(line ? line.translateToString(true).trimEnd() : '');
-    }
-    return out;
   }
 
   /**
    * The visible screen with terminal soft wraps rejoined.
    *
-   * When the terminal itself wraps a long line, xterm flags the continuation
-   * with `isWrapped`, so those fragments can be concatenated back into the
-   * original line exactly. Breaks the UI inserted itself carry no such flag
+   * When the terminal itself wraps a long line it marks the row as continuing
+   * onto the next, so those fragments can be concatenated back into the
+   * original line exactly. Breaks the UI inserted itself carry no such mark
    * and are indistinguishable from real newlines; see the file header.
    */
-  private unwrappedLines(): string[] {
-    if (!this.term) return [];
-    const buf = this.term.buffer.active;
+  private unwrappedLines(reading: TerminalReading): string[] {
     const out: string[] = [];
-    for (let y = 0; y < this.term.rows; y++) {
-      const line = buf.getLine(buf.viewportY + y);
-      if (!line) { out.push(''); continue; }
-      const text = line.translateToString(true).trimEnd();
-      if (line.isWrapped && out.length > 0) out[out.length - 1] += text;
+    let continues = false;
+    reading.lines.forEach((text, y) => {
+      if (continues && out.length > 0) out[out.length - 1] += text;
       else out.push(text);
-    }
+      continues = reading.wrapped[y] === true;
+    });
     return out;
   }
 
@@ -698,8 +677,8 @@ export class PtySession {
    * start by the last assistant bullet before it, so neither the echoed
    * prompt nor a previous turn still on screen can bleed in.
    */
-  private extractReply(nonce: string): string {
-    const lines = this.unwrappedLines();
+  private extractReply(nonce: string, reading: TerminalReading): string {
+    const lines = this.unwrappedLines(reading);
 
     let end = lines.findIndex(l => l.trim() === nonce);
     if (end < 0) end = lines.length;
@@ -781,7 +760,7 @@ export class PtySessionPool {
 
   constructor(
     private readonly dialect: PtyDialect,
-    private readonly options: PtyPoolOptions = {},
+    private readonly options: PtyPoolOptions,
   ) {
     this.maxSessions = options.maxSessions ?? 2;
     this.maxTurnsPerSession = options.maxTurnsPerSession ?? 50;
@@ -939,8 +918,8 @@ function sleep(ms: number): Promise<void> {
 /**
  * Rejoin lines the UI hard-wrapped to fit its own width.
  *
- * The terminal's own soft wraps are already handled exactly, via xterm's
- * `isWrapped` flag. This covers the other case: a UI that lays text out
+ * The terminal's own soft wraps are already handled exactly, from the
+ * screen's own wrap marks. This covers the other case: a UI that lays text out
  * itself and emits a real line break to fit its content column. Nothing in
  * the byte stream distinguishes that break from one the model wrote, so it
  * has to be inferred.
@@ -986,21 +965,6 @@ function dedent(lines: string[]): string[] {
   }
   if (!Number.isFinite(common) || common === 0) return lines;
   return lines.map(l => (l.trim() === '' ? l : l.slice(common)));
-}
-
-/**
- * Strip environment variables a parent CLI agent exports to its children.
- *
- * Without this, a session launched from inside one of these agents inherits
- * markers that make the child believe it is a nested run, which changes its
- * behaviour (observed: transcript persistence silently disabled).
- */
-export function scrubAgentEnv(base: NodeJS.ProcessEnv, prefixes: readonly string[]): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base, TERM: 'xterm-256color' };
-  for (const key of Object.keys(env)) {
-    if (prefixes.some(p => key.startsWith(p))) delete env[key];
-  }
-  return env;
 }
 
 /**
