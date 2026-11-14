@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.16.8",
+    "date": "2026-11-14",
+    "title": "AI settings that save as you go",
+    "summary": "The AI settings pane now saves each change as you make it, and checks an API key with the provider before storing it. Setting up a model takes fewer steps, and a mistyped key is caught right away instead of failing later.",
+    "highlights": [
+      "The AI pane in Settings saves each change as you make it: there is no Save button to remember.",
+      "An API key is checked with its provider before it is stored, so a wrong or mistyped key is reported at once."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.16.7",
     "date": "2026-11-11",
     "title": "A Terminal of Your Own",
