@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.16.9",
+    "date": "2026-11-18",
+    "title": "A web viewer you can browse yourself",
+    "summary": "The web viewer is now a browser you can use directly: type an address, open tabs and click around without asking for control. Pages an agent opens come to the front so you can watch, and any agent can now work on a page that is already open, whoever opened it.",
+    "highlights": [
+      "Pages you open in the web viewer are yours to use straight away: type, click and scroll with no Take Control step",
+      "The address field is editable (press Enter to go), and a '+' button at the end of the tab strip opens a new tab",
+      "When an agent opens a page, the viewer brings it to the front and leaves it under the agent's control until you press Take Control, so you see an agent's browsing as it starts and it never quietly takes over the tab you were watching",
+      "Agents can now act on any open page, including ones you or another agent opened, instead of only the pages they opened themselves",
+      "Tabs you open in the viewer stay open when you hide the viewer and show it again"
+    ],
+    "fixes": [
+      "Opening the viewer with nothing open now gives you a blank tab with an address field to type into, as a browser does; closing your last tab still leaves the empty viewer, since you closed it on purpose",
+      "Clicking empty space in the tab strip no longer opens blank pages; only the '+' button does, and a press that lands while the window is still being built is ignored",
+      "After a video decoding error the viewer starts a fresh decoder, where before it kept retrying the broken one and the picture could stay stuck",
+      "If a frame fails to reach the viewer, the stream restarts from a full frame, so the picture no longer smears from decoding across the gap"
+    ]
+  },
+  {
     "version": "0.16.8",
     "date": "2026-11-14",
     "title": "AI settings that save as you go",
