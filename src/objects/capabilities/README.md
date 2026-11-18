@@ -210,8 +210,13 @@ instance.
   `scroll` / `typeText`, `closePage`, `closeAllPages`, `listPages`); viewer
   methods for WebBrowserViewer (`viewerVideoFrame`, `viewerNavigate`,
   `viewerInput`). A viewer page's pixels come from `Page.startScreencast`
-  (`src/objects/screencast-source.ts`): the renderer pushes frames and each
-  poll drains the newest one, so no screenshot is taken per tick; a page whose
+  (`src/objects/screencast-source.ts`): the renderer pushes frames and the
+  page's encode pump takes the newest one (raw frames may be skipped), so no
+  screenshot is taken per tick. Encoded packets are never skipped: every VP8
+  inter frame is predicted from the one before it, so the pump queues all the
+  packets encoded since the last poll and a poll takes the whole run in order
+  (a key frame replaces the run). Delivering only the newest packet is what
+  made the viewer's picture smear and ghost between key frames. A page whose
   host has no CDP session, or refuses the command, keeps the per-poll
   screenshot (`captureViewerVideoFrame`). The picture is rendered at one
   fixed size, `FIXED_VIDEO_WIDTH` x `FIXED_VIDEO_HEIGHT` (1280x720, in
