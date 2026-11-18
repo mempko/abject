@@ -253,7 +253,8 @@ export class WebBrowserViewer extends Abject {
    *  are laid out and the page list is known. Input the desktop delivers while a
    *  window is being mapped (a press that lands on the freshly created strip, a
    *  focus-driven synthetic event) must not be read as a person asking for a
-   *  page: the empty viewer opens one only on a real press once it is up. */
+   *  page: show() opens the one blank tab itself when nothing is open, and any
+   *  other page comes only from a real press once the window is up. */
   private buildingWindow = false;
   /** Explicit person decisions about who drives a tab, by pageId. Absent means
    *  the tab's owner decides: the viewer's own (person-created) tabs start under
@@ -718,7 +719,15 @@ export class WebBrowserViewer extends Abject {
 
     // Populate initial page list
     await this.refreshPageList();
-    await this.refreshScreenshot();
+    if (this.pages.length === 0) {
+      // Opening the viewer with nothing open starts the person on a blank tab
+      // of their own, toolbar up and the address field ready to type into, as
+      // a browser does. Only showing the window does this: closing the last
+      // tab leaves the empty state, since that tab was closed on purpose.
+      await this.openNewTab();
+    } else {
+      await this.refreshScreenshot();
+    }
 
     this.changed('visibility', true);
     return true;
@@ -856,9 +865,10 @@ export class WebBrowserViewer extends Abject {
   // ── Event Handling ──
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
-    // TabBar '+' — the new-tab button, and the only thing in the viewer that
-    // starts a page for the person. It arrives on its own aspect, so showing
-    // the window (or any stray selection report) can never open one.
+    // TabBar '+' — the new-tab button. Besides show() opening a first blank tab
+    // when nothing is open, it is the only thing that starts a page for the
+    // person. It arrives on its own aspect, so a stray selection report can
+    // never open one.
     if (fromId === this.tabBarId && aspect === 'newTab') {
       // Only a person who can see the finished strip asks for a page. A press
       // delivered while the window is still being mapped is not that.

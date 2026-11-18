@@ -524,7 +524,7 @@ test('viewer: a tab an agent opened still starts uncontrolled', async () => {
 
 // ── Opening the viewer with nothing open ──
 
-test('viewer: showing the window with no pages opens no page and shows the empty state', async () => {
+test('viewer: refreshing the page list with no pages opens no page and shows the empty state', async () => {
   const h = await harness();
   try {
     const stub = await h.spawn(new StubBrowser());
@@ -542,10 +542,11 @@ test('viewer: showing the window with no pages opens no page and shows the empty
     v.selectedPageIndex = 0;
     stub.listed = [];
 
-    // What show() does once its widgets exist: populate from the browser.
+    // Populate from the browser, as after the last tab is closed. (show() itself
+    // then opens a blank tab when this finds nothing; the list refresh never does.)
     await v.refreshPageList();
 
-    assert.equal(stub.opened.length, 0, 'showing the viewer asked the browser for no page');
+    assert.equal(stub.opened.length, 0, 'refreshing the list asked the browser for no page');
     assert.deepEqual(v.pages, [], 'so there is no about:blank placeholder tab');
     assert.deepEqual(tabs.updates.at(-1)?.tabs, ['+'], 'the strip is the trailing + and nothing else');
     assert.equal(tabs.updates.at(-1)?.selectedIndex, 0, 'and the + is the selected tab');
