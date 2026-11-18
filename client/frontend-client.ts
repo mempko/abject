@@ -2259,7 +2259,11 @@ export class FrontendClient {
   private handleViewerVideoChunk(msg: ViewerVideoChunkMsg): void {
     if (typeof VideoDecoder === 'undefined') return;
     let stream = this.videoDecoders.get(msg.videoId);
-    if (!stream || stream.width !== msg.width || stream.height !== msg.height) {
+    // A decoder that hit an error is closed for good (WebCodecs never reopens
+    // one), so configure() on it would throw on every key frame and the
+    // picture would freeze. Start a fresh one instead.
+    const closed = stream?.decoder.state === 'closed';
+    if (!stream || closed || stream.width !== msg.width || stream.height !== msg.height) {
       if (stream) {
         try { stream.decoder.close(); } catch { /* already closed */ }
       }

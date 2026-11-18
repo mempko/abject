@@ -44,6 +44,37 @@ export class TabBarWidget extends WidgetAbject {
     this.closable = config.closable ?? false;
   }
 
+  /** The '+' tab is a button, not a share of the strip: it keeps this width at
+   *  the trailing edge while the real tabs divide what is left. A lone '+' used
+   *  to take the whole row, so any press anywhere on the strip was a press on
+   *  the new-tab button — which is how a freshly shown viewer opened a blank
+   *  page nobody asked for. */
+  private static readonly NEW_TAB_WIDTH = 36;
+
+  /** Where the tabs sit. Drawing and hit-testing both come from here, so what a
+   *  press can reach is exactly what the person sees. */
+  private tabBoxes(): { realCount: number; tabWidth: number; addLeft: number; addWidth: number } {
+    const hasAdd = this.tabs.length > 0 && this.tabs[this.tabs.length - 1] === '+';
+    const addWidth = hasAdd ? Math.min(TabBarWidget.NEW_TAB_WIDTH, this.rect.width) : 0;
+    const realCount = hasAdd ? this.tabs.length - 1 : this.tabs.length;
+    const realWidth = Math.max(0, this.rect.width - addWidth);
+    return {
+      realCount,
+      tabWidth: realCount > 0 ? realWidth / realCount : 0,
+      addLeft: realWidth,
+      addWidth,
+    };
+  }
+
+  /** The tab under a local x, or -1 for empty strip. The '+' keeps its own box,
+   *  so the strip has dead space a stray press can land on and do nothing. */
+  private indexAt(localX: number): number {
+    const { realCount, tabWidth, addLeft } = this.tabBoxes();
+    if (this.tabs.length > realCount && localX >= addLeft) return realCount;
+    if (realCount === 0 || tabWidth <= 0 || localX < 0) return -1;
+    return Math.min(Math.floor(localX / tabWidth), realCount - 1);
+  }
+
   /**
    * Slanted parallelogram tabs standing on a heavy
    * ink baseline. The active tab is a solid red slab with inverse text;
@@ -60,7 +91,8 @@ export class TabBarWidget extends WidgetAbject {
     const tabCount = this.tabs.length;
     if (tabCount === 0) return commands;
 
-    const tabWidth = w / tabCount;
+    const { realCount, tabWidth, addLeft, addWidth } = this.tabBoxes();
+    const addIndex = this.tabs.length > realCount ? realCount : -1;
     const rule = shape.ruleWidth;
     const tabH = h - rule;
     const slant = Math.min(8, tabWidth / 4);
@@ -76,13 +108,15 @@ export class TabBarWidget extends WidgetAbject {
     commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: h, fill: style.background ?? theme.windowBg } });
 
     for (let i = 0; i < tabCount; i++) {
-      const tx = ox + i * tabWidth;
+      const isAddTab = i === addIndex;
+      const tw = isAddTab ? addWidth : tabWidth;
+      const tx = ox + (isAddTab ? addLeft : i * tabWidth);
       const isActive = i === this.selectedIndex;
       const isHovered = i === this.hoveredIndex && !isActive;
       const points = [
         { x: tx + slant, y: oy },
-        { x: tx + tabWidth, y: oy },
-        { x: tx + tabWidth - slant, y: oy + tabH },
+        { x: tx + tw, y: oy },
+        { x: tx + tw - slant, y: oy + tabH },
         { x: tx, y: oy + tabH },
       ];
 
@@ -105,7 +139,7 @@ export class TabBarWidget extends WidgetAbject {
         commands.push({
           type: 'rect', surfaceId,
           params: {
-            x: tx + editPad, y: oy + 3, width: tabWidth - editPad * 2 - (this.closable ? 18 : 0), height: tabH - 6,
+            x: tx + editPad, y: oy + 3, width: tw - editPad * 2 - (this.closable ? 18 : 0), height: tabH - 6,
             fill: theme.inputBg, stroke: theme.inputBorder, lineWidth: 1,
           },
         });
@@ -118,7 +152,7 @@ export class TabBarWidget extends WidgetAbject {
           },
         });
       } else {
-        const labelCenterX = this.closable ? tx + (tabWidth - 18) / 2 : tx + tabWidth / 2;
+        const labelCenterX = this.closable && !isAddTab ? tx + (tw - 18) / 2 : tx + tw / 2;
         commands.push({
           type: 'text', surfaceId,
           params: {
@@ -134,7 +168,7 @@ export class TabBarWidget extends WidgetAbject {
         commands.push({
           type: 'text', surfaceId,
           params: {
-            x: tx + tabWidth - 16 - slant / 2, y: oy + tabH / 2,
+            x: tx + tw - 16 - slant / 2, y: oy + tabH / 2,
             text: '\u00D7',
             font: `600 12px ${fontStacks(theme).body}`,
             fill: isActive ? theme.actionText : (isCloseHovered ? theme.accent : theme.textSecondary),
@@ -157,11 +191,13 @@ export class TabBarWidget extends WidgetAbject {
     const tabCount = this.tabs.length;
     if (tabCount === 0) return { consumed: false };
 
-    const tabWidth = this.rect.width / tabCount;
+    const { tabWidth } = this.tabBoxes();
 
     if (input.type === 'mousedown') {
       const localX = (input.localX as number | undefined) ?? (input.x as number | undefined) ?? 0;
-      const idx = Math.min(Math.floor(localX / tabWidth), tabCount - 1);
+      // Empty strip is not a tab: a press that is nobody's press opens nothing.
+      const idx = this.indexAt(localX);
+      if (idx < 0) return { consumed: true };
 
       // Check if click is on the close button (rightmost ~20px of tab)
       if (this.closable && this.tabs[idx] !== '+') {
@@ -193,6 +229,19 @@ export class TabBarWidget extends WidgetAbject {
       this.lastClickTime = now;
       this.lastClickIndex = idx;
 
+      // A '+' tab is a button, not a selection. When it is the only tab — no
+      // pages open yet — it is also the selected index, so reporting a change
+      // only on a selection change would swallow the click and leave no way to
+      // open the first tab.
+      // A '+' tab is a button, not a selection. It reports on its own aspect so
+      // no consumer can read a selection (or a stale index) as a press: with no
+      // pages open the '+' is index 0 and index === the page count, so a shared
+      // channel made merely opening the strip look like "open a new tab".
+      const isAddTab = idx >= 0 && this.tabs[idx] === '+';
+      if (isAddTab) {
+        this.changed('newTab');
+        return { consumed: true };
+      }
       if (idx >= 0 && idx !== this.selectedIndex) {
         this.selectedIndex = idx;
         await this.requestRedraw();
@@ -203,8 +252,17 @@ export class TabBarWidget extends WidgetAbject {
 
     if (input.type === 'mousemove') {
       const localX = (input.localX as number | undefined) ?? (input.x as number | undefined) ?? 0;
-      const idx = Math.min(Math.floor(localX / tabWidth), tabCount - 1);
+      const idx = this.indexAt(localX);
       let needsRedraw = false;
+
+      if (idx < 0) {
+        if (this.hoveredIndex !== -1 || this.hoveredCloseIndex !== -1) {
+          this.hoveredIndex = -1;
+          this.hoveredCloseIndex = -1;
+          await this.requestRedraw();
+        }
+        return { consumed: true };
+      }
 
       if (idx !== this.hoveredIndex) {
         this.hoveredIndex = idx;

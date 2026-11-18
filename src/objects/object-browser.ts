@@ -1985,28 +1985,37 @@ Pane 4: Detail view with signature, status, source, send-message form,
 
   // ── Event Handling ────────────────────────────────────────────────
 
+  /** Add an investigation tab and point the strip at it. */
+  private async addInvestigationTab(): Promise<void> {
+    this.tabs.push({
+      name: `Tab ${this.tabs.length + 1}`,
+      history: [{ pane1Filter: { scope: 'all' }, label: 'All' }],
+      historyIndex: 0,
+      searches: ['', '', ''],
+    });
+    this.activeTabIndex = this.tabs.length - 1;
+    const tabNames = this.tabs.map(t => t.name);
+    tabNames.push('+');
+    await this.request(request(this.id, this.tabBarId!, 'update', {
+      tabs: tabNames,
+      selectedIndex: this.activeTabIndex,
+    }));
+    await this.rebuildAllPanes();
+  }
+
   private async handleWidgetEvent(fromId: AbjectId, aspect: string, value: unknown): Promise<void> {
+    // Tab bar '+' — the strip reports a press on the new-tab button on its own
+    // aspect, so it can never be read as a selection of a tab that does not
+    // exist; a press on empty strip space reports nothing at all.
+    if (fromId === this.tabBarId && aspect === 'newTab') {
+      await this.addInvestigationTab();
+      return;
+    }
+
     // Tab bar change
     if (fromId === this.tabBarId && aspect === 'change') {
       const idx = typeof value === 'number' ? value : parseInt(String(value), 10);
-      if (idx === this.tabs.length) {
-        // "+" tab — add new investigation tab
-        this.tabs.push({
-          name: `Tab ${this.tabs.length + 1}`,
-          history: [{ pane1Filter: { scope: 'all' }, label: 'All' }],
-          historyIndex: 0,
-          searches: ['', '', ''],
-        });
-        this.activeTabIndex = this.tabs.length - 1;
-        // Update tab bar
-        const tabNames = this.tabs.map(t => t.name);
-        tabNames.push('+');
-        await this.request(request(this.id, this.tabBarId!, 'update', {
-          tabs: tabNames,
-          selectedIndex: this.activeTabIndex,
-        }));
-        await this.rebuildAllPanes();
-      } else if (idx >= 0 && idx < this.tabs.length) {
+      if (idx >= 0 && idx < this.tabs.length) {
         this.activeTabIndex = idx;
         await this.rebuildAllPanes();
       }

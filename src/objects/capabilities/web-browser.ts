@@ -23,7 +23,7 @@
 import { AbjectId, AbjectMessage, MethodDeclaration } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error, request } from '../../core/message.js';
-import { require as requireContract } from '../../core/contracts.js';
+import { ensure, require as requireContract } from '../../core/contracts.js';
 import { PermissionDenied, refusalMessage, type PermissionReceipt } from '../../core/permission-outcome.js';
 import { Log } from '../../core/timed-log.js';
 import { isOwnDesktopUrl } from '../../network/origin-policy.js';
@@ -120,10 +120,20 @@ function framesEqual(a: Uint8Array, b: Uint8Array): boolean {
 interface ViewerVideoPump {
   /** A cycle is in flight; a second one is never started. */
   running: boolean;
-  /** The newest encoded reply waiting for the viewer's next poll. */
+  /** The newest encoded reply (its seq is what a waiting poll watches). */
   latest?: ViewerVideoReply;
-  /** The last reply handed to the client, so nothing is delivered twice. */
-  delivered?: ViewerVideoReply;
+  /**
+   * Every packet encoded since the viewer's last poll, in order.
+   *
+   * The pump encodes on the renderer's clock and the viewer polls on its own,
+   * so several pictures can be encoded between two polls. Each one is a VP8
+   * inter frame predicted from the one before it: handing the client only the
+   * newest would make it decode that frame against references it never got,
+   * and the picture smears and ghosts until the next key frame. So the
+   * packets accumulate here and a poll takes all of them. A key frame starts
+   * the run afresh: nothing before it is needed to decode what follows.
+   */
+  pending?: ViewerVideoReply;
   /** The client asked for a key frame; the next encode must be one. */
   forceKey: boolean;
   /** Resolves when the running cycle finishes. */
@@ -1448,6 +1458,29 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
     },
   },
   {
+    name: 'viewerNavigateTo',
+    description: 'Navigate any page to a URL, whoever opened it. No ownership check: the visual browser\'s address field sends the page the person typed there, and that page is usually another object\'s. Taken only from the built-in WebBrowserViewer; agents navigate with navigateTo, which reaches every page too.',
+    parameters: [
+      {
+        name: 'pageId',
+        type: { kind: 'primitive', primitive: 'string' },
+        description: 'Page handle',
+      },
+      {
+        name: 'url',
+        type: { kind: 'primitive', primitive: 'string' },
+        description: 'URL to navigate to',
+      },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        url: { kind: 'primitive', primitive: 'string' },
+        title: { kind: 'primitive', primitive: 'string' },
+      },
+    },
+  },
+  {
     name: 'viewerClosePage',
     description: 'Close any page by its handle, whoever opened it. No ownership check: the viewer lists every open page, so its tabs are usually other objects\' pages, and a person closing one is the person\'s own decision. Taken only from the built-in WebBrowserViewer.',
     parameters: [
@@ -1610,6 +1643,13 @@ export class WebBrowser extends Abject {
 
   /** How long a poll that asked for a key frame waits for it, in ms. */
   static readonly PUMP_KEY_WAIT_MS = 600;
+  /**
+   * Packets one page may queue for the viewer before the encoder is asked for
+   * a key frame to replace them. The key-frame cadence normally resets the run
+   * long before this (2 s is ~60 packets at 30 fps); this bounds a viewer that
+   * has stopped polling while the pump is still draining the renderer.
+   */
+  static readonly VIEWER_VIDEO_MAX_PENDING = 120;
 
   private pages: Map<string, TrackedPage> = new Map();
 
@@ -1731,11 +1771,27 @@ export class WebBrowser extends Abject {
     return `page-${++this.pageCounter}-${Date.now()}`;
   }
 
-  private getTrackedPage(pageId: string, requesterId: AbjectId): TrackedPage {
+  /**
+   * Resolve a page handle for a caller.
+   *
+   * Every open page is shared. Any object may read, navigate and interact with
+   * a page another object opened — the person's own tabs included — because
+   * the tabs the viewer lists are usually other objects' pages, and an agent
+   * asked to act on what the person is browsing must be able to reach it. The
+   * page's owner is recorded so its pages can be cleaned up when it goes away,
+   * not to fence other callers out.
+   *
+   * `requireOwnership` is kept for the one act where who opened a page does
+   * matter: destroying it. An agent closes the page it opened (closePage); a
+   * person closes any tab through the viewer's own viewerClosePage.
+   */
+  private getTrackedPage(pageId: string, requesterId: AbjectId, requireOwnership = false): TrackedPage {
     const tracked = this.pages.get(pageId);
     requireContract(tracked !== undefined, `Unknown page handle: ${pageId}`);
-    requireContract(tracked!.owner === requesterId,
-      `Page ${pageId} is owned by ${tracked!.owner}, not ${requesterId}`);
+    if (requireOwnership) {
+      requireContract(tracked!.owner === requesterId,
+        `Page ${pageId} is owned by ${tracked!.owner}, not ${requesterId}`);
+    }
     tracked!.lastActivity = Date.now();
     return tracked!;
   }
@@ -1767,11 +1823,14 @@ export class WebBrowser extends Abject {
   private deferredPageHandler(
     method: string,
     fn: (tracked: TrackedPage, payload: Record<string, unknown>, msg: AbjectMessage) => Promise<unknown>,
+    options?: { requireOwnership?: boolean },
   ): void {
     this.on(method, (msg: AbjectMessage) => {
       const payload = msg.payload as Record<string, unknown>;
       try {
-        const tracked = this.getTrackedPage(payload.pageId as string, msg.routing.from);
+        const tracked = this.getTrackedPage(
+          payload.pageId as string, msg.routing.from, options?.requireOwnership === true,
+        );
         fn(tracked, payload, msg).then(
           (result) => this.sendDeferredReply(msg, result),
           (err) => {
@@ -2153,7 +2212,7 @@ export class WebBrowser extends Abject {
       try { await tracked.page.close(); } catch { /* already closed */ }
       this.changed('pageClosed', { pageId });
       return { success: true };
-    });
+    }, { requireOwnership: true });
 
     // -- closeAllPages: special case — no pageId, uses msg.routing.from --
     this.on('closeAllPages', (msg: AbjectMessage) => {
@@ -2783,6 +2842,51 @@ export class WebBrowser extends Abject {
           err instanceof Error ? err.message : String(err)
         ));
       });
+      return DEFERRED_REPLY;
+    });
+
+    // -- viewerNavigateTo: no ownership check — the person typing an address --
+    //
+    // The address field of the visual browser navigates the selected tab, which
+    // is usually another object's page. Agents reach every page through
+    // navigateTo; this is the viewer's own door, so the person's browsing does
+    // not depend on any agent's state.
+    this.on('viewerNavigateTo', (msg: AbjectMessage) => {
+      const { pageId, url } = msg.payload as { pageId: string; url: string };
+      requireContract(typeof pageId === 'string' && pageId.length > 0,
+        'viewerNavigateTo requires a pageId');
+      requireContract(typeof url === 'string' && url.length > 0,
+        'viewerNavigateTo requires a url');
+      const tracked = this.pages.get(pageId);
+      if (!tracked) {
+        this.send(error(msg, 'BROWSER_ERROR', `Unknown page handle: ${pageId}`));
+        return DEFERRED_REPLY;
+      }
+      this.isBuiltInCaller(msg.routing.from, ['WebBrowserViewer']).then(async (viewer) => {
+        if (!viewer) throw new PermissionDenied({
+          authority: this.id, callerId: msg.routing.from, operation: 'viewerNavigateTo', resource: pageId,
+          decision: 'deny', source: 'policy', reason: 'navigating a page from the viewer is taken only from the built-in WebBrowserViewer',
+        }, 'viewerNavigateTo is taken only from WebBrowserViewer; navigate a page with navigateTo');
+        const t0 = Date.now();
+        await this.navigatePage(tracked.page, url);
+        tracked.lastActivity = Date.now();
+        const finalUrl = tracked.page.url();
+        const title = await this.safeTitle(tracked.page, finalUrl);
+        log.info(`viewerNavigateTo (${pageId}) → ${url} [${Date.now() - t0}ms]`);
+        this.changed('pageNavigated', { pageId, url: finalUrl, title });
+        return { url: finalUrl, title };
+      }).then(
+        (result) => this.sendDeferredReply(msg, result),
+        (err) => {
+          if (err instanceof PermissionDenied) {
+            this.send(error(msg, err.code, err.message, err.details));
+            return;
+          }
+          this.send(error(msg, 'BROWSER_ERROR',
+            err instanceof Error ? err.message : String(err)
+          ));
+        },
+      );
       return DEFERRED_REPLY;
     });
 
@@ -3472,6 +3576,14 @@ export class WebBrowser extends Abject {
    * already encoded, which is what keeps the viewer's draw loop off the encode's
    * critical path.
    */
+  /** Wait until the queued run opens with a key frame (or the time is up). */
+  private async waitForPumpKey(pump: ViewerVideoPump, timeoutMs: number): Promise<void> {
+    const until = Date.now() + timeoutMs;
+    while (!pump.pending?.key && Date.now() < until) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
   private async waitForPumpSeq(
     pump: ViewerVideoPump,
     aboveSeq: number,
@@ -3600,11 +3712,13 @@ export class WebBrowser extends Abject {
           pump.forceKey = false;
           const frame = decodePushedFrame(next);
           this.lastPushedFrames.set(pageId, frame);
-          pump.latest = await this.nextViewerVideoFrame(pageId, frame, {
+          const encoded = await this.nextViewerVideoFrame(pageId, frame, {
             display: pump.display,
             keyFrameIntervalMs: pump.keyFrameIntervalMs,
             forceKey,
           });
+          this.queueViewerVideo(pump, encoded);
+          pump.latest = encoded;
           next = source.takeNewest() ?? (pump.forceKey ? source.lastFrame() : undefined);
         }
       } finally {
@@ -3647,7 +3761,6 @@ export class WebBrowser extends Abject {
       source.nudge();
     }
     if (options?.keyFrameIntervalMs !== undefined) pump.keyFrameIntervalMs = options.keyFrameIntervalMs;
-    const previousSeq = pump.latest?.seq ?? 0;
     if (options?.forceKey) pump.forceKey = true;
 
     if (!pump.latest && !pump.running && !source.stats.pending) {
@@ -3672,8 +3785,11 @@ export class WebBrowser extends Abject {
       // empty canvas.
       await this.waitForPumpSeq(pump, 0, WebBrowser.PUMP_FIRST_WAIT_MS);
     } else if (options?.forceKey) {
-      // The client is restarting its decoder and needs the key frame itself.
-      await this.waitForPumpSeq(pump, previousSeq, WebBrowser.PUMP_KEY_WAIT_MS);
+      // The client is restarting its decoder and needs the key frame itself:
+      // wait until the queued run starts with one, not merely for the next
+      // encode, which may be a delta that was already under way when the
+      // request arrived.
+      await this.waitForPumpKey(pump, WebBrowser.PUMP_KEY_WAIT_MS);
     }
 
     const latest = pump.latest;
@@ -3685,9 +3801,11 @@ export class WebBrowser extends Abject {
         sourceWidth: 0, sourceHeight: 0, codec: VP8_CODEC, chunks: [],
       };
     }
-    if (pump.delivered === latest) {
+    const pending = pump.pending;
+    if (!pending) {
       // The pump has not finished the next picture yet. The client already has
-      // this one; sending its packets again would only make it decode twice.
+      // everything encoded so far; sending packets again would only make it
+      // decode them twice.
       const stream = this.viewerVideoStreams.get(pageId);
       if (stream) stream.unchangedTicks += 1;
       return {
@@ -3697,8 +3815,35 @@ export class WebBrowser extends Abject {
         codec: VP8_CODEC, chunks: [],
       };
     }
-    pump.delivered = latest;
-    return latest;
+    pump.pending = undefined;
+    return pending;
+  }
+
+  /**
+   * Add one encode's packets to what the next poll will take.
+   *
+   * A key frame (or a new picture size, which always opens with one) replaces
+   * the run: the client resets its decoder on it, so the deltas before it are
+   * not needed. A delta is appended, keeping every inter frame in the order it
+   * was predicted. A run that grows past VIEWER_VIDEO_MAX_PENDING packets (a
+   * viewer that stopped taking them) asks the encoder for a key frame, which
+   * then replaces it, so the queue cannot grow without bound.
+   */
+  private queueViewerVideo(pump: ViewerVideoPump, reply: ViewerVideoReply): void {
+    if (reply.kind !== 'video' || reply.chunks.length === 0) return;
+    const run = pump.pending;
+    if (reply.key || !run || run.width !== reply.width || run.height !== reply.height) {
+      pump.pending = reply;
+    } else {
+      pump.pending = {
+        ...reply,
+        key: run.key,
+        chunks: [...run.chunks, ...reply.chunks],
+      };
+    }
+    if (pump.pending.chunks.length > WebBrowser.VIEWER_VIDEO_MAX_PENDING) pump.forceKey = true;
+    ensure(!pump.pending.key || pump.pending.chunks[0]?.type === 'key',
+      'a queued run marked key must open with the key frame');
   }
 
   /**
@@ -4548,10 +4693,11 @@ Waiting:       waitForSelector(pageId, selector, options?) — returns {found: f
 Reading:       getContent, screenshotPage, getAttribute, getTextContent, getUrl, getTitle
 Pointer/keys:  clickAt(pageId, x, y, button?, clickCount?), hoverAt(pageId, x, y), drag(pageId, fromX, fromY, toX, toY), scroll(pageId, deltaY, deltaX?, x?, y?), typeText(pageId, text) — real mouse and keyboard input at viewport CSS-pixel coordinates (screenshotPage with options.scale "css" gives an image in the same pixels); each reports the element it landed on
 Escape hatch:  evaluate(pageId, script) — run arbitrary JS in page context
-Viewer:        viewerScreenshot(pageId), viewerInput(pageId, events), viewerNavigate(pageId, nav): no ownership check; used by the visual browser monitor for live view, human takeover (raw mouse/keyboard replay, taken only from WebBrowserViewer), and back/forward/reload
+Viewer:        viewerScreenshot(pageId), viewerInput(pageId, events), viewerNavigate(pageId, nav), viewerNavigateTo(pageId, url): no ownership check; used by the visual browser monitor for live view, human takeover (raw mouse/keyboard replay, taken only from WebBrowserViewer), the address field, and back/forward/reload
 
 ### IMPORTANT
 - A click, key or script action that submits a form or activates a button may wait for the person's approval and can come back declined with PERMISSION_DENIED and a sentence saying who declined; report that and choose another way forward. Reading, scrolling, hovering, following links and typing into fields go straight through.
+- Pages are shared. Any object may navigate, read and interact with a page another object opened — the person's own tabs in the visual browser included — so a page you did not open is still a page you can act on. Closing is the one owner-scoped act: closePage closes the page you opened, and a person closes any tab from the viewer.
 - ALWAYS close pages when done (closePage or closeAllPages). Leaked pages consume memory.
 - Pages are automatically cleaned up if the owning object is unregistered.
 - press(pageId, key) sends a keyboard key (e.g. "Enter", "Tab") — no selector needed.

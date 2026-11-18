@@ -243,7 +243,22 @@ export class WebBrowserViewer extends Abject {
   private backBtnId?: AbjectId;
   private fwdBtnId?: AbjectId;
   private reloadBtnId?: AbjectId;
-  private urlLabelId?: AbjectId;
+  private addressFieldId?: AbjectId;
+  /** The row holding the address field: the window needs it to route keystrokes. */
+  private urlRowId?: AbjectId;
+  /** True while the person is editing the address field: the periodic refresh
+   *  must not write the page's URL over what they are typing. */
+  private addressDirty = false;
+  /** True from the moment show() starts building the window until its widgets
+   *  are laid out and the page list is known. Input the desktop delivers while a
+   *  window is being mapped (a press that lands on the freshly created strip, a
+   *  focus-driven synthetic event) must not be read as a person asking for a
+   *  page: the empty viewer opens one only on a real press once it is up. */
+  private buildingWindow = false;
+  /** Explicit person decisions about who drives a tab, by pageId. Absent means
+   *  the tab's owner decides: the viewer's own (person-created) tabs start under
+   *  the person's control, an agent's pages do not. */
+  private controlOverrides = new Map<string, boolean>();
   private controlBtnId?: AbjectId;
   private bannerRowId?: AbjectId;
   private bannerLabelId?: AbjectId;
@@ -524,6 +539,22 @@ export class WebBrowserViewer extends Abject {
 
   async show(): Promise<boolean> {
     if (this.windowId) {
+      // Already built: nothing below runs, so the guard stays off.
+    } else if (this.buildingWindow) {
+      return true; // a second show() during the build must not build twice
+    } else {
+      this.buildingWindow = true;
+    }
+    try {
+      return await this.showWindow();
+    } finally {
+      this.buildingWindow = false;
+    }
+  }
+
+  /** The body of show(): build the window, its widgets and their first paint. */
+  private async showWindow(): Promise<boolean> {
+    if (this.windowId) {
       try {
         await this.request(request(this.id, this.widgetManagerId!, 'raiseWindow', {
           windowId: this.windowId,
@@ -565,7 +596,7 @@ export class WebBrowserViewer extends Abject {
           { type: 'button', windowId: this.windowId, text: '◀' },
           { type: 'button', windowId: this.windowId, text: '▶' },
           { type: 'button', windowId: this.windowId, text: '⟳' },
-          { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textSecondary, fontSize: 11 } },
+          { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Enter a URL and press Enter', style: { fontSize: 12 } },
           { type: 'button', windowId: this.windowId, text: 'Take Control', style: this.primaryStyle() },
           { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.statusWarning, fontSize: 12 } },
           { type: 'button', windowId: this.windowId, text: 'Take Control', style: this.primaryStyle() },
@@ -578,7 +609,7 @@ export class WebBrowserViewer extends Abject {
     this.backBtnId = widgetIds[1];
     this.fwdBtnId = widgetIds[2];
     this.reloadBtnId = widgetIds[3];
-    this.urlLabelId = widgetIds[4];
+    this.addressFieldId = widgetIds[4];
     this.controlBtnId = widgetIds[5];
     this.bannerLabelId = widgetIds[6];
     this.bannerTakeBtnId = widgetIds[7];
@@ -602,6 +633,7 @@ export class WebBrowserViewer extends Abject {
         spacing: 8,
       })
     );
+    this.urlRowId = urlRowId;
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: urlRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -612,7 +644,7 @@ export class WebBrowserViewer extends Abject {
         { widgetId: this.backBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 28, height: 24 } },
         { widgetId: this.fwdBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 28, height: 24 } },
         { widgetId: this.reloadBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 28, height: 24 } },
-        { widgetId: this.urlLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
+        { widgetId: this.addressFieldId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
         { widgetId: this.controlBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 130, height: 24 } },
       ],
     }));
@@ -657,6 +689,7 @@ export class WebBrowserViewer extends Abject {
 
     // Subscribe to interactive widgets
     await this.request(request(this.id, this.tabBarId, 'addDependent', {}));
+    await this.request(request(this.id, this.addressFieldId, 'addDependent', {}));
     await this.request(request(this.id, this.backBtnId, 'addDependent', {}));
     await this.request(request(this.id, this.fwdBtnId, 'addDependent', {}));
     await this.request(request(this.id, this.reloadBtnId, 'addDependent', {}));
@@ -673,8 +706,9 @@ export class WebBrowserViewer extends Abject {
       } catch { /* WebBrowser may not be available */ }
     }
 
-    // Nav buttons start disabled — enabled only when the user takes control.
-    // Toolbar starts hidden until refreshPageList finds an open page.
+    // Nav buttons start disabled — there is no page to navigate until one is
+    // open. The tab strip and the address field are never hidden, so even with
+    // no page at all there is still a way to start browsing.
     await this.updateNavButtons();
     await this.updateToolbarVisibility();
 
@@ -722,7 +756,9 @@ export class WebBrowserViewer extends Abject {
     this.backBtnId = undefined;
     this.fwdBtnId = undefined;
     this.reloadBtnId = undefined;
-    this.urlLabelId = undefined;
+    this.addressFieldId = undefined;
+    this.urlRowId = undefined;
+    this.addressDirty = false;
     this.controlBtnId = undefined;
     this.bannerRowId = undefined;
     this.bannerLabelId = undefined;
@@ -820,14 +856,42 @@ export class WebBrowserViewer extends Abject {
   // ── Event Handling ──
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
-    // TabBar selection change
+    // TabBar '+' — the new-tab button, and the only thing in the viewer that
+    // starts a page for the person. It arrives on its own aspect, so showing
+    // the window (or any stray selection report) can never open one.
+    if (fromId === this.tabBarId && aspect === 'newTab') {
+      // Only a person who can see the finished strip asks for a page. A press
+      // delivered while the window is still being mapped is not that.
+      if (this.buildingWindow) return;
+      await this.openNewTab();
+      return;
+    }
+
+    // TabBar selection change: a real page tab, or nothing at all.
     if (fromId === this.tabBarId && aspect === 'change') {
-      this.selectedPageIndex = value as number;
+      const index = value;
+      if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= this.pages.length) {
+        return;
+      }
+      this.selectedPageIndex = index;
       this.clearInputQueue();
+      await this.applyControlDefault();
       this.needsKeyFrame = true; // a new page must not be patched over the old one
-      await this.updateUrlLabel();
+      await this.updateAddressField(true);
       await this.refreshScreenshot();
       return;
+    }
+
+    // Address field: Enter takes the selected page to what was typed
+    if (fromId === this.addressFieldId) {
+      if (aspect === 'change') {
+        this.addressDirty = true; // the person is typing; leave their text alone
+        return;
+      }
+      if (aspect === 'submit') {
+        await this.navigateToAddress(value as string);
+        return;
+      }
     }
 
     // TabBar close button (×) — confirm, then close the underlying browser page
@@ -869,6 +933,10 @@ export class WebBrowserViewer extends Abject {
     if (fromId === this.webBrowserId) {
       if (aspect === 'pageOpened' || aspect === 'pageClosed' || aspect === 'pageNavigated') {
         await this.refreshPageList();
+        if (aspect === 'pageOpened') {
+          const { pageId } = (value ?? {}) as { pageId?: string };
+          await this.focusAgentPage(pageId);
+        }
         await this.refreshScreenshot();
       }
     }
@@ -913,7 +981,6 @@ export class WebBrowserViewer extends Abject {
 
   /** Back/forward/reload on the selected page via the browser's history. */
   private async navigateSelectedPage(nav: 'back' | 'forward' | 'reload'): Promise<void> {
-    if (!this.controlMode) return; // navigation is a control action
     const page = this.pages[this.selectedPageIndex];
     if (!page || !this.webBrowserId) return;
     try {
@@ -921,7 +988,7 @@ export class WebBrowserViewer extends Abject {
         request(this.id, this.webBrowserId, 'viewerNavigate', { pageId: page.pageId, nav })
       );
       page.url = url;
-      await this.updateUrlLabel();
+      await this.updateAddressField(true);
     } catch {
       // Nothing to go back/forward to: the page stays as is, and the window
       // shakes so the press visibly registered.
@@ -936,7 +1003,13 @@ export class WebBrowserViewer extends Abject {
   private async takeControl(): Promise<void> {
     if (this.controlMode || !this.windowId) return;
     this.controlMode = true;
+    const taken = this.pages[this.selectedPageIndex];
+    if (taken) this.controlOverrides.set(taken.pageId, true);
     this.mouseButtonsDown.clear();
+    // Keys go to the page from here on, so the address field must not keep the
+    // keyboard: focusing the canvas is what routes keystrokes into the page.
+    await this.blurAddressField();
+    await this.focusCanvas();
     // A takeover-mode handoff is satisfied the moment the user takes control;
     // the requesting agent continues while the user keeps driving.
     if (this.pendingHandoff?.resolveOn === 'takeover') {
@@ -957,6 +1030,8 @@ export class WebBrowserViewer extends Abject {
   private async releaseControl(): Promise<void> {
     if (!this.controlMode) return;
     this.controlMode = false;
+    const released = this.pages[this.selectedPageIndex];
+    if (released) this.controlOverrides.set(released.pageId, false);
     // Release any button the page still thinks is down
     for (const button of this.mouseButtonsDown) {
       this.queueEvent({ type: 'mouseup', button, x: this.lastPagePos.x, y: this.lastPagePos.y }, true);
@@ -997,10 +1072,10 @@ export class WebBrowserViewer extends Abject {
     }
   }
 
-  /** Enable the back/forward/reload buttons only while the user is in control —
-   *  navigating the page is a control action. */
+  /** Enable back/forward/reload whenever a page is open: browsing normally does
+   *  not require taking control of the page. */
   private async updateNavButtons(): Promise<void> {
-    const disabled = !this.controlMode;
+    const disabled = this.pages.length === 0;
     for (const id of [this.backBtnId, this.fwdBtnId, this.reloadBtnId]) {
       if (!id) continue;
       try {
@@ -1010,15 +1085,56 @@ export class WebBrowserViewer extends Abject {
   }
 
   /** Show the toolbar (nav + take control) only when a page is open — there is
-   *  nothing to navigate or control otherwise. */
+   *  nothing to navigate or control otherwise. The Take Control button is for
+   *  pages somebody else drives: a tab the person opened is already theirs, so
+   *  it needs no affordance to make it usable. */
   private async updateToolbarVisibility(): Promise<void> {
-    const visible = this.pages.length > 0;
-    for (const id of [this.backBtnId, this.fwdBtnId, this.reloadBtnId, this.controlBtnId]) {
+    const hasPage = this.pages.length > 0;
+    const showControl = hasPage && !this.isPersonPage(this.pages[this.selectedPageIndex]?.pageId);
+    for (const id of [this.backBtnId, this.fwdBtnId, this.reloadBtnId]) {
       if (!id) continue;
       try {
-        await this.request(request(this.id, id, 'update', { visible }));
+        await this.request(request(this.id, id, 'update', { visible: hasPage }));
       } catch { /* widget gone */ }
     }
+    if (this.controlBtnId) {
+      try {
+        await this.request(request(this.id, this.controlBtnId, 'update', { visible: showControl }));
+      } catch { /* widget gone */ }
+    }
+  }
+
+  /** Did the person open this tab? Pages the viewer opened itself belong to the
+   *  viewer's own id; anything else was opened by an agent or the computer. */
+  private isPersonPage(pageId?: string): boolean {
+    if (!pageId) return false;
+    const page = this.pages.find((p) => p.pageId === pageId);
+    return !!page && page.owner === this.id;
+  }
+
+  /** Bring control in line with the selected tab: the person's own tabs are
+   *  driven by the person from the moment they exist, so keys, clicks and the
+   *  takeover border are already live and no Take Control press is needed. An
+   *  agent's page starts without control, and keeps the Take Control button (and
+   *  the handoff banner) until the person takes over. An explicit take/release
+   *  on a tab outranks this default for as long as the tab is open. */
+  private async applyControlDefault(): Promise<void> {
+    const page = this.pages[this.selectedPageIndex];
+    const pageId = page?.pageId;
+    const override = pageId ? this.controlOverrides.get(pageId) : undefined;
+    const want = pageId ? (override ?? page.owner === this.id) : false;
+    if (want === this.controlMode) return;
+    this.controlMode = want;
+    this.mouseButtonsDown.clear();
+    // Keys follow control: the page when the person drives it, the address
+    // field when they do not.
+    if (want) {
+      await this.focusCanvas();
+    } else {
+      await this.blurAddressField();
+    }
+    this.needsKeyFrame = true; // the reserved border frame changes with control
+    await this.updateControlUi();
   }
 
   /** Sync the control button, banner, and status label to takeover state. */
@@ -1247,9 +1363,33 @@ export class WebBrowserViewer extends Abject {
           );
         } catch { /* widget gone */ }
       }
-      await this.updateUrlLabel();
+      await this.updateAddressField(true);
     }
     await this.refreshScreenshot();
+  }
+
+  /** Bring a page somebody else opened to the front.
+   *
+   *  The viewer exists to show what an agent is browsing and to offer the person
+   *  control of it, so a page an agent opens becomes the selected tab and its
+   *  Take Control button appears in the toolbar where the person will look for
+   *  it. A page the viewer opened itself is the person's own tab, already
+   *  selected, and needs no affordance. A handoff already in progress owns the
+   *  front tab until it settles. */
+  private async focusAgentPage(pageId?: string): Promise<void> {
+    if (!pageId || this.isPersonPage(pageId)) return;
+    const idx = this.pages.findIndex((p) => p.pageId === pageId);
+    if (idx < 0 || idx === this.selectedPageIndex) return;
+    const handoffPage = (this.pendingHandoff as unknown as { pageId?: string } | undefined)?.pageId;
+    if (handoffPage && handoffPage !== pageId) return;
+    this.selectedPageIndex = idx;
+    this.clearInputQueue();
+    await this.applyControlDefault();
+    await this.updateAddressField(true);
+    await this.updateStatusLabel();
+    await this.updateToolbarVisibility();
+    await this.syncTabSelection();
+    this.needsKeyFrame = true;
   }
 
   private async refreshPageList(): Promise<void> {
@@ -1276,6 +1416,7 @@ export class WebBrowserViewer extends Abject {
         const title = p.title || p.url || `Page ${i + 1}`;
         return title.length > 20 ? title.slice(0, 18) + '..' : title;
       });
+      tabLabels.push('+'); // the new-tab affordance; the TabBar draws no × on it
       try {
         await this.request(
           request(this.id, this.tabBarId, 'update', {
@@ -1286,8 +1427,11 @@ export class WebBrowserViewer extends Abject {
       } catch { /* widget gone */ }
     }
 
-    // Update URL label
-    await this.updateUrlLabel();
+    // A tab the person opened is theirs to use at once; an agent's page waits.
+    await this.applyControlDefault();
+
+    // Update the address field
+    await this.updateAddressField();
 
     await this.updateStatusLabel();
 
@@ -1300,12 +1444,14 @@ export class WebBrowserViewer extends Abject {
     let statusText: string;
     // Human control reads in red; a live page feed glows; idle is muted.
     let color: string;
-    if (this.controlMode) {
-      statusText = 'You are in control: mouse and keyboard go to the page';
-      color = this.theme.accent;
-    } else if (this.pages.length === 0) {
+    if (this.pages.length === 0) {
+      // Nothing open, so nothing to drive: the empty viewer says so whatever
+      // the last tab left behind in controlMode.
       statusText = 'No browser pages open';
       color = this.theme.textMeta;
+    } else if (this.controlMode) {
+      statusText = 'You are in control: mouse and keyboard go to the page';
+      color = this.theme.accent;
     } else {
       const fps = Math.max(1, Math.round(1000 / this.framePollMs));
       statusText = `${this.pages.length} page${this.pages.length > 1 ? 's' : ''} open | Live ~${fps} fps`;
@@ -1318,16 +1464,163 @@ export class WebBrowserViewer extends Abject {
     } catch { /* widget gone */ }
   }
 
-  private async updateUrlLabel(): Promise<void> {
-    if (!this.urlLabelId) return;
+  /** Write the selected page's URL into the address field.
+   *
+   *  While the person is editing the field the periodic refresh leaves it alone
+   *  — a frame tick must not overwrite half-typed text. A tab change, a finished
+   *  navigation or an explicit request forces the page's real URL back in, so a
+   *  redirect shows up as where the page actually landed. A fresh page still on
+   *  about:blank shows the placeholder instead of an internal handle. */
+  private async updateAddressField(force = false): Promise<void> {
+    if (!this.addressFieldId) return;
+    if (this.addressDirty && !force) return;
 
     const page = this.pages[this.selectedPageIndex];
-    const urlText = page ? `  ${page.url}` : '';
+    const raw = page ? page.url : '';
+    const text = raw.startsWith('about:blank') ? '' : raw;
     try {
       await this.request(
-        request(this.id, this.urlLabelId, 'update', { text: urlText })
+        request(this.id, this.addressFieldId, 'update', { text })
+      );
+      this.addressDirty = false;
+    } catch { /* widget gone */ }
+  }
+
+  /** Turn what the person typed into a URL: a scheme they typed is kept, a bare
+   *  host gets https, and a loopback host gets http. Empty input navigates
+   *  nowhere. */
+  private normalizeAddress(raw: string): string | undefined {
+    const text = (raw ?? '').trim();
+    if (!text) return undefined;
+    // A real scheme keeps its text. It must be followed by '//' (http, https,
+    // file) or be one of the scheme-only forms — 'localhost:3000' is a host and
+    // a port, not a scheme, and must get http.
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(text)) return text;
+    if (/^(about|data|mailto|blob|file|javascript|view-source):/i.test(text)) return text;
+    if (/^localhost([:/]|$)/i.test(text) || /^\d{1,3}(\.\d{1,3}){3}([:/]|$)/.test(text)) {
+      return `http://${text}`;
+    }
+    return `https://${text}`;
+  }
+
+  /** Navigate the selected page to what was typed in the address field, opening
+   *  a page first when there is none — the address field is the way to start
+   *  browsing from nothing. */
+  private async navigateToAddress(raw: string): Promise<void> {
+    if (!this.webBrowserId) return;
+    const url = this.normalizeAddress(raw);
+    if (!url) return;
+
+    let page = this.pages[this.selectedPageIndex];
+    if (!page) {
+      try {
+        const { pageId } = await this.request<{ pageId: string }>(
+          request(this.id, this.webBrowserId, 'openPage', {})
+        );
+        await this.refreshPageList();
+        const idx = this.pages.findIndex((p) => p.pageId === pageId);
+        if (idx >= 0) this.selectedPageIndex = idx;
+        await this.syncTabSelection();
+        page = this.pages[this.selectedPageIndex];
+      } catch {
+        this.playEffect('shake');
+        return;
+      }
+      if (!page) return;
+    }
+
+    this.addressDirty = false;
+    try {
+      const { url: finalUrl, title } = await this.request<{ url: string; title: string }>(
+        request(this.id, this.webBrowserId, 'viewerNavigateTo', { pageId: page.pageId, url })
+      );
+      page.url = finalUrl;
+      if (title) page.title = title;
+    } catch {
+      this.playEffect('shake');
+    }
+    this.needsKeyFrame = true;
+    await this.refreshPageList();
+    await this.refreshScreenshot();
+  }
+
+  /** Open a page for the person's '+' tab and leave the address field ready to
+   *  type in. The page belongs to the viewer itself, so no agent task finishing
+   *  can take it down. */
+  private async openNewTab(): Promise<void> {
+    if (!this.webBrowserId) return;
+    this.addressDirty = false;
+    try {
+      const { pageId } = await this.request<{ pageId: string }>(
+        request(this.id, this.webBrowserId, 'openPage', {})
+      );
+      await this.refreshPageList();
+      const idx = this.pages.findIndex((p) => p.pageId === pageId);
+      if (idx >= 0) this.selectedPageIndex = idx;
+      await this.syncTabSelection();
+      await this.updateAddressField(true);
+      this.needsKeyFrame = true;
+      await this.refreshScreenshot();
+      await this.focusAddressField();
+    } catch {
+      this.playEffect('shake');
+    }
+  }
+
+  /** Point the tab strip at the selected page (the '+' tab is the last one). */
+  private async syncTabSelection(): Promise<void> {
+    if (!this.tabBarId) return;
+    try {
+      await this.request(
+        request(this.id, this.tabBarId, 'update', { selectedIndex: this.selectedPageIndex })
       );
     } catch { /* widget gone */ }
+  }
+
+  /** Give the address field the keyboard, so the person can type a URL.
+   *
+   *  Focus goes through the window: it routes keydown to its focused child, so
+   *  setting focus on the widget alone draws a caret that no key ever reaches. */
+  private async focusAddressField(): Promise<void> {
+    if (!this.addressFieldId) return;
+    if (this.windowId && this.urlRowId) {
+      try {
+        await this.request(
+          request(this.id, this.windowId, 'focusChild', {
+            widgetId: this.addressFieldId, parentChildId: this.urlRowId, via: 'keyboard',
+          })
+        );
+        return;
+      } catch { /* window gone: fall back to the widget */ }
+    }
+    try {
+      await this.request(
+        request(this.id, this.addressFieldId, 'setFocused', { focused: true, via: 'keyboard' })
+      );
+    } catch { /* widget gone */ }
+  }
+
+  /** Take the keyboard away from the address field, so keys reach the page. */
+  private async blurAddressField(): Promise<void> {
+    if (!this.addressFieldId) return;
+    try {
+      await this.request(
+        request(this.id, this.addressFieldId, 'setFocused', { focused: false })
+      );
+    } catch { /* widget gone */ }
+  }
+
+  /** Give the keyboard to the page's canvas, which is what routes keystrokes into
+   *  the page during takeover. The window unfocuses whatever held it before. */
+  private async focusCanvas(): Promise<void> {
+    if (!this.windowId || !this.canvasId || !this.rootLayoutId) return;
+    try {
+      await this.request(
+        request(this.id, this.windowId, 'focusChild', {
+          widgetId: this.canvasId, parentChildId: this.rootLayoutId, via: 'mouse',
+        })
+      );
+    } catch { /* window gone */ }
   }
 
   private async refreshScreenshot(): Promise<void> {
@@ -1392,7 +1685,7 @@ export class WebBrowserViewer extends Abject {
       if (reply.url && reply.url !== page.url) {
         page.url = reply.url;
         if (reply.title) page.title = reply.title;
-        await this.updateUrlLabel();
+        await this.updateAddressField();
       }
       this.lastFrameSeq = reply.seq;
 
@@ -1492,11 +1785,15 @@ export class WebBrowserViewer extends Abject {
       this.lastDrawControlMode = this.controlMode;
       this.needsKeyFrame = false;
     } catch {
-      // The frame request failed. If a frame is already on screen, keep it — a
-      // transient failure (page mid-navigation) must not flash a placeholder.
+      // The frame request or the hand-off to the client failed, and packets
+      // the capability already dequeued for this poll may never have reached
+      // the decoder. Every later delta is predicted from them, so the stream
+      // restarts from a key frame rather than decoding onto a gap.
+      this.needsKeyFrame = true;
+      // If a frame is already on screen, keep it — a transient failure (page
+      // mid-navigation) must not flash a placeholder.
       if (this.lastDrawnSeq !== undefined) return;
       this.lastTransform = undefined;
-      this.needsKeyFrame = true;
       await this.drawPlaceholder('Screenshot unavailable');
     }
   }
@@ -1534,11 +1831,11 @@ export class WebBrowserViewer extends Abject {
           },
           {
             type: 'text',
-            params: { x: cx, y: cy + 24, text: 'Pages that agents browse for you appear here, live.', font: `12px ${body}`, fill: t.textTertiary, align: 'center', baseline: 'middle' },
+            params: { x: cx, y: cy + 24, text: 'Press + above, or type an address and press Enter, to open a page.', font: `12px ${body}`, fill: t.textTertiary, align: 'center', baseline: 'middle' },
           },
           {
             type: 'text',
-            params: { x: cx, y: cy + 42, text: 'Ask in Chat to look something up online, then watch or take control.', font: `12px ${body}`, fill: t.textTertiary, align: 'center', baseline: 'middle' },
+            params: { x: cx, y: cy + 42, text: 'Pages agents browse for you appear here too, live.', font: `12px ${body}`, fill: t.textTertiary, align: 'center', baseline: 'middle' },
           },
         );
       }
