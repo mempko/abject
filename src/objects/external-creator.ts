@@ -33,6 +33,7 @@ import { errorDetails, type PermissionReceipt } from '../core/permission-outcome
 import { encodeAgentState } from '../core/agent-session-codec.js';
 import * as path from 'path';
 import * as os from 'node:os';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, type MessageHandlerFn } from '../core/abject.js';
 import { request, event } from '../core/message.js';
@@ -40,7 +41,7 @@ import { require as precondition, invariant } from '../core/contracts.js';
 import type { AgentAction, AgentActionResult } from './agent-abject.js';
 import { bulkAwareResult, resultEcho } from './agent-abject.js';
 import type { ExternalProject } from './external-project-registry.js';
-import { ALWAYS_PROTECTED } from './external-project-registry.js';
+import { ALWAYS_PROTECTED, autonomyRank } from './external-project-registry.js';
 import type { FileEdit } from '../core/file-edit.js';
 import { Log } from '../core/timed-log.js';
 import { choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
@@ -48,6 +49,11 @@ import { askScopeQuestions, criterion, instruction } from '../core/decision-ques
 import { runtimeFault } from '../core/runtime-fault.js';
 import { plannedStepBudget } from '../core/step-budget.js';
 import { isPrivatePayload, shown } from '../core/privacy.js';
+import { systemMessage, userMessage, type LLMMessage } from '../llm/provider.js';
+import {
+  MAP_LIST_LIMIT, MAP_SYSTEM_PROMPT, cleanMap, entryPointsOf, keyFilesOf, mapDrift, mapUserPrompt,
+  numbered, renderMapSection, renderTree, shapeOf, type ProjectMap,
+} from './project-map.js';
 
 const log = new Log('ExternalCreator');
 
@@ -185,8 +191,9 @@ interface CheckVerdict {
   newFailures: string[];
   /**
    * New failures in files this task did not touch. Several tasks may work in
-   * one checkout at once, so these are reported as concurrent work and never
-   * block this task; the round's review sees the combined state.
+   * one checkout at once, so these may be concurrent work, or a knock-on
+   * effect of this task's change. They block done all the same (gateVerdict)
+   * until they are gone: the gate cannot tell the two apart.
    */
   foreignFailures: string[];
   /** Pre-existing failures still present. Advisory, never blocking. */
@@ -279,6 +286,10 @@ interface TaskExtra {
   lastFailure?: FailureRecord;
   /** A line for the first observation from the project judgment (external.project). */
   projectNote?: string;
+  /** The project map as this task's system prompt shows it (trusted projects only). */
+  projectMapSection?: string;
+  /** A shell command that may have written files ran, so the layout may have changed. */
+  shellMayHaveWritten?: boolean;
   /** The runtime ran verification itself once for this task (external.auto-verify). */
   autoVerified?: boolean;
   /**
@@ -297,6 +308,8 @@ export class ExternalCreator extends Abject {
   private goalManagerId?: AbjectId;
   private jobManagerId?: AbjectId;
   private verificationRuns = new Map<string, Promise<CheckOutcome>>();
+  /** Maps being written, by project, so two tasks starting together write one. */
+  private mapWrites = new Map<string, Promise<ProjectMap | undefined>>();
 
   private readonly operationTask = new AsyncLocalStorage<string>();
   private taskExtras = new Map<string, TaskExtra>();
@@ -749,13 +762,19 @@ clean result I did not observe.`;
     args: string,
     cwd?: string,
     timeoutMs = 60_000,
+    env?: Record<string, string>,
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const shellId = await this.shell();
     return this.call<{ stdout: string; stderr: string; exitCode: number }>(
       shellId, 'exec',
-      { command: `git ${args}`, taskId: extra.taskId, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs, untrusted: this.isUntrusted(extra) },
+      { command: `git ${args}`, taskId: extra.taskId, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs, untrusted: this.isUntrusted(extra), ...(env ? { env } : {}) },
       timeoutMs + 15_000,
     );
+  }
+
+  /** A string as one single-quoted shell word. */
+  private static shellWord(s: string): string {
+    return `'${s.replace(/'/g, `'\\''`)}'`;
   }
 
   /**
@@ -778,26 +797,124 @@ clean result I did not observe.`;
     }
   }
 
+  /** New files a checkpoint carries at most, their total size, and the largest one it takes. */
+  private static readonly CHECKPOINT_NEW_FILES = 300;
+  private static readonly CHECKPOINT_NEW_BYTES = 20 * 1024 * 1024;
+  private static readonly CHECKPOINT_FILE_BYTES = 5 * 1024 * 1024;
+  /** Who a checkpoint commit names, so one is made where git has no identity configured. */
+  private static readonly CHECKPOINT_IDENTITY = {
+    GIT_AUTHOR_NAME: 'Abjects checkpoint', GIT_AUTHOR_EMAIL: 'checkpoint@abjects.invalid',
+    GIT_COMMITTER_NAME: 'Abjects checkpoint', GIT_COMMITTER_EMAIL: 'checkpoint@abjects.invalid',
+  };
+
   /**
-   * A restorable snapshot that does NOT disturb the working tree.
+   * A restorable snapshot of the working tree that does NOT disturb it.
    *
-   * `git stash create` builds the stash commit and prints its sha without
-   * touching the index, the tree, or the stash list — so a checkpoint costs
-   * the user nothing and can be taken as often as is useful. An empty result
-   * means there was nothing to snapshot, which is not a failure.
+   * The snapshot is a commit no ref points at, so it costs the user nothing
+   * and can be taken as often as is useful: the tree, the index and the stash
+   * list are left alone. It holds tracked changes and new (untracked, not
+   * ignored) files alike, because a task's new files are as much its work as
+   * its edits. `git restore --source=<ref> --worktree -- .` puts the files back.
+   * Nothing to snapshot (a clean tree) is not a failure.
    */
   private async checkpoint(extra: TaskExtra, note: string): Promise<void> {
     if (extra.project?.vcs !== 'git') return;
     try {
-      const r = await this.git(extra, 'stash create');
-      const ref = r.stdout.trim();
-      if (r.exitCode === 0 && ref) {
-        extra.checkpoints.push({ ref, at: Date.now(), note });
-        this.audit(extra, `checkpoint ${ref.slice(0, 10)} (${note})`);
+      const snap = await this.snapshotCommit(extra, note);
+      if (snap) {
+        extra.checkpoints.push({ ref: snap.ref, at: Date.now(), note });
+        this.audit(extra, `checkpoint ${snap.ref.slice(0, 10)} (${note})${snap.left ? `; ${snap.left}` : ''}`);
       }
     } catch (err) {
       log.warn(`checkpoint failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * Build the checkpoint commit.
+   *
+   * `git stash create` captures tracked changes without touching anything,
+   * but it cannot take new files. When there are any, they are added on top
+   * of that stash's tree in a scratch index outside the repository
+   * (GIT_INDEX_FILE), and the result is committed with HEAD as its parent.
+   * The real index is never read for this, so staged work stays as it is.
+   */
+  private async snapshotCommit(extra: TaskExtra, note: string): Promise<{ ref: string; left?: string } | undefined> {
+    const env = ExternalCreator.CHECKPOINT_IDENTITY;
+    const stash = await this.git(extra, 'stash create', undefined, 60_000, env);
+    const tracked = stash.exitCode === 0 ? stash.stdout.trim() : '';
+    // Adding new files takes four more git commands. Where each would be put
+    // to the person (an untrusted project, or one below "edit"), the
+    // checkpoint stays with what stash create took.
+    const project = extra.project!;
+    if (!project.trusted || autonomyRank(project.autonomy) < autonomyRank('edit')) {
+      return tracked ? { ref: tracked } : undefined;
+    }
+    const fresh = await this.newFilesForCheckpoint(extra);
+    if (fresh.files.length === 0) return tracked ? { ref: tracked, left: fresh.left } : undefined;
+
+    const head = await this.gitHead(extra);
+    const scratch = await mkdtemp(path.join(os.tmpdir(), 'abjects-checkpoint-'));
+    try {
+      const indexEnv = { ...env, GIT_INDEX_FILE: path.join(scratch, 'index') };
+      const list = path.join(scratch, 'paths');
+      await writeFile(list, fresh.files.join('\0') + '\0');
+      const base = tracked || head;
+      if (base) {
+        const r = await this.git(extra, `read-tree ${base}`, undefined, 60_000, indexEnv);
+        if (r.exitCode !== 0) throw new Error(`read-tree: ${r.stderr.trim()}`);
+      }
+      const added = await this.git(extra, `add --pathspec-from-file=${ExternalCreator.shellWord(list)} --pathspec-file-nul`, undefined, 120_000, indexEnv);
+      if (added.exitCode !== 0) throw new Error(`add: ${added.stderr.trim()}`);
+      const tree = await this.git(extra, 'write-tree', undefined, 60_000, indexEnv);
+      if (tree.exitCode !== 0 || !tree.stdout.trim()) throw new Error(`write-tree: ${tree.stderr.trim()}`);
+      const message = ExternalCreator.shellWord(`abjects checkpoint: ${note}`);
+      const commit = await this.git(extra,
+        `commit-tree ${tree.stdout.trim()}${head ? ` -p ${head}` : ''} -m ${message}`, undefined, 60_000, env);
+      if (commit.exitCode !== 0 || !commit.stdout.trim()) throw new Error(`commit-tree: ${commit.stderr.trim()}`);
+      return { ref: commit.stdout.trim(), left: fresh.left };
+    } catch (err) {
+      // The tracked half is still worth keeping when the new files could not be added.
+      const why = err instanceof Error ? err.message : String(err);
+      log.warn(`checkpoint could not include new files: ${why}`);
+      return tracked ? { ref: tracked, left: `new files not included (${why.slice(0, 120)})` } : undefined;
+    } finally {
+      await rm(scratch, { recursive: true, force: true }).catch(() => { /* the OS clears its temp dir */ });
+    }
+  }
+
+  /**
+   * The new files a checkpoint takes: untracked and not ignored, files this
+   * task wrote first, within a count and size budget so a stray dataset or
+   * build output beside the work does not turn every checkpoint into a copy
+   * of it. `left` says what was skipped.
+   */
+  private async newFilesForCheckpoint(extra: TaskExtra): Promise<{ files: string[]; left?: string }> {
+    const listed = await this.git(extra, 'ls-files --others --exclude-standard -z');
+    if (listed.exitCode !== 0) return { files: [] };
+    const all = listed.stdout.split('\0').filter(Boolean);
+    if (all.length === 0) return { files: [] };
+    const root = extra.workRoot!;
+    const ours = new Set([...extra.filesModified].map(abs => path.relative(root, abs).split(path.sep).join('/')));
+    const ordered = [...all.filter(f => ours.has(f)), ...all.filter(f => !ours.has(f)).sort()];
+
+    const fs = await this.hostFs();
+    const files: string[] = [];
+    let bytes = 0;
+    let skipped = 0;
+    for (const rel of ordered) {
+      if (files.length >= ExternalCreator.CHECKPOINT_NEW_FILES) { skipped += 1; continue; }
+      let size: number;
+      try {
+        const st = await this.call<{ size: number; isDirectory: boolean }>(fs, 'stat', { path: path.join(root, rel) }, 15_000);
+        if (st.isDirectory) continue;
+        size = st.size;
+      } catch { skipped += 1; continue; }
+      if (size > ExternalCreator.CHECKPOINT_FILE_BYTES || bytes + size > ExternalCreator.CHECKPOINT_NEW_BYTES) { skipped += 1; continue; }
+      files.push(rel);
+      bytes += size;
+    }
+    return { files, ...(skipped > 0 ? { left: `${skipped} new file(s) left out of the checkpoint (over its size or count budget)` } : {}) };
   }
 
   private audit(extra: TaskExtra, line: string): void {
@@ -1451,6 +1568,153 @@ clean result I did not observe.`;
     return this.afterMutation(extra, action, summary, abs);
   }
 
+  // ─── Project map ────────────────────────────────────────────────
+  //
+  // A project map is a cited orientation guide to a project (project-map.ts),
+  // kept by ExternalProjectRegistry with the project's other data. This agent
+  // writes it: at a task's start when the project has none, and again when the
+  // project's layout has moved away from the one the map was written from,
+  // checked at task start and after any task that may have changed files.
+  // Trusted projects only: the map is written from the project's own files
+  // and rides in the system prompt, the same standing as its instruction
+  // files, which an untrusted project does not get either.
+
+  /** How long a task waits at its start for a first map to be written. */
+  private static readonly MAP_WAIT_MS = 150_000;
+  /** Excerpt text the map writer reads at most, across all key files. */
+  private static readonly MAP_EXCERPT_CHARS = 60_000;
+
+  /** Every file under a root that its ignore rules keep, root-relative. */
+  private async projectFiles(root: string): Promise<string[]> {
+    const fs = await this.hostFs();
+    const r = await this.call<{ files: string[]; truncated: boolean }>(
+      fs, 'glob', { pattern: '**', cwd: root, limit: MAP_LIST_LIMIT }, 180_000);
+    return r.files
+      .map(f => path.relative(root, f).split(path.sep).join('/'))
+      .filter(f => f !== '' && !f.startsWith('..'));
+  }
+
+  /**
+   * Give this task the project's map, writing one first when there is none.
+   * A map that has drifted is still shown, with a line saying so, while a
+   * fresh one is written in the background for later tasks. Never fails the
+   * task: a project without a map is where every task started before.
+   */
+  private async prepareProjectMap(extra: TaskExtra): Promise<void> {
+    const project = extra.project;
+    const reg = await this.projects();
+    if (!project?.trusted || !reg) return;
+    try {
+      const stored = await this.call<ProjectMap | null>(reg, 'getProjectMap', { name: project.name }, 15_000);
+      const files = await this.projectFiles(project.root);
+      if (stored) {
+        const drift = mapDrift(stored, { fileCount: files.length, shape: shapeOf(files) });
+        extra.projectMapSection = renderMapSection(stored, drift.stale ? drift.reason : undefined);
+        if (drift.stale) {
+          this.audit(extra, `project map is out of date (${drift.reason}); writing a fresh one in the background`);
+          void this.writeProjectMap(extra, project, files);
+        }
+        return;
+      }
+      if (files.length === 0) return;
+      this.audit(extra, `${project.name} has no project map; writing one`);
+      this.reportProgress(extra, 'planning', `mapping ${project.name}`);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waited = new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), ExternalCreator.MAP_WAIT_MS); });
+      const written = await Promise.race([this.writeProjectMap(extra, project, files), waited]);
+      clearTimeout(timer);
+      if (written) extra.projectMapSection = renderMapSection(written);
+      else this.audit(extra, 'the project map was not ready in time; this task starts without it');
+    } catch (err) {
+      this.audit(extra, `project map unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** After a task: rewrite the map when the layout has moved away from it (or there is none yet). */
+  private async refreshProjectMap(extra: TaskExtra, project: ExternalProject): Promise<void> {
+    const reg = await this.projects();
+    if (!project.trusted || !reg) return;
+    try {
+      const stored = await this.call<ProjectMap | null>(reg, 'getProjectMap', { name: project.name }, 15_000);
+      const files = await this.projectFiles(project.root);
+      const drift = stored ? mapDrift(stored, { fileCount: files.length, shape: shapeOf(files) }) : { stale: true, reason: 'no map yet' };
+      if (!drift.stale || files.length === 0) return;
+      log.info(`[${extra.taskId.slice(0, 8)}] rewriting the map for ${project.name}: ${drift.reason}`);
+      await this.writeProjectMap(extra, project, files);
+    } catch (err) {
+      log.warn(`map refresh for ${project.name} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Write and store a project's map; a write already under way for the project is shared. */
+  private writeProjectMap(extra: TaskExtra, project: ExternalProject, files: string[]): Promise<ProjectMap | undefined> {
+    const running = this.mapWrites.get(project.name);
+    if (running) return running;
+    // Private work leaves nothing behind, and a stored map would be something.
+    if (extra.private) return Promise.resolve(undefined);
+    const writing = this.composeProjectMap(extra, project, files)
+      .catch((err: unknown) => {
+        log.warn(`writing the map for ${project.name} failed: ${err instanceof Error ? err.message : String(err)}`);
+        return undefined;
+      })
+      .finally(() => this.mapWrites.delete(project.name));
+    this.mapWrites.set(project.name, writing);
+    return writing;
+  }
+
+  /**
+   * Read the project's layout and key files, have the LLM write the map from
+   * them, and store it with the registry. The key files are read from the
+   * project root (the person's checkout), the same tree the layout comes from.
+   */
+  private async composeProjectMap(extra: TaskExtra, project: ExternalProject, files: string[]): Promise<ProjectMap | undefined> {
+    const reg = await this.projects();
+    const llm = await this.discoverDep('LLM');
+    if (!reg || !llm) return undefined;
+    const fs = await this.hostFs();
+    const root = project.root;
+    const read = async (rel: string, lines: number) => {
+      try {
+        return await this.call<{ content: string; totalLines: number }>(
+          fs, 'readFile', { path: path.join(root, rel), offset: 1, limit: lines, maxBytes: 24 * 1024 }, 30_000);
+      } catch { return undefined; }
+    };
+
+    const pkg = files.includes('package.json') ? await read('package.json', 2000) : undefined;
+    const keys = keyFilesOf(files, pkg ? entryPointsOf(pkg.content) : []);
+    const excerpts: Array<{ path: string; text: string; totalLines?: number }> = [];
+    let budget = ExternalCreator.MAP_EXCERPT_CHARS;
+    for (const k of keys) {
+      if (budget <= 0) break;
+      const r = await read(k.path, k.lines);
+      if (!r?.content) continue;
+      const text = numbered(r.content).slice(0, budget);
+      budget -= text.length;
+      excerpts.push({ path: k.path, text, totalLines: r.totalLines });
+    }
+
+    const prompt = mapUserPrompt(project, files.length, renderTree(files), excerpts);
+    const reply = await this.request<{ content: string }>(request(this.id, llm, 'complete', {
+      messages: [systemMessage(MAP_SYSTEM_PROMPT), userMessage(prompt)] as LLMMessage[],
+      options: { tier: 'smart', maxTokens: 4096 },
+    }), 300_000);
+    const text = cleanMap(reply?.content ?? '');
+    if (text.length < 200) {
+      log.warn(`the map written for ${project.name} was too short to keep (${text.length} chars)`);
+      return undefined;
+    }
+
+    const shape = shapeOf(files);
+    const stored = await this.call<{ success: boolean; builtAt?: number; error?: string }>(
+      reg, 'setProjectMap', { name: project.name, text, fileCount: files.length, shape, builtBy: extra.taskId }, 30_000);
+    if (!stored.success) {
+      log.warn(`the registry did not keep the map for ${project.name}: ${stored.error}`);
+      return undefined;
+    }
+    this.audit(extra, `wrote the project map for ${project.name} (${text.length} chars from ${excerpts.length} key files)`);
+    return { project: project.name, text, builtAt: stored.builtAt ?? Date.now(), builtBy: extra.taskId, fileCount: files.length, shape };
+  }
+
   // ─── Working beside other tasks ─────────────────────────────────
 
   private async siblings(extra: TaskExtra): Promise<Array<{ taskId: string; goalId?: string; description?: string; files: string[]; startedAt: number }>> {
@@ -1785,6 +2049,7 @@ clean result I did not observe.`;
     }
 
     this.reportProgress(extra, 'acting', command.slice(0, 80));
+    if (!ExternalCreator.isReadOnlyCommand(command)) extra.shellMayHaveWritten = true;
     const before = await this.verificationSnapshot(extra);
     let r: { stdout: string; stderr: string; exitCode: number; truncated?: unknown; outputObjectId?: AbjectId };
     try { r = await this.runCommand(extra, command, timeout, cwd); }
@@ -2454,7 +2719,7 @@ clean result I did not observe.`;
       ``,
       `## Critical Context`,
       extra.checkpoints.length > 0
-        ? `- Checkpoints (restore with \`git stash apply <ref>\`): ${extra.checkpoints.map(c => c.ref.slice(0, 10)).join(', ')}`
+        ? `- Checkpoints (restore files with \`git restore --source=<ref> --worktree -- .\`): ${extra.checkpoints.map(c => c.ref.slice(0, 10)).join(', ')}`
         : `- No checkpoints (project is not a git checkout)`,
       extra.baseline ? `- ${this.baselineSummary(extra)}` : '',
       ``,
@@ -2722,6 +2987,7 @@ clean result I did not observe.`;
           await this.captureBaseline(extra);
           await this.checkpoint(extra, 'task start');
           this.announceTaskStarted(extra);
+          await this.prepareProjectMap(extra);
         } catch (err) {
           // A project that cannot be prepared (root gone, snapshot failing)
           // is a fact about that project, not about the task. The loop starts
@@ -2793,6 +3059,10 @@ clean result I did not observe.`;
       return { success: false, error: message };
     } finally {
       this.announceTaskFinished(extra);
+      // A task that changed files may have moved the layout the map describes.
+      if (extra.project && (extra.filesModified.size > 0 || extra.shellMayHaveWritten)) {
+        void this.refreshProjectMap(extra, extra.project);
+      }
       try { await this.teardownIsolation(extra); } catch { /* leave the worktree in place */ }
       // Permissions granted "for this task" end with the task. They also time
       // out on their own, but a task that finishes should not leave a standing
@@ -2832,7 +3102,7 @@ clean result I did not observe.`;
       extra.lastVerify ? this.renderVerdict(extra.lastVerify)
         : extra.lastCheck ? this.renderVerdict(extra.lastCheck) : '',
       extra.checkpoints.length > 0
-        ? `Checkpoints: ${extra.checkpoints.map(c => c.ref.slice(0, 10)).join(', ')} (restore with \`git stash apply <ref>\`)`
+        ? `Checkpoints: ${extra.checkpoints.map(c => c.ref.slice(0, 10)).join(', ')} (restore files with \`git restore --source=<ref> --worktree -- .\`)`
         : '',
       worktreeNote ?? '',
     ].filter(Boolean).join('\n');
@@ -3207,12 +3477,6 @@ clean result I did not observe.`;
           break;
         }
 
-        case 'ask_user': {
-          const question = String(action.question ?? '');
-          result = { success: true, data: `Asked: ${question}` };
-          break;
-        }
-
         default:
           result = {
             success: false,
@@ -3292,15 +3556,15 @@ Live project configuration and observed results take precedence over historical 
 - {"action":"add_project","root":"~/path/to/dir","name":"<short handle>","description":"..."} — register a directory the user names as a new project, then work in it. Use it when the user asks to add a directory, or gives you one to work in that no registered project covers. The name defaults to the directory's own name.
 - {"action":"call","target":"KnowledgeBase","method":"recall","payload":{}} — message any object in this system.
 - {"action":"reply","text":"..."} — a note to the user mid-task.
-- {"action":"ask_user","question":"..."} — ask, then finish this task with done.
+- {"action":"ask_user","question":"..."} — ask the person; their answer comes back as this action's result and you carry on.
 - {"action":"done","result":"..."} / {"action":"fail","reason":"..."} — terminal.
 
 # How to work
 
-1. **Find before reading.** grep and find cost one step and point at exact lines; reading whole files to look for something costs many.
+1. **Find before reading.** When the project has a map (below, with the project), start from it: it says what lives where. grep and find cost one step and point at exact lines; reading whole files to look for something costs many.
 2. **Write the whole change, then let it be checked.** Put every edit to a file in ONE edit call. Across turns, mark every edit but the last with "more": true to keep the set open, then drop it on the last one.
 3. **Checks run themselves.** When an edit set closes, this project's check command runs automatically and its verdict comes back on that same action. Do not spend a step running it yourself.
-4. **You are judged against a baseline, on the files you wrote.** Failures that existed before you started are not yours and never block you. Failures you introduce in files you wrote do. Other tasks may be working in this project at the same time: your first observation lists them and what they have written, and new diagnostic location alone does not establish which task caused a failure.
+4. **You are judged against a baseline.** Failures that existed before you started are not yours and never block you. Every new failure blocks done, wherever it appears. One in a file you wrote is yours to fix. One only in files you did not write is either a knock-on effect of your change (fix it) or the work of another task in this project at the same time (your first observation lists them and what they have written). Where a diagnostic appears does not by itself say which task caused it. When another task's work is the cause, run verify again once its files have settled; if the failure stays, finish with fail, naming the task and the evidence, so the goal can sort it out.
 5. **Use verification evidence.** Run the declared check after relevant edits; a distinct full verification command must also run when required. Use verify (full: false for check, full: true for verification) to obtain structured results and reuse applicable evidence. force: true requests a fresh run. The exact declared command counts through either verify or bash; shell pipelines and compound commands do not provide individual verification status. Filter output through read_output after execution, not through a pipeline that can mask failure. Read-only commands and commits do not invalidate unchanged project inputs. Evidence reuse covers the declared command and scoped project snapshot within this task; request force: true when toolchain, environment, services, or other untracked inputs changed. Report snapshot limitations honestly; an exit-0 command with limited coverage is not a failed test, and repeating it just to get identical snapshots is unnecessary. If completion still needs correction after one attempt, preserve the work and report the unresolved evidence.
 6. **Say what you did not verify.** When a project declares no commands, there is nothing to run — report exactly what you changed and that it was not verified. Never let silence imply a pass.
 7. **Keep oldText small.** Just enough context to be unique, no padding.
@@ -3350,6 +3614,7 @@ Report in your done result: what changed, which command proved it, and anything 
         parts.push(`<project_instructions path="${c.path}">\n${c.content}\n</project_instructions>`, ``);
       }
     }
+    if (extra.projectMapSection) parts.push(``, extra.projectMapSection);
 
     return parts.join('\n');
   }

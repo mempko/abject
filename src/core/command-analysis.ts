@@ -279,6 +279,8 @@ const PROGRAMS: Record<string, ProgramRule> = {
       restore: 'write', stash: 'write', merge: 'write', rebase: 'write',
       reset: 'write', revert: 'write', 'cherry-pick': 'write', apply: 'write',
       am: 'write', mv: 'write', clean: 'write', worktree: 'write', init: 'write',
+      // Plumbing that writes objects or an index (a scratch one, for a checkpoint).
+      'read-tree': 'write', 'write-tree': 'write', 'commit-tree': 'write',
       push: 'network', pull: 'network', fetch: 'network', clone: 'network',
       submodule: 'network',
     },
