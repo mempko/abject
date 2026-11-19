@@ -245,7 +245,11 @@ export async function replay(source: string, recordings: InvocationRecording[], 
     if (failure) failures.push(failure);
     if (failures.length >= maxFailures) break;
   }
-  return replayResult(judged, failures);
+  const rep = replayResult(judged, failures);
+  if (judged < recordings.length && !past(deadline)) {
+    rep.detail = `${failures.length} contradicted in the first ${judged} recording${judged === 1 ? '' : 's'} replayed, where replay stopped; ${recordings.length - judged} more were not replayed`;
+  }
+  return rep;
 }
 
 function replayResult(judged: number, failures: string[]): ReplayResult {
@@ -334,7 +338,15 @@ export async function evaluate(candidate: { source: string }, evidence: Evidence
     return unjudged(`the live source gave a different answer on a second run for every recording the draft contradicted (${selfDivergent}) — not deterministic`, strength);
   }
   const rep = replayResult(judged, failures);
-  strength.detail = `${usable.length} recording${usable.length === 1 ? '' : 's'} replayed`;
+  // Replay stops at MAX_REPORTED_FAILURES contradictions, so the counts above
+  // cover only what was replayed before it stopped; say so.
+  const replayed = judged + selfDivergent;
+  if (replayed < usable.length) {
+    rep.detail = `${failures.length} contradicted in the first ${replayed} recording${replayed === 1 ? '' : 's'} replayed, where replay stopped; ${usable.length - replayed} more were not replayed`;
+  }
+  strength.detail = replayed < usable.length
+    ? `${replayed} of ${usable.length} recordings replayed`
+    : `${usable.length} recording${usable.length === 1 ? '' : 's'} replayed`;
   return finish(rep.pass, rep, strength);
 }
 

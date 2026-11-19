@@ -2010,7 +2010,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   // moment of deploy — there is no verdict carried between actions and no
   // digest to bind, so nothing can go stale and no path can deadlock
   // (mempko/abject#11 review, 2026-08-26). No evidence, no judge, or a target
-  // that does not exist yet (deploy_spawn) means "unverified", never a refusal.
+  // that does not exist yet (a first deploy_spawn) means "unverified", never a
+  // refusal. A repeat deploy_spawn, once the object exists, is an update of it
+  // and is judged like deploy_update.
 
   /** Refuse the deploy when the staged draft is mechanically broken. Returns the refusal, or undefined to proceed. */
   private gateDeploy(state: LoopState, verb: string): { ok: false; summary: string; error: string } | undefined {
@@ -2339,7 +2341,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     const label = targetLabel ?? name ?? targetId;
     const failures = verdict.replay.failures.slice(0, 3).map(f => `  - ${f}`).join('\n');
     if (intendedChange && intendedChange.trim().length > 0) {
-      return { note: `fitness: contradicted ${verdict.replay.failures.length} of ${verdict.replay.judged} recording${verdict.replay.judged === 1 ? '' : 's'} of ${label}; deployed on stated intent: ${intendedChange.trim()}` };
+      return { note: `fitness: ${label}: ${verdict.replay.detail}; deployed on stated intent: ${intendedChange.trim()}` };
     }
     return {
       note: verdict.summary,
@@ -2350,7 +2352,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           `Replaying ${label}'s recorded invocations against your draft:\n${failures}\n\n` +
           `Each recording is what the live object actually did with those arguments, served the same answers it got then. ` +
           `If the recorded behaviour is what the goal asked you to preserve, fix the draft with edit_source and deploy again. ` +
-          `If changing that behaviour IS the goal, deploy again with {"intendedChange": "<what changes and why>"} — ` +
+          `If changing that behaviour IS the goal, repeat this ${verb} with {"intendedChange": "<what changes and why>"} — ` +
           `the contradiction is then recorded on the result, not hidden.`,
       },
     };
@@ -2527,7 +2529,7 @@ ${source}
     // Already spawned: this is an update of that object. It keeps the act's
     // own fields (intendedChange) and the act's deadline.
     if (state.spawnedObjectId) {
-      return this.opDeployUpdate(state, { ...action, action: 'deploy_update', objectId: state.spawnedObjectId } as AgentAction, call);
+      return this.opDeployUpdate(state, { ...action, action: 'deploy_update', objectId: state.spawnedObjectId } as AgentAction, call, 'deploy_spawn');
     }
     const refusal = this.gateDeploy(state, 'deploy_spawn');
     if (refusal) return refusal;
@@ -2643,18 +2645,19 @@ ${source}
    * agent pivot mid-loop when Chat dispatched the task as a `kind: create`
    * but the goal turned out to be a modify of an existing object.
    */
-  private async opDeployUpdate(state: LoopState, action: AgentAction, call?: ActCall): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+  private async opDeployUpdate(state: LoopState, action: AgentAction, call?: ActCall,
+                               verb: 'deploy_update' | 'deploy_spawn' = 'deploy_update'): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     // Without the request's own deadline (an internal call), count from here.
     const deadline = call?.deadline ?? Date.now() + AGENT_TASK_TIMEOUT_MS - ACT_REPLY_MARGIN_MS;
-    if (!this.registryId) return { ok: false, summary: 'deploy_update: Registry unavailable', error: 'Registry not resolved' };
+    if (!this.registryId) return { ok: false, summary: `${verb}: Registry unavailable`, error: 'Registry not resolved' };
     // A redrafted manifest with the source untouched is a deploy too: it
     // reaches the live object, the Registry, and the snapshot, the same three
     // places a source change does.
     const manifestOnly = !state.draftSource && !!state.draftManifest;
-    if (!state.draftSource && !manifestOnly) return { ok: false, summary: 'deploy_update: nothing drafted', error: 'call draft_source, edit_source, or draft_via_llm({kind: "source"}) first; a manifest-only change needs draft_manifest first' };
+    if (!state.draftSource && !manifestOnly) return { ok: false, summary: `${verb}: nothing drafted`, error: 'call draft_source, edit_source, or draft_via_llm({kind: "source"}) first; a manifest-only change needs draft_manifest first' };
 
     if (!manifestOnly) {
-      const refusal = this.gateDeploy(state, 'deploy_update');
+      const refusal = this.gateDeploy(state, verb);
       if (refusal) return refusal;
     }
 
@@ -2666,12 +2669,12 @@ ${source}
     const explicitName = this.actionField(action, ['targetName', 'targetObjectName', 'target']);
     if (typeof explicitId === 'string' && explicitId.length > 0) {
       const resolved = await this.resolveTarget(explicitId);
-      if (!resolved) return { ok: false, summary: `deploy_update: target not found: ${explicitId}`, error: `Could not resolve target "${explicitId}"` };
+      if (!resolved) return { ok: false, summary: `${verb}: target not found: ${explicitId}`, error: `Could not resolve target "${explicitId}"` };
       targetId = resolved;
       targetLabel = explicitId.includes('-') && explicitId.length > 20 ? undefined : explicitId;
     } else if (typeof explicitName === 'string' && explicitName.length > 0) {
       const resolved = await this.resolveTarget(explicitName);
-      if (!resolved) return { ok: false, summary: `deploy_update: target not found: ${explicitName}`, error: `Could not resolve target "${explicitName}"` };
+      if (!resolved) return { ok: false, summary: `${verb}: target not found: ${explicitName}`, error: `Could not resolve target "${explicitName}"` };
       targetId = resolved;
       targetLabel = explicitName;
     } else if (state.targetObjectId) {
@@ -2691,14 +2694,17 @@ ${source}
     // A draft built on a version that is no longer live is answered with
     // "reload", which no replay verdict should pre-empt, and judging it would
     // spend the judge's budget on a draft that cannot deploy.
-    const conflict = await this.detectSourceConflict(state, targetId);
+    const conflict = await this.detectSourceConflict(state, targetId, verb);
     if (conflict) return conflict;
 
     // The evidential gate, against the target resolved above. It runs OUTSIDE
     // the source lock: a verdict only says something about the base it was
-    // judged against, and the base is checked again under the lock just
-    // before the swap, so holding the lock through a judgment (up to
-    // JUDGE_TIMEOUT_MS) would make a second deploy to the same object wait
+    // judged against, and when the loop has a base (it loaded the target) the
+    // base is checked again under the lock just before the swap. A deploy with
+    // no base (a repeat deploy_spawn, a create loop that pivots by objectId)
+    // has nothing to compare there, as before the judge. Holding the lock
+    // through a judgment (up to JUDGE_TIMEOUT_MS) would make a second deploy
+    // to the same object wait
     // without making either one safer. Judging reads Storage and the Registry
     // and runs the draft on the judge's worker; it touches no live object.
     const intendedChange = this.actionField(action, ['intendedChange']);
@@ -2710,7 +2716,7 @@ ${source}
     const ownTarget = targetId === state.targetObjectId;
     const judged = await this.judgeDraft(draftSource, targetId, targetLabel,
       ownTarget ? state.targetSource : undefined,
-      typeof intendedChange === 'string' ? intendedChange : undefined, 'deploy_update', deadline);
+      typeof intendedChange === 'string' ? intendedChange : undefined, verb, deadline);
     if (judged.refusal) return judged.refusal;
 
     // Everything from here is one write to one object. Two modify loops
@@ -2723,17 +2729,17 @@ ${source}
     return withKeyedLock(`abject-source:${targetId}`, async () => {
       // The judgment can take a while: the source may have changed under it,
       // and the caller may have stopped waiting. Either way, no swap.
-      const changedDuringJudgment = await this.detectSourceConflict(state, targetId!);
+      const changedDuringJudgment = await this.detectSourceConflict(state, targetId!, verb);
       if (changedDuringJudgment) return changedDuringJudgment;
       // A task cancelled mid-judgment does not stop that judgment: it runs to
       // its budget (holding the judge's queue that long), and only here does
       // the deploy learn the task is gone, so nothing is swapped.
       if (call && !call.live()) {
-        return { ok: false, summary: 'deploy_update: not deployed, the task ended while the draft was being judged',
+        return { ok: false, summary: `${verb}: not deployed, the task ended while the draft was being judged`,
           error: 'The task this deploy belonged to was cancelled or finished; the live object is untouched.' };
       }
       if (Date.now() >= deadline) {
-        return { ok: false, summary: 'deploy_update: not deployed, the request timed out before the swap',
+        return { ok: false, summary: `${verb}: not deployed, the request timed out before the swap`,
           error: `The judgment and the wait for the source lock took past the action's deadline, so its caller has stopped waiting. ` +
             `Nothing was deployed: the live object is untouched. Deploy again.` };
       }
@@ -2748,11 +2754,11 @@ ${source}
         60000,
       );
       if (updateRes && updateRes.success === false) {
-        return { ok: false, summary: 'deploy_update: live updateSource refused', error: updateRes.error ?? 'updateSource returned success=false' };
+        return { ok: false, summary: `${verb}: live updateSource refused`, error: updateRes.error ?? 'updateSource returned success=false' };
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return { ok: false, summary: `deploy_update: live updateSource failed: ${msg.slice(0, 120)}`, error: msg };
+      return { ok: false, summary: `${verb}: live updateSource failed: ${msg.slice(0, 120)}`, error: msg };
     }
 
     // The live swap happened. Retain that base even if a later participant fails,
@@ -2840,7 +2846,7 @@ ${source}
 
     return {
       ok: true,
-      summary: `deploy_update: ${targetLabel ?? targetId} updated (${draftSource.split('\n').length} lines)${manifestNote}`,
+      summary: `${verb}: ${targetLabel ?? targetId} updated (${draftSource.split('\n').length} lines)${manifestNote}`,
       data: {
         objectId: targetId,
         fitness: judged.note,
@@ -2869,6 +2875,7 @@ ${source}
   private async detectSourceConflict(
     state: LoopState,
     targetId: AbjectId,
+    verb: 'deploy_update' | 'deploy_spawn' = 'deploy_update',
   ): Promise<{ ok: false; summary: string; error: string } | undefined> {
     // No base means no claim about what this draft was built from: a full
     // authored rewrite, or a create loop that discovered an existing object.
@@ -2890,7 +2897,7 @@ ${source}
 
     return {
       ok: false,
-      summary: 'deploy_update: the object changed underneath this draft',
+      summary: `${verb}: the object changed underneath this draft`,
       error:
         `This object's source has changed since it was loaded, so deploying now would erase ` +
         `whoever made that change. Your draft is based on ${state.targetSource.split('\n').length} ` +
@@ -5439,7 +5446,7 @@ Your local actions are the supported way to create and modify Abjects: they carr
 - \`read_draft({handler?, lineRange?, grep?})\` — read the CURRENT source exactly as it stands. No args → the member outline. \`{handler:"name"}\` → that member's exact text, line-numbered. \`{lineRange:"a-b"}\` / \`{grep:"pattern"}\` → those lines. Read-only: it stages nothing; use it to resolve a concrete uncertainty. Use it to look at a member you are about to rewrite, or one a check named. Read related members as needed to understand the change; avoid repeating an unchanged read without a new question.
 - \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`edit_source\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
 - \`compile()\` / \`validate_calls()\` / \`review_semantics()\` — the checks, available explicitly but **rarely worth a step**: they run on their own (see *Checks run themselves*, below).
-- \`deploy_spawn({ folder?, tags?, loading? })\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint, then keeps it in AbjectStore. The staged drafts are read from loop state; the payload says where it lives: \`folder\` (e.g. "user/recipes", a group named for what it is about), \`tags\` (words for search and filtering), \`loading\` ("boot" to run with the workspace, the default; "needed" to sleep until looked up or shown, right for things shown on demand such as cards).
+- \`deploy_spawn({ folder?, tags?, loading?, intendedChange? })\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint, then keeps it in AbjectStore. The staged drafts are read from loop state; the payload says where it lives: \`folder\` (e.g. "user/recipes", a group named for what it is about), \`tags\` (words for search and filtering), \`loading\` ("boot" to run with the workspace, the default; "needed" to sleep until looked up or shown, right for things shown on demand such as cards). Once the object has been spawned, calling \`deploy_spawn\` again updates it the way \`deploy_update\` does (its \`folder\`, \`tags\` and \`loading\` stay as they were): the staged source is judged against the object's recordings, and \`intendedChange\` works the same way.
 
 ### Placing objects, more of the same, and objects shown inline
 
@@ -5447,7 +5454,7 @@ Your local actions are the supported way to create and modify Abjects: they carr
 - **More of the same is a copy with new data**, not a new kind of thing: \`call("AbjectStore", "copy", { objectId: <the original's typeId>, data: {...}, folder? })\` gives an independent object with the original's code. Each copy is its own object; to change several, change each one (or a folder's worth, listed with \`call("AbjectStore", "list", { folder })\`).
 - **Loading when needed** suits objects shown on demand: they wake when looked up or shown and sleep when idle. An object that must act on its own runs at boot, or is woken by a Scheduler job. An object that loads when needed and declares a \`startup\` method hears it each time it wakes.
 - **Something shown inline** (in a chat, a dialog, pinned to the desktop) is any object that answers \`render({ width, host })\` with \`{ commands, height }\`: draw commands in its own coordinates (0,0 top left), colours as theme names (\`"$accent"\`, \`"$textPrimary"\`, \`"$buttonBg"\`, \`"$divider"\`), fonts naming the theme's faces (\`"600 26px $display"\`, \`"14px $body"\`). \`call(host, "wrapText", { text, font, maxWidth })\` and \`call(host, "measureText", { text, font })\` lay text out. \`handleInput({ type, x, y })\` gets clicks in its own coordinates; \`this.changed("redraw")\` asks for a fresh drawing; \`this.changed("action", { say })\` sends words as the person's (in a chat), \`{ open: typeId }\` opens an object. Show it in a conversation with \`call(<the Chat>, "postCard", { typeId, text })\`.
-- \`deploy_update({objectId?, targetName?, intendedChange?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here. A redrafted manifest with no source change ships the same way: draft_manifest, then deploy_update. Calling Registry.updateManifest yourself updates only the Registry's copy; the object and its snapshot keep the old one and it is lost on restart. Before the swap, the draft is replayed against what the target was recorded doing (its handlers, arguments, outbound calls and results); a draft that contradicts a recording is refused with the exact divergence. If changing that behaviour IS the goal, pass \`intendedChange: "<what changes and why>"\` and the deploy proceeds with the contradiction on record.
+- \`deploy_update({objectId?, targetName?, intendedChange?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here. A redrafted manifest with no source change ships the same way: draft_manifest, then deploy_update. Calling Registry.updateManifest yourself updates only the Registry's copy; the object and its snapshot keep the old one and it is lost on restart. Before the swap, a source change is replayed against what the target was recorded doing (its handlers, arguments, outbound calls and results); a draft that contradicts a recording is refused with the exact divergence. If changing that behaviour IS the goal, pass \`intendedChange: "<what changes and why>"\` and the deploy proceeds with the contradiction on record.
 - \`compose_organism({name, description, organelleNames, interfaceSource?})\` packages EXISTING source-backed objects into ONE Organism: a composite Abject whose organelles (independent internal copies of the named objects) cooperate behind a membrane interface, while external callers see a single object with a single curated surface. The staged drafts define the membrane: \`draft_manifest\` is the organism's public surface and \`draft_source\` (or the explicit \`interfaceSource\`) is the forwarding handler map; when either is missing it is drafted automatically from the organelle manifests. The originals keep running, so remove them afterwards (or tell the user) when the organism replaces them.
 - \`extract_organelle({target, organelleName})\` deploys one organelle of an existing organism as a standalone object, carrying a snapshot of its live data. The organism keeps its internal copy and is never modified. Pass \`organelleName: "__interface__"\` for the membrane itself.
 - \`reply({text})\` — send an intermediate user-visible chat bubble. Loop continues.
@@ -5473,7 +5480,7 @@ Your local actions are the supported way to create and modify Abjects: they carr
 
 **One thing is checked immediately, every time: that what you supplied is a well-formed MEMBER.** Members are addressed by name through the parsed object literal, so a body with unbalanced braces would make every later edit unable to find anything. Such an edit is refused outright — the draft is left untouched and still healthy — and you get the failing line back. Send the FULL member, signature and all, with balanced braces, and this never fires.
 
-**Deploy is the gate.** A draft that does not parse, or that calls a method a dependency does not have, is refused by \`deploy_spawn\` / \`deploy_update\`: the live object is not touched and you get the exact failing line. \`deploy_update\` also replays the target's recorded invocations against your draft and refuses a verified contradiction (see \`intendedChange\` above); with no recordings it says \`unverified\` and proceeds. You cannot ship broken code, so never check defensively "just in case". The semantic reviewer also runs itself at deploy — its findings ride back on the deploy result as advice, and never block.
+**Deploy is the gate.** A draft that does not parse, or that calls a method a dependency does not have, is refused by \`deploy_spawn\` / \`deploy_update\`: the live object is not touched and you get the exact failing line. \`deploy_update\` (and a repeat \`deploy_spawn\`) also replays the target's recorded invocations against your draft and refuses a verified contradiction (see \`intendedChange\` above). When nothing can be judged (no recordings, recordings the live source does not reproduce, no judge, or a judge that times out) it says \`unverified\` on the result and proceeds. You cannot ship broken code, so never check defensively "just in case". The semantic reviewer also runs itself at deploy — its findings ride back on the deploy result as advice, and never block.
 
 # Recipes
 

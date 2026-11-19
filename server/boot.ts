@@ -862,6 +862,8 @@ export async function bootServer(options: BootOptions): Promise<void> {
   // judging generated objects — mempko/abject#11 series). HttpClient finds
   // it through the registry and sends exchanges to it directly.
   await supervisedSpawn('CassetteRecorder', 'permanent', systemTypeId('CassetteRecorder'));
+  // Judges ObjectCreator's drafts against those recordings inside deploy_update
+  // (and a repeat deploy_spawn, which updates the object it spawned).
   await supervisedSpawn('FitnessJudge', 'permanent', systemTypeId('FitnessJudge'));
 
   if (ui) await ui.spawnGlobalUi(ctx);

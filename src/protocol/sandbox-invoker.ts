@@ -358,7 +358,7 @@ class WorkerInvoker {
     }).finally(() => { if (this.conn === conn && conn.pending.size === 0) conn.worker.unref(); });
   }
 
-  /** Release the worker. Idempotent; a later invoke respawns. */
+  /** Release the worker. Idempotent; a disposed invoker refuses later invokes. */
   dispose(): void {
     this.disposed = true;
     const conn = this.conn;

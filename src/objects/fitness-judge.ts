@@ -43,7 +43,7 @@
 import { AbjectId, AbjectMessage, TypeId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
-import { requireNonEmpty } from '../core/contracts.js';
+import { invariant, requireNonEmpty } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 import { evaluate, type Verdict, type InvocationRecording } from '../protocol/fitness.js';
 import { buildSandboxInvoker, type SandboxInvoker } from '../protocol/sandbox-invoker.js';
@@ -111,6 +111,11 @@ export class FitnessJudge extends Abject {
     });
   }
 
+  protected override checkInvariants(): void {
+    super.checkInvariants();
+    invariant(!(this.stopping && this.running), 'a stopped judge runs no worker');
+  }
+
   protected override async onInit(): Promise<void> {
     this.on('judge', async (msg: AbjectMessage) => this.judge(msg.payload as JudgeRequest));
   }
@@ -121,6 +126,7 @@ export class FitnessJudge extends Abject {
     this.stopping = true;
     this.running?.dispose();
     this.running = undefined;
+    this.checkInvariants();
   }
 
   judge(req: JudgeRequest): Promise<Verdict> {
@@ -142,11 +148,14 @@ export class FitnessJudge extends Abject {
     const deadline = req.budgetMs === undefined ? req.deadline
       : Math.min(req.deadline ?? Number.POSITIVE_INFINITY, Date.now() + req.budgetMs);
     const loaded = await this.loadRecordings(req.typeId);
+    // The judge may have stopped while Storage answered: build no worker then.
+    if (this.stopping) return unverified('judgment abandoned: the judge stopped');
     if (typeof loaded === 'string') return unverified(loaded);
     // One worker per judgment: the invoker serialises invocations on its
     // worker, and two judgments must not share one. ~15ms to spawn.
     const invoker = buildSandboxInvoker();
     this.running = invoker;
+    this.checkInvariants();
     // Just past the caller's deadline the worker is stopped, which ends the
     // invocation in flight; evaluate() sees the deadline passed and answers
     // unverified instead of counting that invocation against the draft.
@@ -162,6 +171,7 @@ export class FitnessJudge extends Abject {
       clearTimeout(stop);
       invoker.dispose();
       if (this.running === invoker) this.running = undefined;
+      this.checkInvariants();
     }
   }
 
