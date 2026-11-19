@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.16.11",
+    "date": "2026-11-19",
+    "title": "A desktop that fits its window, and Argon by default",
+    "summary": "This release fixes a Safari display bug that stretched the desktop and sent clicks to the wrong place, makes Kill stop more kinds of model calls, and moves the Antigravity smart and code tiers to Gemini 4 Argon (High), which answered faster in our tests. It also fixes a scheduler bug where a schedule could be saved and then never run.",
+    "highlights": [
+      "The Antigravity (agy) provider now defaults its smart and code tiers to Gemini 4 Argon (High); balanced and fast stay on Flash. In our tests on a large extraction prompt, Argon answered in a median 21 seconds against 74 for Flash High and used far fewer reasoning tokens. We have checked that Argon is available on only one Google plan so far.",
+      "If you already saved tier choices, they stay as they are; the new default applies when you pick a model again or re-apply the recommended preset. Retired Gemini Pro model ids still move to Flash, so an older setup keeps working even if your plan lacks Argon.",
+      "Kill now closes a non-streaming call to OpenAI and to the providers built on the same code (OpenRouter, DeepSeek, Grok, Kimi, MiniMax, Meta, PeerLLM) while it waits for the server to start replying. Before, the connection stayed open until the answer arrived or the 300-second timeout ran out, and a timeout was then retried.",
+      "The browser client now redraws the desktop whenever the canvas changes size, not only when the window is resized, and tells the backend the new size so windows and other screen-sized parts of the desktop fit the real screen."
+    ],
+    "fixes": [
+      "Safari (desktop and phone): the desktop could come up stretched, and clicks landed away from what was drawn (a click on a Settings tab, for example, did nothing) until the window was resized. This happened because the page measured itself before its styles loaded.",
+      "The client now uses only one way to follow resizes per browser, and stops watching for resizes when it shuts down, so a window resize sends the backend one message and a closed client stops redrawing.",
+      "Scheduler: a repeat interval sent as text (such as \"60000\") was accepted, listed as enabled, and never ran. Intervals that are text, NaN, Infinity, zero or negative are now refused with an error, so nothing broken is saved.",
+      "Model calls that set a cancel signal still have the 300-second timeout; before, adding a cancel signal removed the timeout. A cancelled call now reports that it was cancelled, not that it timed out."
+    ]
+  },
+  {
     "version": "0.16.10",
     "date": "2026-11-19",
     "title": "Agents that know their way around your projects",
