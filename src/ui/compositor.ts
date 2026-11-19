@@ -880,6 +880,14 @@ export class Compositor {
   /** Optional hook: these surfaces were re-allocated at a new dpr and hold
    *  only their old pixels, scaled; ask the backend to replay their content. */
   onSurfacesReallocated?: (surfaceIds: string[]) => void;
+  /**
+   * The canvas's CSS size changed and was re-measured (ResizeObserver path),
+   * whether or not the window resized: the stylesheet arriving late, or a
+   * container change. The client reports the new size to the backend.
+   */
+  onCanvasResized?: () => void;
+  /** Watches the canvas's own size; disconnected in stop(). */
+  private resizeObserver?: ResizeObserver;
   /** A camera flight in progress (focus, fly out, keyboard pan). */
   private mobileFlight?: { from: MobileCam; to: MobileCam; start: number; duration: number };
   /** A one-finger pan released with speed: the camera glides (screen px/s). */
@@ -965,7 +973,24 @@ export class Compositor {
 
     // Handle resize
     this.handleResize();
-    window.addEventListener('resize', () => this.handleResize());
+    // Follow the canvas's own size, not only the window's: it can change with
+    // no window resize. Safari runs the module entry before a pending
+    // stylesheet applies, so the first measure above sees the unstyled canvas
+    // (300x150 aspect, body margin) and the real size only arrives once the
+    // page's CSS does. A window resize resizes the canvas too, so the observer
+    // covers that case as well; the window listener is only the fallback where
+    // ResizeObserver is missing. A dpr change keeps the CSS size and is
+    // watched separately (watchDevicePixelRatio).
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => {
+        const before = [this.renderer.cssWidth, this.renderer.cssHeight];
+        this.handleResize();
+        if (this.renderer.cssWidth !== before[0] || this.renderer.cssHeight !== before[1]) this.onCanvasResized?.();
+      });
+      this.resizeObserver.observe(this.canvas);
+    } else {
+      window.addEventListener('resize', () => this.handleResize());
+    }
     this.watchDevicePixelRatio();
 
     // Start render loop
@@ -3157,6 +3182,9 @@ export class Compositor {
    * Stop the render loop.
    */
   stop(): void {
+    // No re-measure may reach the renderer once it is disposed below.
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = undefined;
     if (this.animationFrameId !== undefined) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = undefined;
