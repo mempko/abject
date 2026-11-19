@@ -31,7 +31,7 @@ import { bulkAwareResult, type AgentAction, type AgentActionResult } from './age
 import { buildOrganismManifest } from './organism.js';
 import type { OrganismSpec, OrganelleSpec } from './organism.js';
 import { Log } from '../core/timed-log.js';
-import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
+import { applyDiff, parseSearchReplaceBlocks, levenshtein, type SearchReplaceBlock } from './source-diff.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
 import { choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
 import { criterion, instruction } from '../core/decision-questions.js';
@@ -774,7 +774,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   private actionField(action: AgentAction, keys: string[]): unknown {
     // `payload`/`args` are included because the `call` action nests its fields
     // under `payload`, and models carry that habit to local actions — emitting
-    // e.g. {"action":"draft_diff","payload":{"blocks":"..."}}. Reading the
+    // e.g. {"action":"edit_source","payload":{"edits":[...]}}. Reading the
     // wrapper here lets those flat-vs-nested variants both resolve.
     const envelopes = [action, action.payload, action.params, action.arguments, action.args, action.input]
       .filter((e): e is Record<string, unknown> => !!e && typeof e === 'object');
@@ -789,12 +789,24 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   /** Valid action verbs this loop dispatches, for unknown-action recovery. */
   private static readonly VALID_ACTIONS = [
-    'call', 'draft_manifest', 'draft_source', 'edit_source', 'draft_diff', 'read_draft', 'read_guide',
-    'replace_handler', 'add_handler', 'remove_handler', 'load_target', 'clone_object', 'draft_via_llm',
+    'call', 'draft_manifest', 'draft_source', 'edit_source', 'read_draft', 'read_guide',
+    'load_target', 'clone_object', 'draft_via_llm',
     'compile', 'validate_calls', 'review_semantics', 'deploy_spawn', 'deploy_update',
     'compose_organism', 'extract_organelle',
     'reply', 'ask_user', 'done', 'fail',
   ];
+
+  /**
+   * Edit verbs this loop used to have, each folded into edit_source. A model
+   * (or a recalled pattern) that still reaches for one gets the edit_source
+   * form that does the same thing, and nothing is staged until it uses it.
+   */
+  private static readonly RETIRED_EDIT_VERBS: Record<string, string> = {
+    draft_diff: '{"action":"edit_source","edits":[{"oldText":"<exact text from the source>","newText":"<its replacement>"}]}',
+    replace_handler: '{"action":"edit_source","edits":[{"op":"replace","name":"<member>","body":"<the full member text>"}]}',
+    add_handler: '{"action":"edit_source","edits":[{"op":"add","name":"<member>","body":"<the full member text>"}]}',
+    remove_handler: '{"action":"edit_source","edits":[{"op":"remove","name":"<member>"}]}',
+  };
 
   // ── Staging, and when each check runs ─────────────────────────────────
   //
@@ -811,7 +823,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   //   swapping four methods keeps the file parseable by construction. Only a
   //   genuinely malformed body trips it — which the agent must know at once.
   //   (A draft that is ALREADY broken — a whole-object draft_source with a typo —
-  //   accepts any edit, since draft_diff/draft_source are how it gets repaired.)
+  //   accepts any edit, since text edits and draft_source are how it gets repaired.)
   //
   //   CALL VALIDATION — whole-object, and meaningless on half-written code, so it
   //   WAITS for the edit set to close: while more edits are coming (more actions
@@ -891,7 +903,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         ok: false,
         summary: `${summary} — does not parse`,
         error: `The source is staged but does not parse:\n${this.augmentCompileError(source, syntaxError)}\n\n` +
-          `Until it parses, edits addressed by member NAME cannot locate anything. Repair it with draft_diff (SEARCH/REPLACE works on any text) at the line above, or re-draft the whole object.`,
+          `Until it parses, edits addressed by member NAME cannot locate anything. Repair it with an edit_source text edit ({oldText, newText} works on any text) at the line above, or re-draft the whole object.`,
       };
     }
 
@@ -990,23 +1002,38 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const detail = parsed.parseErrors.length > 0 ? parsed.parseErrors.join('; ') : 'no blocks recognized';
       return { error: `Could not parse any SEARCH/REPLACE blocks. ${detail}. Format: each block is\n<<<<<<< SEARCH\n...\n=======\n...\n>>>>>>> REPLACE` };
     }
-    const result = applyDiff(source, parsed.blocks);
+    return this.applyBlocks(source, parsed.blocks, parsed.parseErrors);
+  }
+
+  /**
+   * One exact-text replacement: \`{ oldText, newText }\`, the shape every
+   * file-editing agent uses. Matched by the same tolerant matcher as SEARCH
+   * blocks, but with no block syntax to get wrong, so text that itself holds
+   * a line of equals signs or angle brackets edits like any other.
+   */
+  private memberText(source: string, oldText: string, newText: string): { source?: string; error?: string; applied?: number } {
+    if (!oldText) return { error: 'oldText must be the exact text to replace, copied from the current source (read_draft shows it).' };
+    return this.applyBlocks(source, [{ search: oldText, replace: newText }], []);
+  }
+
+  private applyBlocks(source: string, blocks: SearchReplaceBlock[], parseErrors: string[]): { source?: string; error?: string; applied?: number; parseErrors?: string[] } {
+    const result = applyDiff(source, blocks);
     if (!result.ok) {
       const errorLines = result.errors.map((e) => {
         let line = `  - ${e.message}`;
         if (e.nearest) {
-          line += `\n    Closest text in source (around line ${e.nearest.line}) — copy this EXACTLY into your SEARCH:\n` +
+          line += `\n    Closest text in source (around line ${e.nearest.line}); copy this EXACTLY as your oldText:\n` +
             e.nearest.text.split('\n').map((l) => `    | ${l}`).join('\n');
         }
         return line;
       }).join('\n');
-      const parseNote = parsed.parseErrors.length > 0 ? `\nParse warnings: ${parsed.parseErrors.join('; ')}` : '';
+      const parseNote = parseErrors.length > 0 ? `\nParse warnings: ${parseErrors.join('; ')}` : '';
       return {
-        error: `${result.applied}/${parsed.blocks.length} blocks applied, ${result.errors.length} failed:\n${errorLines}${parseNote}\n\n` +
-          `Nothing was staged. For a whole method, the robust move is a "replace" edit addressed by NAME — no SEARCH text to match.`,
+        error: `${result.applied}/${blocks.length} text edit(s) applied, ${result.errors.length} failed:\n${errorLines}${parseNote}\n\n` +
+          `Nothing was staged. For a whole method, the robust move is a "replace" edit addressed by NAME, with no text to match.`,
       };
     }
-    return { source: result.source!, applied: parsed.blocks.length, parseErrors: parsed.parseErrors };
+    return { source: result.source!, applied: blocks.length, parseErrors };
   }
 
   /**
@@ -1083,7 +1110,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         ok: false,
         summary: 'edit_source: missing edits',
         error: `This edit_source action carried no edits (its fields: ${carried.join(', ') || 'none'}), so nothing was staged. The edits themselves go in the action, not in your reasoning. ` +
-          'Pass `edits`: an array of { op: "replace" | "add" | "remove", name, body } entries (body is the FULL member text including its signature, e.g. "openMap(msg) { … }"), and/or { op: "diff", blocks: "<<<<<<< SEARCH …" } for a change inside a member. They apply in order.',
+          'Pass `edits`: an array of { op: "replace" | "add" | "remove", name, body } entries (body is the FULL member text including its signature, e.g. "openMap(msg) { … }"), and/or { oldText, newText } for a change inside a member. They apply in order.',
       };
     }
 
@@ -1111,6 +1138,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         if (typeof o[k] === 'string') { body = o[k] as string; break; }
       }
       const blocks = o.blocks ?? o.diff ?? o.patch ?? o.search_replace;
+      const oldText = typeof o.oldText === 'string' ? o.oldText : typeof o.old_string === 'string' ? o.old_string : undefined;
+      const newText = typeof o.newText === 'string' ? o.newText : typeof o.new_string === 'string' ? o.new_string : undefined;
 
       // Infer the op when the model left it off. Deletion is NEVER inferred: it
       // is destructive and unrecoverable, so it must be asked for explicitly.
@@ -1119,8 +1148,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       if (op.startsWith('add_') || op === 'insert' || op === 'create') op = 'add';
       if (op.startsWith('remove_') || op === 'delete') op = 'remove';
       if (op === 'patch' || op === 'draft_diff') op = 'diff';
+      if (op === 'replace_text' || op === 'text' || op === 'edit') op = 'text';
       if (!op) {
-        if (blocks !== undefined) op = 'diff';
+        if (oldText !== undefined) op = 'text';
+        else if (blocks !== undefined) op = 'diff';
         else if (name && body !== undefined) {
           const parsed = this.parseHandlerMembers(work);
           op = parsed?.members.some(m => m.name === name) ? 'replace' : 'add';
@@ -1134,7 +1165,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       }
 
       // A blank body would splice emptiness over the member — a silent deletion
-      // wearing a rewrite's name. Reject it the same way replace_handler does.
+      // wearing a rewrite's name, so it is refused.
       if ((op === 'replace' || op === 'add') && typeof body === 'string' && !body.trim()) {
         failures.push(`edit[${i}] ${op} "${name}": body is empty. Send the FULL member text including its signature; an empty body would erase the member.`);
         continue;
@@ -1154,11 +1185,15 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           if (!name) { failures.push(`edit[${i}] remove: needs {name}`); continue; }
           r = this.memberRemove(work, name);
           break;
+        case 'text':
+          if (oldText === undefined || newText === undefined) { failures.push(`edit[${i}] text: needs {oldText, newText}`); continue; }
+          r = this.memberText(work, oldText, newText);
+          break;
         case 'diff':
           r = this.memberDiff(work, blocks);
           break;
         default:
-          failures.push(`edit[${i}]: unknown op "${op}" — use replace, add, remove, or diff`);
+          failures.push(`edit[${i}]: unknown op "${op}"; use replace, add or remove with a name, or { oldText, newText }`);
           continue;
       }
 
@@ -1167,7 +1202,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         continue;
       }
       work = r.source;
-      applied.push(`${op}${name ? ` ${name}` : ''}`);
+      applied.push(op === 'text' || op === 'diff' ? 'text edit' : `${op}${name ? ` ${name}` : ''}`);
     }
 
     if (failures.length > 0) {
@@ -1240,59 +1275,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return '';
   }
 
-  private async opDraftDiff(state: LoopState, action: AgentAction, batchRemaining: number): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
-    const base = state.draftSource ?? state.targetSource;
-    if (!base) {
-      return {
-        ok: false,
-        summary: 'draft_diff: no base source',
-        error: 'draft_diff requires an existing source to edit. For modify loops the target source is loaded automatically. If you discovered the goal is about an existing object, call load_target({objectId|targetName}) to adopt it and load its source, then edit. For a brand-new object, use draft_source instead.',
-      };
-    }
-
-    const rawBlocks = this.actionField(action, ['blocks', 'diff', 'search_replace', 'searchReplace', 'patch', 'edits']);
-    const r = this.memberDiff(base, rawBlocks);
-    if (r.error !== undefined || r.source === undefined) {
-      return {
-        ok: false,
-        summary: `draft_diff: not applied`,
-        error: `${r.error}\n\nFor a whole method, edit_source({edits:[{op:"replace", name, body}]}) addresses it by NAME — no SEARCH text to match, and every method of the change-set applies in one action.`,
-      };
-    }
-
-    const prevDraft = state.draftSource;
-    state.draftSource = r.source;
-    const stackedNote = base !== state.targetSource ? ' (stacked on prior draft)' : '';
-    // A block the parser could not recognize is a block that did NOT get applied.
-    // Saying "2 blocks applied" without saying "1 was unreadable" reads as total
-    // success, and the missing edit only surfaces as a bug report from the user.
-    const dropped = r.parseErrors ?? [];
-    const droppedNote = dropped.length > 0
-      ? `⚠️ ${dropped.length} block${dropped.length === 1 ? '' : 's'} could NOT be parsed and ${dropped.length === 1 ? 'was' : 'were'} NOT applied: ${dropped.join('; ')}. That edit is MISSING from the draft — re-send ${dropped.length === 1 ? 'it' : 'them'} in valid SEARCH/REPLACE form.`
-      : '';
-    const res = this.finishEdit(
-      state,
-      action,
-      batchRemaining,
-      `draft_diff: ${r.applied} block${r.applied === 1 ? '' : 's'} applied${stackedNote}, source now ${r.source.split('\n').length} lines${dropped.length > 0 ? ` — ⚠️ ${dropped.length} block(s) dropped` : ''}`,
-      // A diff that BREAKS a healthy draft is a mistake and rolls back. A diff on
-      // an already-broken draft is how it gets repaired, so it is always kept.
-      this.parses(base) ? { draft: prevDraft } : undefined,
-    );
-    // The verdict alone would read as total success. The agent sees `data` as its
-    // action result, so the dropped blocks have to land there, not just in the log.
-    if (droppedNote) {
-      res.data = `${droppedNote}\n\n${typeof res.data === 'string' ? res.data : ''}`.trim();
-    }
-    return res;
-  }
-
   // ── Structure-aware editing of the staged handler-map object literal ──────
   //
   // Generated objects are a single `({ name(msg){...}, _helper(){...}, prop: v })`
   // literal, so the natural — and whitespace-proof — edit unit is a top-level
   // member addressed by NAME. These ops parse that literal and replace / add /
-  // remove one member, avoiding the SEARCH-text matching that makes draft_diff
+  // remove one member, avoiding the text matching that makes text edits
   // fragile on large files. read_draft lets the agent edit against ground truth
   // (the current stage) instead of reconstructing it from memory.
 
@@ -1303,7 +1291,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * brace span (objStart = index of `{`, objEnd = index of `}`) plus each
    * top-level member's name and [start, end) source span. Returns null when the
    * source doesn't parse or has no top-level object literal (callers then fall
-   * back to draft_diff / draft_source).
+   * back to text edits / draft_source).
    */
   private parseHandlerMembers(source: string): {
     objStart: number; objEnd: number;
@@ -1450,55 +1438,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   }
 
   /**
-   * Single-member sugar over edit_source. Kept because a one-method change reads
-   * cleanly as one verb; anything larger should go through edit_source so the
-   * whole change-set applies (and checks) in a single action.
-   */
-  private opMemberEdit(
-    state: LoopState,
-    action: AgentAction,
-    batchRemaining: number,
-    verb: 'replace' | 'add' | 'remove',
-  ): { ok: boolean; summary: string; error?: string; data?: unknown } {
-    const label = `${verb}_handler`;
-    const base = state.draftSource ?? state.targetSource;
-    if (!base) return { ok: false, summary: `${label}: no source`, error: 'Nothing staged. Use draft_source for a new object, or load_target to adopt an existing one.' };
-
-    const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
-    if (!name) return { ok: false, summary: `${label}: missing name`, error: `${label} requires {name}.` };
-
-    let body: string | undefined;
-    if (verb !== 'remove') {
-      body = this.actionField(action, ['body', 'source', 'member', 'text', 'code']) as string | undefined;
-      if (typeof body !== 'string' || !body.trim()) {
-        return { ok: false, summary: `${label}: missing body`, error: `${label} requires {body} — the FULL member text including its signature, e.g. "openMap(msg) { ... }".` };
-      }
-    }
-
-    const r = verb === 'replace' ? this.memberReplace(base, name, body!)
-      : verb === 'add' ? this.memberAdd(base, name, body!)
-        : this.memberRemove(base, name);
-
-    if (r.error !== undefined || r.source === undefined) {
-      return { ok: false, summary: `${label}: "${name}" not applied`, error: r.error };
-    }
-
-    const prevDraft = state.draftSource;
-    state.draftSource = r.source;
-    const past = verb === 'replace' ? 'replaced' : verb === 'add' ? 'added' : 'removed';
-    return this.finishEdit(
-      state,
-      action,
-      batchRemaining,
-      `${label}: "${name}" ${past}, source now ${r.source.split('\n').length} lines`,
-      this.parses(base) ? { draft: prevDraft } : undefined,
-    );
-  }
-
-  /**
    * Adopt an existing object as the loop's modify target. Resolves a UUID or
    * registered name, loads its current source into `state.targetSource`, and
-   * pivots the loop to a modify (so `draft_diff` has a base and `deploy_update`
+   * pivots the loop to a modify (so `edit_source` has a base and `deploy_update`
    * has a target). This is how a loop that began as a create — because no
    * target was supplied at dispatch — recovers once it discovers (via ask /
    * describe / discover) that the goal is really about an existing Abject.
@@ -3002,16 +2944,6 @@ ${source}
    * then call `done` after recording the question — the user's reply spawns
    * a new task with the answer in the prompt.
    */
-  private async opAskUser(_state: LoopState, action: AgentAction, callerId?: AbjectId): Promise<{ ok: boolean; summary: string }> {
-    const question = (this.actionField(action, ['question', 'text', 'message']) as string | undefined) ?? '';
-    if (callerId && callerId !== this.id && question) {
-      this.send(event(this.id, callerId, 'agentIntermediateAction', {
-        action: { action: 'reply', text: question },
-      }));
-    }
-    return { ok: true, summary: `ask_user: ${question.slice(0, 120).replace(/\n+/g, ' ')}${question.length > 120 ? '…' : ''}` };
-  }
-
   // ── Drafter / reviewer prompt helpers ─────────────────────────────────
 
   private draftManifestSystemPrompt(): string {
@@ -3906,7 +3838,7 @@ ${source}
     }
 
     // Preload existing source for modify loops so the agent can author
-    // draft_diff blocks without burning a turn on Registry.getSource. Best
+    // its edits without burning a turn on Registry.getSource. Best
     // effort — if this fails (object not yet registered, no source on file),
     // the agent falls back to fetching it explicitly.
     let targetSource: string | undefined;
@@ -4853,9 +4785,6 @@ ${source}
         case 'edit_source':
           res = await this.opEditSource(state, action, batchRemaining);
           break;
-        case 'draft_diff':
-          res = await this.opDraftDiff(state, action, batchRemaining);
-          break;
         case 'read_guide': {
           const guide = state.deps.get(String(action.name ?? action.target ?? ''))?.usageGuide;
           res = guide ? { ok: true, summary: 'Retained Ask answer', data: guide }
@@ -4864,15 +4793,6 @@ ${source}
         }
         case 'read_draft':
           res = this.opReadDraft(state, action);
-          break;
-        case 'replace_handler':
-          res = this.opMemberEdit(state, action, batchRemaining, 'replace');
-          break;
-        case 'add_handler':
-          res = this.opMemberEdit(state, action, batchRemaining, 'add');
-          break;
-        case 'remove_handler':
-          res = this.opMemberEdit(state, action, batchRemaining, 'remove');
           break;
         case 'load_target':
           res = await this.opLoadTarget(state, action);
@@ -4907,17 +4827,18 @@ ${source}
         case 'reply':
           res = await this.opReply(state, action, callerId);
           break;
-        case 'ask_user':
-          res = await this.opAskUser(state, action, callerId);
-          break;
         case 'done':
           res = this.opDone(state, action);
           break;
         case 'fail':
           res = this.opFail(state, action);
           break;
-        default:
-          res = { ok: false, summary: `unknown action: ${action.action}`, error: this.unknownActionError(action.action, state) };
+        default: {
+          const replacement = ObjectCreator.RETIRED_EDIT_VERBS[action.action];
+          res = replacement
+            ? { ok: false, summary: `${action.action}: folded into edit_source`, error: `"${action.action}" is now part of edit_source; nothing was staged. Send the same change as:\n${replacement}\nSeveral changes go in one edits array.` }
+            : { ok: false, summary: `unknown action: ${action.action}`, error: this.unknownActionError(action.action, state) };
+        }
       }
     } catch (err) {
       res = { ok: false, summary: 'action threw', error: err instanceof Error ? err.message : String(err) };
@@ -5161,10 +5082,13 @@ ${source}
    * AgentAbject invokes this through candidateComplete before settlement.
    * A rejected candidate returns to the same execution conversation. Two things
    * are refused: staged source that never shipped, and a deploy nothing has
-   * exercised since. A diagnostic loop authors nothing and passes.
+   * exercised since. A diagnostic loop that authors nothing passes; one that
+   * deployed a change after all is held to the same rule as a modify, since
+   * the live object changed either way. A draft it never deployed is a sketch
+   * in the report and passes.
    */
   private gateVerdict(state: LoopState): { ok: boolean; reason?: string; note: string } {
-    if (state.kind === 'investigate' || !state.draftSource) {
+    if (!state.draftSource || (state.kind === 'investigate' && state.lastDeployedSource === undefined)) {
       return { ok: true, note: 'nothing was authored; the result is a report.' };
     }
     if (state.draftSource !== state.lastDeployedSource) {
@@ -5299,25 +5223,13 @@ Your local actions are the supported way to create and modify Abjects: they carr
 - \`clone_object({objectId?, targetName?, newName, description?, withData?})\` — clone an EXISTING source-backed object into a NEW one ENTIRELY server-side: resolves the original, copies its manifest + source renamed to \`newName\`, spawns it with you as owner in this workspace's registry, persists it, and adopts the clone as this loop's modify target. No source passes through your context, so this is THE way to build "a new object based on that one" (a shorter variant of an existing deck, a themed copy of an app) even when the original is far too large to draft. Then inspect with \`read_draft\`, change with \`edit_source\`, ship with \`deploy_update\`. \`withData: true\` also deep-copies the original's data (default: the clone starts with fresh data). For authoring from scratch, use \`draft_source\` + \`deploy_spawn\` instead.
 - \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Shape: \`{ name, description, version, icon, interface: { id, name, description, methods, events? }, tags: [] }\`. \`methods\` and \`events\` are arrays of OBJECTS, never bare name strings: each method is \`{ name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns? }\` and each event is \`{ name, description, payload }\`. Emitting a plain string like \`"show"\` leaves the method nameless in the Explorer — always use the object form. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
 - \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for NEW objects (create flow) or a genuine full rewrite. When MODIFYING an existing object, use \`edit_source\` — re-emitting a large whole-object source in one action risks being truncated by the output-length limit (the source silently gets dropped and the action fails with "missing source").
-- \`edit_source({edits, more?})\` — **the way to change an existing object.** Apply a whole change-set in ONE action: \`edits\` is an array applied in order, where each entry is
-  - \`{ op: "replace", name, body }\` — swap the entire top-level member \`name\` for \`body\` (the FULL member text including its signature, e.g. \`"openMap(msg) { … }"\`). Addressed by name through the object literal's structure: no SEARCH text to match, whitespace-proof, unaffected by file size.
+- \`edit_source({edits, more?})\` — **the way to change an existing object.** Apply a whole change-set in ONE action: \`edits\` is an array applied in order, where each entry is one of
+  - \`{ op: "replace", name, body }\` — swap the entire top-level member \`name\` for \`body\` (the FULL member text including its signature, e.g. \`"openMap(msg) { … }"\`). Addressed by name through the object literal's structure: no text to match, whitespace-proof, unaffected by file size.
   - \`{ op: "add", name, body }\` — insert a new member.
   - \`{ op: "remove", name }\` — delete a member.
-  - \`{ op: "diff", blocks }\` — a SEARCH/REPLACE edit *inside* a member, for a change too small to justify rewriting the whole method.
+  - \`{ oldText, newText }\` — replace one exact span of text, for a change too small to justify rewriting the whole member. \`oldText\` is copied from the current source (read_draft shows it) and must match one place only: include a line or two of surrounding context when a snippet occurs more than once.
 
-  Rewriting four methods is ONE \`edit_source\` with four edits, not four actions. The set is all-or-nothing: if any edit fails to find its target, nothing is staged and every failure is reported together, so the draft is never left half-changed.
-- \`draft_diff({blocks})\` — SEARCH/REPLACE blocks against the current source, when you want one surgical span and nothing else. Each block:
-
-  \`\`\`
-  <<<<<<< SEARCH
-  exact lines from the current source, including indentation
-  =======
-  the replacement lines
-  >>>>>>> REPLACE
-  \`\`\`
-
-  SEARCH must match a UNIQUE location — include 2–3 lines of surrounding context if a snippet would otherwise match in more than one place. For a whole method, an \`edit_source\` \`replace\` is more robust (nothing to match).
-- \`replace_handler({name, body})\` / \`add_handler({name, body})\` / \`remove_handler({name})\` — single-member sugar for the corresponding \`edit_source\` op. Use them for a one-method change; use \`edit_source\` the moment there is more than one.
+  Rewriting four methods is ONE \`edit_source\` with four edits, not four actions, and a one-line fix is one entry. The set is all-or-nothing: if any edit fails to find its target, nothing is staged and every failure is reported together, so the draft is never left half-changed.
 - \`read_guide({name})\` — retrieve the retained Ask answers for a collaborator, even after conversation compaction. Ask again when assumptions or capabilities change.
 - \`read_draft({handler?, lineRange?, grep?})\` — read the CURRENT source exactly as it stands. No args → the member outline. \`{handler:"name"}\` → that member's exact text, line-numbered. \`{lineRange:"a-b"}\` / \`{grep:"pattern"}\` → those lines. Read-only: it stages nothing; use it to resolve a concrete uncertainty. Use it to look at a member you are about to rewrite, or one a check named. Read related members as needed to understand the change; avoid repeating an unchanged read without a new question.
 - \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`edit_source\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
@@ -5334,7 +5246,7 @@ Your local actions are the supported way to create and modify Abjects: they carr
 - \`compose_organism({name, description, organelleNames, interfaceSource?})\` packages EXISTING source-backed objects into ONE Organism: a composite Abject whose organelles (independent internal copies of the named objects) cooperate behind a membrane interface, while external callers see a single object with a single curated surface. The staged drafts define the membrane: \`draft_manifest\` is the organism's public surface and \`draft_source\` (or the explicit \`interfaceSource\`) is the forwarding handler map; when either is missing it is drafted automatically from the organelle manifests. The originals keep running, so remove them afterwards (or tell the user) when the organism replaces them.
 - \`extract_organelle({target, organelleName})\` deploys one organelle of an existing organism as a standalone object, carrying a snapshot of its live data. The organism keeps its internal copy and is never modified. Pass \`organelleName: "__interface__"\` for the membrane itself.
 - \`reply({text})\` — send an intermediate user-visible chat bubble. Loop continues.
-- \`ask_user({question, assumptions?})\` — surface a clarifying question. The user's answer arrives as a new task with the answer in the prompt; finish the current loop with \`done\` after this.
+- \`ask_user({question, assumptions?})\` — ask the person a clarifying question. Their answer comes back as this action's result, and the loop carries on from there.
 
 ## Terminals
 
@@ -5351,7 +5263,7 @@ Your local actions are the supported way to create and modify Abjects: they carr
 - When it does not fit in one response, split it across turns and mark every edit but the last with \`"more": true\`. That keeps the edit set OPEN, so the whole-object call check waits until you are done instead of judging a half-written object. Drop \`"more"\` on your final edit and it runs, once.
 
 \`\`\`json
-{ "action": "replace_handler", "name": "_draw", "body": "_draw(msg) { … }", "more": true }
+{ "action": "edit_source", "edits": [{ "op": "replace", "name": "_draw", "body": "_draw(msg) { … }" }], "more": true }
 \`\`\`
 
 **One thing is checked immediately, every time: that what you supplied is a well-formed MEMBER.** Members are addressed by name through the parsed object literal, so a body with unbalanced braces would make every later edit unable to find anything. Such an edit is refused outright — the draft is left untouched and still healthy — and you get the failing line back. Send the FULL member, signature and all, with balanced braces, and this never fires.
