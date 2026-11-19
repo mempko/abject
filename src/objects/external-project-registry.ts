@@ -10,7 +10,9 @@
  *
  * What this object stores about a project is deliberately thin: a name, a root,
  * a description, and optional commands the project declares about itself. It
- * runs none of them and interprets none of them; ExternalCreator does that. A
+ * runs none of them and interprets none of them; ExternalCreator does that.
+ * It also keeps each project's map (project-map.ts), which ExternalCreator
+ * writes and every task in the project reads. A
  * TypeScript service declares a typecheck and a test run; a manuscript may
  * declare only a prose linter; a folder of notes declares nothing and is still
  * a first-class project.
@@ -38,6 +40,7 @@ import {
   UndoHistories, UndoRefused, UNDO_EVENTS, sameValue, undoMethods,
   type UndoAction, type UndoHistoryJSON, type UndoResult, type UndoStep,
 } from '../core/undo.js';
+import { MAP_MAX_CHARS, type ProjectMap } from './project-map.js';
 
 const log = new Log('ExternalProjectRegistry');
 
@@ -46,6 +49,14 @@ const STORAGE_KEY = 'external-projects:registry';
 /** Each caller's undo history, kept on disk for the session and three days after. */
 const UNDO_STORAGE_KEY = 'external-projects:undo';
 const UNDO_KEEP_MS = 3 * 24 * 60 * 60_000;
+/** Each project's map under its own key, so listing projects never carries the maps. */
+const MAP_STORAGE_PREFIX = 'external-projects:map:';
+/**
+ * Objects whose maps are stored: the agent that writes them, and the objects
+ * that speak for the person. A map rides in every task's system prompt for
+ * its project, so who may write one is as narrow as who may write trust.
+ */
+const MAP_WRITERS = ['ExternalCreator', 'ExternalProjectBrowser', 'GlobalSettings', 'CliServer'];
 
 /**
  * The fields an undo of an edit puts back. Trust and autonomy are not among
@@ -318,6 +329,26 @@ export class ExternalProjectRegistry extends Abject {
               returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
             {
+              name: 'getProjectMap',
+              description: 'The project\'s map: a cited orientation guide (what it is, how it builds, its layout, entry points, where changes go), with the file count and layout it was written from. Null when none has been written.',
+              parameters: [
+                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Project handle' },
+              ],
+              returns: { kind: 'object' },
+            },
+            {
+              name: 'setProjectMap',
+              description: 'Store a project\'s map. Only ExternalCreator, which writes maps, and the objects that act for the user may store one.',
+              parameters: [
+                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Project handle' },
+                { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'The map, markdown with file citations' },
+                { name: 'fileCount', type: { kind: 'primitive', primitive: 'number' }, description: 'Files the project held when the map was written' },
+                { name: 'shape', type: { kind: 'object' }, description: 'Files per directory, two levels deep, when the map was written' },
+                { name: 'builtBy', type: { kind: 'primitive', primitive: 'string' }, description: 'Task that wrote it', optional: true },
+              ],
+              returns: { kind: 'object' },
+            },
+            {
               name: 'protectedPathsFor',
               description: 'The full protected-path set for a project, built-ins included',
               parameters: [
@@ -436,6 +467,11 @@ with the files each has written so far; agents report through \`taskStarted\`,
 paths, isolation and vcs go back; trust, autonomy, root and protected paths stay as
 they are. A project brought back (an undone removal) returns untrusted at "ask".
 
+### Project maps
+\`getProjectMap({ name })\` returns a project's map: a cited orientation guide that
+ExternalCreator writes when a project has none and rewrites when the project's layout
+moves away from it. Every task in the project reads it.
+
 ### Answering questions
 - "which project is X?" → resolveProject accepts a handle or any path inside one.
 - "how do I build X?" → the project's checkCommand / verifyCommand above, verbatim.
@@ -519,6 +555,8 @@ they are. A project brought back (an undone removal) returns untrusted at "ask".
       }
       this.projects.set(name, updated);
       await this.persist();
+      // A map describes the directory it was written from.
+      if (updated.root !== existing.root) await this.dropMap(name);
       this.changed('projectsChanged', { projects: this.list() });
       this.checkInvariants();
       const fields = UNDO_FIELDS.filter(k => !sameValue(existing[k], updated[k]));
@@ -537,6 +575,7 @@ they are. A project brought back (an undone removal) returns untrusted at "ask".
       const had = this.projects.delete(name);
       if (had) {
         await this.persist();
+        await this.dropMap(name);
         this.changed('projectsChanged', { projects: this.list() });
         await this.recordUndo(msg, `Remove project ${name}`, { kind: 'put', name, before: { ...existing! }, after: null });
       }
@@ -597,6 +636,40 @@ they are. A project brought back (an undone removal) returns untrusted at "ask".
       this.changed('projectsChanged', { projects: this.list() });
       log.info(`${name} autonomy is now ${autonomy}`);
       return { success: true, project: p };
+    });
+
+    this.on('getProjectMap', async (msg: AbjectMessage) => {
+      const { name } = msg.payload as { name: string };
+      requireNonEmpty(name, 'name');
+      if (!this.projects.has(name)) return null;
+      return this.loadMap(name);
+    });
+
+    this.on('setProjectMap', async (msg: AbjectMessage) => {
+      if (!(await this.isBuiltInCaller(msg.routing.from, MAP_WRITERS))) {
+        return { success: false, error: 'Project maps are written by ExternalCreator' };
+      }
+      const { name, text, fileCount, shape, builtBy } = msg.payload as {
+        name: string; text: string; fileCount: number; shape: Record<string, number>; builtBy?: string;
+      };
+      requireNonEmpty(name, 'name');
+      if (!this.projects.has(name)) return { success: false, error: `No external project named "${name}"` };
+      if (typeof text !== 'string' || text.trim() === '') return { success: false, error: 'setProjectMap requires a non-empty "text"' };
+      if (typeof fileCount !== 'number' || fileCount < 0) return { success: false, error: 'setProjectMap requires "fileCount", a non-negative number' };
+      const cleanShape = Object.fromEntries(Object.entries(shape && typeof shape === 'object' ? shape : {})
+        .filter(([k, v]) => typeof k === 'string' && typeof v === 'number' && v >= 0));
+      const map: ProjectMap = {
+        project: name,
+        text: text.length > MAP_MAX_CHARS ? `${text.slice(0, MAP_MAX_CHARS)}\n…` : text,
+        builtAt: Date.now(),
+        ...(typeof builtBy === 'string' ? { builtBy: builtBy.slice(0, 200) } : {}),
+        fileCount,
+        shape: cleanShape,
+      };
+      if (!this.storageId) return { success: false, error: 'Storage is unavailable, so the map cannot be kept' };
+      await this.request(request(this.id, this.storageId, 'set', { key: MAP_STORAGE_PREFIX + name, value: map }));
+      log.info(`stored a project map for ${name} (${map.text.length} chars, ${fileCount} files)`);
+      return { success: true, builtAt: map.builtAt };
     });
 
     this.on('protectedPathsFor', async (msg: AbjectMessage) => {
@@ -944,6 +1017,28 @@ they are. A project brought back (an undone removal) returns untrusted at "ask".
   // ═══════════════════════════════════════════════════════════════════
   // Persistence
   // ═══════════════════════════════════════════════════════════════════
+
+  private async loadMap(name: string): Promise<ProjectMap | null> {
+    if (!this.storageId) return null;
+    try {
+      const map = await this.request<ProjectMap | null>(
+        request(this.id, this.storageId, 'get', { key: MAP_STORAGE_PREFIX + name }));
+      return map && typeof map.text === 'string' ? map : null;
+    } catch (err) {
+      log.warn(`failed to load the map for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
+
+  /** Forget a project's map: the project is gone, or now points somewhere else. */
+  private async dropMap(name: string): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      await this.request(request(this.id, this.storageId, 'delete', { key: MAP_STORAGE_PREFIX + name }));
+    } catch (err) {
+      log.warn(`failed to drop the map for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   private async persist(): Promise<void> {
     if (!this.storageId) return;
