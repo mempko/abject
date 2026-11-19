@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.16.10",
+    "date": "2026-11-19",
+    "title": "Agents that know their way around your projects",
+    "summary": "An agent working in one of your projects now starts from a map of it instead of searching through the files on every task, and checkpoints now save the new files a task creates as well as its edits, so you can undo a task completely.",
+    "highlights": [
+      "Project maps: each trusted project gets a map of its layout and key files, with citations, written once and shown to the agent at the start of every task there. The agent no longer spends its first steps finding its way around with grep, find and ls each time.",
+      "Maps stay current: the app keeps a fingerprint of the project's layout, and when the files have moved on, the agent still sees the old map, marked out of date, while a new one is written in the background. A task that wrote files gets its map checked again when it ends.",
+      "Maps stay private and narrow: private work writes no map; a map is deleted when its project is removed or its folder changes; only the project agent and the objects that act for you can write one.",
+      "Fuller checkpoints: a checkpoint now saves the files a task created as well as its changes to files git already tracks, so `git restore --source=<ref> --worktree -- .` puts the whole project back. Your working tree, index and stash list are left alone. Projects below \"edit\" autonomy keep the old tracked-files-only snapshot.",
+      "Simpler object editing: every change to an object's source now goes through one edit_source action, which applies replacements, additions, removals and text edits together or not at all. The agent no longer has to choose between overlapping edit actions.",
+      "Questions no longer end the work: when the agent asks you something mid-task, it picks up from your answer and carries on, instead of finishing first."
+    ],
+    "fixes": [
+      "A task can no longer be marked done while files it did not touch have started failing, since those failures may come from the change itself.",
+      "A look-around task that changed a live object after all now has to show the change deployed and working, the same as an edit task.",
+      "The git commands a checkpoint uses are now counted as writes when the system checks what a shell command does."
+    ]
+  },
+  {
     "version": "0.16.9",
     "date": "2026-11-18",
     "title": "A web viewer you can browse yourself",
