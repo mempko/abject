@@ -1,6 +1,6 @@
 {
   "name": "KnowledgeBaseCpp",
-  "version": "3.11.0",
+  "version": "3.12.0",
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace",
@@ -78,7 +78,7 @@
           }
         },
         {
-          "description": "Store a knowledge entry. Deduplicates by normalized title+type (updates if exists).",
+          "description": "Store a knowledge entry. Deduplicates by normalized title+type (updates if exists). An agent or planner write whose claim differs from established knowledge under the same title (reviewer-written, useful, tested, or with learning history) leaves that entry as it is and is kept beside it as a competing claim (tag 'competing-claim'; the reply carries competesWith) for the reviewer to reconcile.",
           "name": "remember",
           "parameters": [
             {

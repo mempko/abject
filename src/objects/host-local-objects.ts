@@ -42,6 +42,8 @@ export const HOST_LOCAL_OBJECTS: ReadonlySet<string> = new Set<string>([
   // Orchestration and agents — these act with this host's authority.
   'ScrumMaster', 'GoalObserver', 'TaskReviewer', 'AgentCreator', 'AgentAbject',
   'WebAgent', 'SkillAgent', 'ObjectAgent', 'ExternalCreator', 'ExternalProjectRegistry',
+  // Maps describe sources on this machine (Files and host folders), and the agent that writes them.
+  'DocumentMap', 'Cartographer',
   // System singletons — every peer runs its own, so a peer's copy is never useful.
   'Registry', 'Factory', 'WorkspaceManager', 'WorkspaceShareRegistry', 'P2P',
   'PeerRouter', 'LLMObject', 'Negotiator', 'HealthMonitor', 'ProxyGenerator',

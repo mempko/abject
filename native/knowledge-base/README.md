@@ -112,6 +112,19 @@ TypeScript callers read its message shapes from `src/core/knowledge.ts`
   patterns, `profile`-tagged entries, `user`/`person` facts, entries marked
   useful and entries with learning history are never touched. Archived entries are purged after 180
   days or past 2000 archived (user-authored ones never).
+- **Competing claims.** Established knowledge has one writer: the reviewer
+  (and the person). An entry is established when it is reviewer-written,
+  judged useful, tested (evidence counters), or carries learning history.
+  A `remember` from an agent or the planner whose claim differs from an
+  established entry under the same title leaves that entry as it is and
+  writes a separate entry tagged `competing-claim` with `competesWith` naming
+  the established one (the reply carries `competesWith` too); a later write
+  of the same challenge revises that entry rather than adding another. The
+  title lookup prefers the established entry over a challenger. The
+  reviewer settles the pair: a reviewer `update_entry`, `confirm_entry` or
+  `narrow_entry` on the challenger clears its tag and `competesWith`, and
+  archiving either side ends the challenge. Before this, a colliding
+  `remember` replaced the content and zeroed the evidence of a tested entry.
 - **`ask`** is answered by the host from the manifest plus `ask-guide.md`
   (declared under `ask` in `abject.json`), at the balanced tier. The module
   never sees `ask`.
@@ -120,7 +133,7 @@ TypeScript callers read its message shapes from `src/core/knowledge.ts`
 
 | Group | Methods |
 |---|---|
-| Store | `remember` (dedup by normalized title + type; optional `origin`: user, agent, reviewer, scrum), `update` (optional `expectedRevision`), `forget` (first call archives, second deletes), `archive` |
+| Store | `remember` (dedup by normalized title + type; optional `origin`: user, agent, reviewer, scrum; an agent or scrum write with a different claim under the title of established knowledge is kept beside it as a competing claim, see Competing claims), `update` (optional `expectedRevision`), `forget` (first call archives, second deletes), `archive` |
 | Retrieve | `recall` (BM25, `previews: true` for `{id, title, snippet}`; without a query, `order: 'worth'` ranks user-written, then reviewer-confirmed useful, then recent; `order: 'uncertain'`, with or without a query, ranks what is relied on most and tested least first: `(1 + accessCount + 2 * usefulCount) * evidence.uncertainty`), `match` (literal or `A\|B`), `get`, `list`, `listTags`, `weave` (patterns by context, plus linked patterns; `from`, `hops` up to 2); `recall`, `get` and `list` take `includeLearning` |
 | Curation | `markUseful` (bumps `usefulCount`, which protects an entry from distillation) |
 | Pattern learning | `beginPatternApplication`, `assessPatternApplication`, `recordPatternApplication`, `patternHistory`, `applyLearningDecision` (including `observe_entry`), `evidenceHashes` |

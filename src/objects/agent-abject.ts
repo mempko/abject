@@ -1109,6 +1109,8 @@ export class AgentAbject extends Abject {
    * ranked selection so identity facts outlive over-tagged trivia.
    */
   private static readonly PROFILE_BLOCK_CHAR_BUDGET = 4000;
+  /** Map pages a task is pointed at (titles only). */
+  private static readonly MAP_POINTER_LIMIT = 3;
   private static readonly PROFILE_ENTRY_CHAR_CAP = 400;
 
   /**
@@ -5647,6 +5649,21 @@ The preview often answers the question on its own — when it does, just act.`, 
       }
     } catch { /* best effort */ }
 
+    // Pointers into the workspace's maps: titles of a few pages that share
+    // several words with the task, never their bodies. The maps stay a level
+    // down; the agent reads a page when it needs one.
+    try {
+      const documentMapId = await this.discoverDep('DocumentMap');
+      if (documentMapId) {
+        const query = [entry.goalRecallText, entry.state.task].filter(Boolean).join('\n').slice(0, 1000);
+        const hits = await this.request<Array<{ map: string; title: string }>>(
+          request(this.id, documentMapId, 'search', { query, limit: AgentAbject.MAP_POINTER_LIMIT, minTerms: 2, exact: true }), 3000).catch(() => []);
+        if (hits.length > 0) {
+          add('map-pointers', `\n\n## Maps\nPages in this workspace's maps (cited wikis over document collections and projects) that share words with this task. Read one with recall {"map": "<map>", "page": "<title>"} before relying on it; each page cites the sources it summarizes.\n${hits.map(h => `- ${h.map}: ${h.title}`).join('\n')}\n`, false);
+        }
+      }
+    } catch { /* best effort */ }
+
     // Always-present primer on the system every agent operates in: the
     // message-passing model, the ask protocol, and the observe-think-act loop
     // that drives them. Injected once here so every agent shares one baseline
@@ -5677,29 +5694,24 @@ Reference objects by their registered name wherever possible — name-based call
     // Always-present guidance on memory tools
     add('memory-tools', `\n\n## Memory Tools
 
+Memory carries what this work learned into later, unrelated tasks, which start knowing nothing of this one. A note is a prediction: writing it says a later task will need it and can rely on it without checking again. So keep what a later task could not get back by looking: what you tested and found to hold, what surprised you, what the person told you, how something behaves that its own description leaves out. What the world will tell a later task directly (current state, which agent or object handles a kind of work, what an object can do right now) is better asked of the world then, because it moves after the note is written; refer to objects by their registered names.
+
 **remember** action (persistent across all goals and restarts):
-You can emit a remember action to save knowledge for future tasks:
 \`\`\`json
 { "action": "remember", "title": "short summary", "content": "detailed knowledge", "type": "fact", "tags": ["tag1", "tag2"] }
 \`\`\`
 Types: 'learned' (lessons from outcomes), 'fact' (discovered facts), 'insight' (analysis), 'reference' (pointers)
-When to remember (durable knowledge for future unrelated tasks):
-- User preferences or personal facts they share (location, name, job, etc.) — tag these with "profile" so they are always available in future tasks, even ones whose wording does not mention them
-- Stable system architecture insights or validated patterns
-- Useful API details or capabilities that are unlikely to change
-
-Record what the system can do and how it works — a tool's commands and flags, where its config lives, how it authenticates, what its output looks like. Leave out who should do it. Which agent handles a goal is decided when the goal runs, from the live team and by asking, because installed skills and capabilities change between the moment a note is written and the moment it is read; a remembered owner is a guess about a roster that has since moved on. Write "this tool reports status as JSON and authenticates from its own config file" rather than naming the agent that happened to run it.
-
-Leave out the recipe as well. A note that says which steps to take to answer a kind of question — look here, then check that — fixes one attempt's route as though it were a property of the world, and the next task follows it instead of thinking. It is worth least when it is most confident: a run that answered the wrong question smoothly produces a clean-looking procedure for doing so again, and writing it down is how one wrong turn becomes the standard route. Save what you learned that stays true — what a thing is, what it exposes, what its output means, what surprised you — and let each task work out its own steps from that.
-
-The "profile" tag is reserved for WHO THE USER IS: name, location, role, preferences, accounts they use. Facts ABOUT their projects, writings, or interests are still worth remembering, with topical tags — keyword recall surfaces them when relevant. Every profile-tagged entry competes for a small always-injected block in every future prompt, so tagging trivia "profile" crowds out the user's actual identity.
-Ephemeral problems (runtime errors, connection failures, config issues, workarounds being tried) belong in the goal scratchpad, not the knowledge base. They are relevant to the current goal only.
-After remembering, you will be prompted to continue with the task.
+Write each note as what holds and what it rests on: the claim, the observation behind it, and the trap it avoids, so a later reader can tell when it no longer applies. A rule you tested earns its place this way. A route that merely worked once is better left for the next task to work out again from what is true, since a confident note about one path becomes the path every later task takes.
+The "profile" tag is for who the user is: name, location, role, preferences, accounts they use. Profile entries ride in every future prompt, so keep it to identity; facts about their projects, writings and interests go under topical tags, where recall finds them when they matter.
+Problems of the moment (an error, a connection that failed, a workaround in progress) belong in the goal scratchpad, where this goal's work is kept.
+When an entry with a track record already holds your title with a different claim, your note is kept beside it as a competing claim, and the reviewer weighs the two against what the work showed.
+Remember when something is clearly worth keeping, and judge the rest yourself. After remembering, you will be prompted to continue with the task.
 
 **recall** action (look things up mid-task, available alongside your other actions):
 \`\`\`json
 { "action": "recall", "query": "keywords to search" }
 \`\`\`
+Maps: \`{ "action": "recall", "map": "*", "query": "keywords" }\` searches the workspace's maps (cited wikis over document collections and projects), \`{ "action": "recall", "map": "<map>", "page": "<title>" }\` reads a page with its links, and \`{ "action": "recall", "map": "<map>" }\` lists a map's pages.
 Variants: \`{ "action": "recall", "pattern": "ExactName|other" }\` for exact identifiers, \`{ "action": "recall", "id": "<entry id>" }\` to fetch one full entry, \`{ "action": "recall", "tags": ["profile"] }\` to list by tag. Keyword results are compact previews (id, title, snippet); refine your terms when results are thin, then fetch the full entries you will actually use by id. Recall when a task resembles previous work, when you are unsure of user preferences or conventions, and before re-deriving anything the system may already know.`, true);
 
     if (entry.knownTagsLine) {
@@ -6339,17 +6351,28 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     if (action.action === 'remember' && entry.private) {
       return { result: { success: false, error: PRIVATE_REMEMBER_REFUSAL }, message: `[Remember] ${PRIVATE_REMEMBER_REFUSAL}` };
     }
+    // Reading a map: the same verb, answered by DocumentMap instead of the KnowledgeBase.
+    if (action.action === 'recall' && typeof action.map === 'string' && action.map.trim()) {
+      if (task.phase === 'error' || entry.finished) throw new Error('Task cancelled');
+      const rendered = await this.recallFromMap(entry, action);
+      return { result: { success: true, data: { displayedText: rendered } }, message: `[Recall] ${rendered}` };
+    }
     const kbId = await this.discoverDep('KnowledgeBase');
     if (task.phase === 'error' || entry.finished) throw new Error('Task cancelled');
     if (!kbId) throw new Error('KnowledgeBase not available');
     const track = entry.private ? { track: false } : {};
     if (action.action === 'remember') {
-      const saved = await this.request<{ id?: string; success?: boolean; error?: string }>(request(this.id, kbId, 'remember', {
+      const saved = await this.request<{ id?: string; success?: boolean; error?: string; competesWith?: string }>(request(this.id, kbId, 'remember', {
         title: (action.title as string) ?? (action.description as string) ?? 'Untitled',
         content: (action.content as string) ?? (action.description as string) ?? '',
         type: (action.type as string) ?? 'fact', tags: (action.tags as string[]) ?? [],
       }), 10000);
       if (!saved?.id || saved.success === false) throw new Error(saved?.error ?? 'KnowledgeBase did not acknowledge the saved entry');
+      if (saved.competesWith) {
+        return { result: { success: true, data: saved }, message:
+          `[Remember] Saved ${saved.id} as a competing claim: established knowledge (${saved.competesWith}) already holds this title with a different claim, ` +
+          `and it stays as it is until the reviewer weighs the two against what this work observed. Continue with the task.` };
+      }
       return { result: { success: true, data: saved }, message: `[Remember] Saved ${saved.id}. Continue with the task.` };
     }
     if (action.action !== 'recall') throw new Error(`Unknown runtime action: ${action.action}`);
@@ -6382,6 +6405,46 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         : 'No matching entries. Try different terms, or a pattern for exact names.';
     } else throw new Error('recall needs query, pattern, id, or tags');
     return { result: { success: true, data: { displayedText: rendered } }, message: `[Recall] ${rendered}` };
+  }
+
+  /**
+   * A recall against the workspace's maps (DocumentMap): a page by title, a
+   * search within one map or across all of them ("*"), or a map's page list.
+   */
+  private async recallFromMap(entry: TaskEntry, action: AgentAction): Promise<string> {
+    const dm = await this.discoverDep('DocumentMap');
+    if (!dm) throw new Error('DocumentMap not available');
+    const map = (action.map as string).trim();
+    const page = typeof action.page === 'string' ? action.page.trim() : '';
+    const query = typeof action.query === 'string' ? action.query.trim() : '';
+    const limit = Math.min(typeof action.limit === 'number' ? action.limit : 6, 12);
+    const clip = this.chunkLimit(entry);
+    if (page) {
+      const p = await this.request<{ found: boolean; error?: string; similar?: string[]; map?: string; title?: string; revision?: number; body?: string;
+        sources?: Array<{ path: string }>; sourceRoot?: { kind: string; root: string }; flags?: Array<{ reason: string }>; links?: string[]; unwrittenLinks?: string[]; linkedFrom?: string[]; editedInFiles?: boolean }>(
+        request(this.id, dm, 'readPage', { map, page }), 15000);
+      if (!p.found) return `${p.error ?? `No page "${page}"`}${p.similar?.length ? `. Similar pages: ${p.similar.join(', ')}` : ''}`;
+      const body = p.body ?? '';
+      return [
+        `**${p.title}** (map ${p.map}, revision ${p.revision}${p.editedInFiles ? ', edited in Files' : ''}; sources under ${p.sourceRoot?.kind} ${p.sourceRoot?.root}: ${(p.sources ?? []).map(s => s.path).join(', ') || 'none listed'})`,
+        ...(p.flags?.length ? [`Flagged by readers: ${p.flags.map(f => f.reason).join(' | ')}`] : []),
+        sanitizeInjectedFact(body.slice(0, clip)) + (body.length > clip ? '\n[Page continues past the recall display limit.]' : ''),
+        `Links: ${(p.links ?? []).join(', ') || 'none'}${p.unwrittenLinks?.length ? `; unwritten: ${p.unwrittenLinks.join(', ')}` : ''}${p.linkedFrom?.length ? `; linked from: ${p.linkedFrom.join(', ')}` : ''}`,
+      ].join('\n');
+    }
+    if (query) {
+      const hits = await this.request<Array<{ map: string; title: string; snippet?: string }>>(
+        request(this.id, dm, 'search', { query, limit, ...(map === '*' ? {} : { map }) }), 15000);
+      return hits.length
+        ? hits.map(h => `- ${h.map}: **${h.title}**: ${h.snippet ?? ''}`).join('\n') + '\nRead a page with recall {"map": "<map>", "page": "<title>"}.'
+        : 'No matching pages. Try other words, or recall {"map": "<map>"} for a map\'s page list.';
+    }
+    if (map === '*') {
+      const maps = await this.request<Array<{ id: string; name: string; kind: string; description?: string; pages: number }>>(request(this.id, dm, 'listMaps', {}), 15000);
+      return maps.length ? maps.map(m => `- ${m.id}: ${m.name} (${m.kind}, ${m.pages} pages)${m.description ? `: ${m.description}` : ''}`).join('\n') : 'This workspace has no maps yet.';
+    }
+    const info = await this.request<{ id: string; name: string; source: { kind: string; root: string }; pages: Array<{ title: string; flagged?: boolean }> }>(request(this.id, dm, 'getMap', { map }), 15000);
+    return `Map ${info.id} (${info.name}) over ${info.source.kind} ${info.source.root}. Pages: ${info.pages.map(p => p.title + (p.flagged ? ' (flagged)' : '')).join(', ') || 'none yet'}`;
   }
 
   /** Serve one read_chunk request against a stored payload. */

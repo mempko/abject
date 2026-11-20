@@ -38,7 +38,7 @@ Search, read the previews, and refine: when results are thin, reformulate with d
     tags: ['ui', 'preferences'],
   });
 
-Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources), 'pattern' (Alexander/Coplien-style generative pattern-language entries, written through the reviewer's save_pattern/update_pattern actions rather than composed by hand: each names the context it applies to, the forces in tension, what to do therefore, the evidence behind it, and the patterns it links to). Remembering a title that already exists for that type updates the entry in place.
+Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources), 'pattern' (Alexander/Coplien-style generative pattern-language entries, written through the reviewer's save_pattern/update_pattern actions rather than composed by hand: each names the context it applies to, the forces in tension, what to do therefore, the evidence behind it, and the patterns it links to). Remembering a title that already exists for that type updates the entry in place, with one exception: when the existing entry has a track record (written or confirmed by the reviewer, judged useful, tested by predictions, or carrying learning history) and your claim differs from it, the entry stays as it is and yours is kept beside it as a competing claim (tag 'competing-claim'; the reply carries `competesWith` with the established entry's id). The reviewer weighs the two against what the work showed.
 
 ### Weave patterns for a goal
 
@@ -61,13 +61,11 @@ Pass `from: [<pattern ids>]` with the patterns a plan already follows to see wha
   // archived entry deletes it for good, learning history included.
   const all = await call(await dep('KnowledgeBase'), 'list', { type: 'learned', limit: 20 });
 
-### When to remember (durable knowledge only)
+### What memory is for
+Memory carries what one piece of work learned into later, unrelated ones. Keep what a later task could not get back by looking: what was tested and found to hold, what surprised, what the person said, how something behaves that its own description leaves out. Write the claim with what it rests on, so a later reader can tell when it no longer applies. What the world will report directly (current state, what an object can do right now) is better asked of the world when it is needed.
 - User preferences or personal facts (location, name, role): tag these with "profile" so every future task has them, even when the task wording does not mention them
-- Facts about this workspace or an external project you are working in
-- Stable capabilities or approaches that help future unrelated tasks
-- References to external resources or object capabilities
-
-Ephemeral problems (runtime errors, connection failures, debugging context) belong in the goal scratchpad, so the knowledge base stays a record of durable lessons.
+- Problems of the moment (runtime errors, connection failures, debugging context) belong in the goal scratchpad
+- A summary of a collection of documents belongs in a map (DocumentMap), whose pages cite their sources and can be checked against them
 
 ### When to recall
 - Before starting a task, check whether relevant knowledge exists

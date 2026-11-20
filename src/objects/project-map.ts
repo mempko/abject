@@ -8,16 +8,20 @@
  * where the entry points are, and where a given kind of change goes. Every
  * statement cites the file it came from, so a reader can check it.
  *
- * ExternalProjectRegistry keeps each project's map with the rest of its data;
- * ExternalCreator writes it when a project has none and rewrites it when the
- * project's layout has moved away from what the map describes. This module is
- * the part with no messaging in it: the layout fingerprint ("shape"), the test
+ * A project map is the index page of the project's map in DocumentMap
+ * (kind 'project', id `project/<name>`), stored with the rest of the
+ * workspace's maps under /maps in Files; the map's layout records what the
+ * index was written from. ExternalCreator writes it when a project has none
+ * and rewrites it when the project's layout has moved away from what the map
+ * describes; further pages of the same map can go deeper. This module is the
+ * part with no messaging in it: the layout fingerprint ("shape"), the test
  * for drift, choosing which files the writer reads, and the writer's prompt.
  */
 
 import { require as precondition, ensure } from '../core/contracts.js';
+import { mapIdOf } from '../core/map-page.js';
 
-/** A project's map, as ExternalProjectRegistry stores it. */
+/** A project's map as a task reads it: the index page of its DocumentMap map, with the layout it was written from. */
 export interface ProjectMap {
   /** Project handle the map belongs to. */
   project: string;
@@ -30,6 +34,11 @@ export interface ProjectMap {
   fileCount: number;
   /** Files per directory down to SHAPE_DEPTH, the layout the map describes. */
   shape: Record<string, number>;
+}
+
+/** The DocumentMap id of a project's map. */
+export function projectMapId(project: string): string {
+  return mapIdOf('project', project);
 }
 
 /** The longest map kept. It rides in every task's system prompt for its project. */

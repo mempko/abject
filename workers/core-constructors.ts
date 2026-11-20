@@ -62,6 +62,8 @@ import { Crypto } from '../src/objects/capabilities/crypto.js';
 import { OAuthHelper } from '../src/objects/oauth-helper.js';
 import { ObjectAgent } from '../src/objects/object-agent.js';
 import { ExternalProjectRegistry } from '../src/objects/external-project-registry.js';
+import { DocumentMap } from '../src/objects/document-map.js';
+import { Cartographer } from '../src/objects/cartographer.js';
 import { ExternalCreator } from '../src/objects/external-creator.js';
 import { SharedState } from '../src/objects/capabilities/shared-state.js';
 import { WebAgent } from '../src/objects/web-agent.js';
@@ -147,6 +149,8 @@ export function coreConstructors(): Map<string, ObjectFactory> {
   map.set('OAuthHelper', () => new OAuthHelper());
   map.set('ObjectAgent', () => new ObjectAgent());
   map.set('ExternalProjectRegistry', () => new ExternalProjectRegistry());
+  map.set('DocumentMap', () => new DocumentMap());
+  map.set('Cartographer', () => new Cartographer());
   map.set('ExternalCreator', () => new ExternalCreator());
   map.set('SharedState', () => new SharedState());
   map.set('WebAgent', () => new WebAgent());

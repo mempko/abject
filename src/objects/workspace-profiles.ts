@@ -31,8 +31,10 @@ export const INFRA_OBJECTS = [
   // each one (a terminal shows them); it draws a toast only where there is a desktop.
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme', 'NotificationCenter',
   'GoalManager', 'JobManager', 'TaskSession', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
+  // DocumentMap keeps the workspace's maps in its FileSystem; ExternalProjectRegistry,
+  // ExternalCreator and Cartographer reach it by name, so it spawns before them.
   // ExternalProjectRegistry precedes ExternalCreator: the agent resolves it at init.
-  'ExternalProjectRegistry', 'ExternalCreator', 'ObjectCreator',
+  'DocumentMap', 'ExternalProjectRegistry', 'ExternalCreator', 'Cartographer', 'ObjectCreator',
   // TaskReviewer discovers KnowledgeBase, so it spawns after it.
   'AgentCreator', 'Scheduler', 'KnowledgeBase', 'TaskReviewer', 'AgentEvaluation', 'ChatManager',
   'Console', 'CollectionStore', 'TriggerManager', 'WebExposure',
@@ -64,6 +66,7 @@ export const WORKSPACE_OBJECT_REQUIRES: Readonly<Record<string, readonly string[
   SkillAgent: ['AgentAbject'],
   ObjectAgent: ['AgentAbject'],
   ExternalCreator: ['AgentAbject', 'ExternalProjectRegistry'],
+  Cartographer: ['AgentAbject', 'DocumentMap'],
   AgentCreator: ['AgentAbject'],
   TaskReviewer: ['AgentAbject'],
   GoalBrowser: ['GoalManager'],

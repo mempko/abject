@@ -54,6 +54,9 @@ using namespace abject;
 static const char* LEGACY_STORAGE_KEY = "knowledge-base:entries";
 static const char* ENTRY_KEY_PREFIX = "knowledge-base:entry:";
 static const char* SYNC_NAMESPACE = "knowledge-base";
+/// Tag on a claim an agent wrote under the title of established knowledge
+/// (see Entry::competes_with), so the reviewer and recall can find it.
+static const std::string COMPETING_TAG = "competing-claim";
 /// One CRDT register per entry: `entry:<id>`. A deletion publishes a
 /// tombstone under the same key.
 static const char* ENTRY_REGISTER_PREFIX = "entry:";
@@ -280,6 +283,19 @@ struct Entry {
   bool archived = false;
   json learning = nullptr;
   Evidence evidence;
+  /// Set on an entry an agent wrote under the title of established knowledge
+  /// with a different claim: the id of the entry it competes with. The
+  /// reviewer reconciles the two; the established entry is never rewritten
+  /// by the agent's remember.
+  std::string competes_with;
+
+  /// Knowledge with a track record: written or confirmed by the reviewer,
+  /// judged useful, carrying learning history, or tested by predictions.
+  /// Only the reviewer (and the person) rewrite it; another writer's
+  /// different claim under its title is kept beside it as a competing claim.
+  bool established() const {
+    return origin == "reviewer" || useful_count > 0 || learning.is_object() || evidence.tested();
+  }
 
   /// What the entry claims, for telling a claim change from a bookkeeping
   /// one: title and content, a pattern's without its own learning record.
@@ -356,6 +372,7 @@ struct Entry {
             {"lastUsefulAt", last_useful_at},
             {"archived", archived}, {"learning", learning}};
     if (evidence.stored()) j["evidence"] = evidence.to_json();
+    if (!competes_with.empty()) j["competesWith"] = competes_with;
     return j;
   }
 
@@ -386,6 +403,7 @@ struct Entry {
     e.last_useful_at = int_or(j, "lastUsefulAt", 0);
     e.archived = j.contains("archived") && j["archived"].is_boolean() && j["archived"].get<bool>();
     if (j.contains("evidence")) e.evidence = Evidence::from_json(j["evidence"]);
+    e.competes_with = str_or(j, "competesWith", "");
     return e;
   }
 };
@@ -723,7 +741,12 @@ class KnowledgeBase final : public Object {
         .param("effectId", "string", "Immutable effect identity").returns("object");
     m.method("remember",
              "Store a knowledge entry. Deduplicates by normalized title+type "
-             "(updates if exists).")
+             "(updates if exists). An agent or planner write whose claim differs "
+             "from established knowledge under the same title (reviewer-written, "
+             "useful, tested, or with learning history) leaves that entry as it "
+             "is and is kept beside it as a competing claim (tag "
+             "'competing-claim'; the reply carries competesWith) for the "
+             "reviewer to reconcile.")
         .param("title", "string", "Short summary (max 200 chars)")
         .param("content", "string", "The knowledge content (markdown)")
         .param("type", "string", "Entry type: 'learned' | 'fact' | 'insight' | 'reference' | 'pattern'")
@@ -1386,6 +1409,12 @@ class KnowledgeBase final : public Object {
         next.content = pattern->to_json().dump();
       }
       if (action == "archive_entry") next.archived = true;
+      // The reviewer revising or confirming a competing claim settles it: it
+      // is knowledge in its own right now, not a challenger.
+      if (!next.competes_with.empty() && (action == "update_entry" || action == "confirm_entry" || action == "narrow_entry")) {
+        next.competes_with.clear();
+        next.tags.erase(std::remove(next.tags.begin(), next.tags.end(), COMPETING_TAG), next.tags.end());
+      }
       if (action == "supersede_entry") next.learning["supersessions"].push_back({{"replacementId",input["replacementId"]},{"scope",scope},{"effectId",effect_id}});
       if (action == "dispute_entry") next.learning["disputes"].push_back({{"explanation",input["evidence"]},{"scope",scope},{"effectId",effect_id}});
       if (action == "narrow_entry" || (creating && !scope.empty())) next.learning["scope"] = scope;
@@ -1719,6 +1748,21 @@ class KnowledgeBase final : public Object {
       log(LogLevel::Info, "Remember: title collides with user entry; creating separate " + origin + " entry");
       existing = nullptr;
     }
+    // Established knowledge has one writer, the reviewer (and the person).
+    // An agent or the planner writing a different claim under its title
+    // would replace a tested claim with an untested one and zero its
+    // evidence; parallel tasks would overwrite each other. The new claim is
+    // kept beside it instead, marked as competing, for the reviewer to
+    // reconcile. A remember that restates the same claim changes nothing.
+    std::string competes_with;
+    if (existing && (origin == "agent" || origin == "scrum") && existing->established() && !existing->archived) {
+      Entry proposed = *existing;
+      proposed.content = type == "pattern" ? *revise_pattern(title, content, existing->content) : body;
+      if (proposed.claim_text() != existing->claim_text()) {
+        competes_with = existing->id;
+        existing = find_competing(title, type, competes_with);
+      }
+    }
     if (existing) {
       if (busy_learning(req, existing->id)) return;
       if (existing->learning.is_object() && (existing->archived || !existing->learning.value("supersessions",json::array()).empty())) { req.reply({{"success",false},{"error","Retired knowledge requires an explicit revision"},{"id",existing->id}}); return; }
@@ -1729,10 +1773,16 @@ class KnowledgeBase final : public Object {
       existing->archived = false;
       existing->updated_at = std::max(now, existing->updated_at + 1);
       index_.add(existing->id, existing->title, index_text(*existing), existing->tags);
+      if (!competes_with.empty()) {
+        existing->competes_with = competes_with;
+        if (std::find(existing->tags.begin(), existing->tags.end(), COMPETING_TAG) == existing->tags.end()) existing->tags.push_back(COMPETING_TAG);
+      }
       save_entry(*existing);
       changed("entryUpdated", event_json(*existing));
       log(LogLevel::Info, "Updated knowledge: \"" + title + "\" (" + type + ")");
-      req.reply({{"id", existing->id}});
+      json reply = {{"id", existing->id}};
+      if (!competes_with.empty()) reply["competesWith"] = competes_with;
+      req.reply(reply);
       maybe_distill(now);
       return;
     }
@@ -1753,6 +1803,10 @@ class KnowledgeBase final : public Object {
     e.useful_count = 0;
     e.last_useful_at = 0;
     e.archived = false;
+    if (!competes_with.empty()) {
+      e.competes_with = competes_with;
+      if (std::find(e.tags.begin(), e.tags.end(), COMPETING_TAG) == e.tags.end()) e.tags.push_back(COMPETING_TAG);
+    }
 
     index_.add(e.id, e.title, index_text(e), e.tags);
     json entry_json = e.to_json();
@@ -1760,8 +1814,10 @@ class KnowledgeBase final : public Object {
     entries_[id] = std::move(e);
     save_entry(entries_[id]);
     changed("entryAdded", entry_json);
-    log(LogLevel::Info, "Remembered: \"" + entries_[id].title + "\" (" + type + ")");
-    req.reply({{"id", id}});
+    log(LogLevel::Info, std::string(competes_with.empty() ? "Remembered" : "Remembered a competing claim") + ": \"" + entries_[id].title + "\" (" + type + ")");
+    json reply = {{"id", id}};
+    if (!competes_with.empty()) reply["competesWith"] = competes_with;
+    req.reply(reply);
     maybe_distill(now);
   }
 
@@ -2211,8 +2267,24 @@ class KnowledgeBase final : public Object {
 
   Entry* find_by_title_and_type(const std::string& title, const std::string& type) {
     const std::string norm = normalize_title(title);
+    Entry* found = nullptr;
     for (auto& [_, e] : entries_) {
-      if (e.type == type && normalize_title(e.title) == norm) return &e;
+      if (e.type != type || normalize_title(e.title) != norm) continue;
+      // The established entry answers for its title; a competing claim
+      // beside it is found only through find_competing.
+      if (!found || (!found->competes_with.empty() && e.competes_with.empty())) found = &e;
+    }
+    return found;
+  }
+
+  /// The open competing claim against an established entry, if one exists:
+  /// a second write of a competing claim revises it rather than adding
+  /// another beside it.
+  Entry* find_competing(const std::string& title, const std::string& type, const std::string& established_id) {
+    const std::string norm = normalize_title(title);
+    for (auto& [_, e] : entries_) {
+      if (e.id != established_id && e.competes_with == established_id && !e.archived && !e.established()
+          && e.type == type && normalize_title(e.title) == norm) return &e;
     }
     return nullptr;
   }

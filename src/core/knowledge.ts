@@ -20,6 +20,15 @@ export const KNOWLEDGE_BASE_ID = 'abjects:knowledge-base' as AbjectId;
  */
 export const PROFILE_TAG = 'profile';
 
+/**
+ * Tag on a claim an agent wrote under the title of established knowledge
+ * (reviewer-written, judged useful, tested, or with learning history). The
+ * KnowledgeBase keeps such a write beside the established entry rather than
+ * over it, with `competesWith` naming that entry, and the reviewer reconciles
+ * the two: one writer for knowledge with a track record.
+ */
+export const COMPETING_TAG = 'competing-claim';
+
 export type KnowledgeType = 'learned' | 'fact' | 'insight' | 'reference' | 'pattern';
 
 /**
@@ -58,4 +67,6 @@ export interface KnowledgeEntry {
    * before the field existed, which are read as local.
    */
   creatorPeerId?: string;
+  /** Set on a competing claim: the established entry it challenges (see COMPETING_TAG). */
+  competesWith?: string;
 }

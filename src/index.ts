@@ -228,6 +228,9 @@ export { Speech, SPEECH_ID, createSpeech } from './objects/capabilities/speech.j
 export { SkillRegistry, SKILL_REGISTRY_ID } from './objects/skill-registry.js';
 export { SkillAgent, SKILL_AGENT_ID } from './objects/skill-agent.js';
 export { ObjectAgent, OBJECT_AGENT_ID } from './objects/object-agent.js';
+export { DocumentMap, DOCUMENT_MAP_ID } from './objects/document-map.js';
+export { Cartographer, CARTOGRAPHER_ID } from './objects/cartographer.js';
+export * from './core/map-page.js';
 export { ExternalProjectRegistry, EXTERNAL_PROJECT_REGISTRY_ID, ALWAYS_PROTECTED, AUTONOMY_LEVELS, autonomyRank, minAutonomy } from './objects/external-project-registry.js';
 export type { ExternalProject, IsolationMode, AutonomyLevel } from './objects/external-project-registry.js';
 export { PermissionBroker, PERMISSION_BROKER_ID, ceilingFor } from './objects/permission-broker.js';

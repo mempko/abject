@@ -52,6 +52,7 @@ import { boundDecisionState, choiceOf, noulOf, type DecisionQuestion } from '../
 import { criterion, instruction } from '../core/decision-questions.js';
 import type { DecisionMode } from '../core/decision-sites.js';
 import { Log } from '../core/timed-log.js';
+import { COMPETING_TAG } from '../core/knowledge.js';
 import { parseRuntimeFault } from '../core/runtime-fault.js';
 import { isPrivatePayload } from '../core/privacy.js';
 import { ATTRIBUTION_SOURCES, MAX_ASSUMPTIONS_PER_GOAL, confidenceOf, isNegativeReaction, reactionKindOf, surpriseBits,
@@ -165,6 +166,16 @@ const REPORT_EPISODES_BUDGET = 24000;
 const PERSON_BUDGET = 4000;
 /** Flagged entries (misses outnumber holds) offered for narrowing or dispute. */
 const FLAGGED_BUDGET = 1500;
+/** Competing claims: an agent's different claim kept beside established knowledge, offered for reconciliation. */
+const COMPETING_BUDGET = 2500;
+const COMPETING_LIMIT = 4;
+/**
+ * Entries bearing on the reviewed work that agents rely on most and have
+ * tested least (KnowledgeBase recall order 'uncertain'): where checking a
+ * claim against this work's record buys the most.
+ */
+const UNCERTAIN_BUDGET = 1500;
+const UNCERTAIN_LIMIT = 4;
 
 interface TaskCompletedEvent {
   taskId: string;
@@ -308,6 +319,10 @@ interface ShownEntry {
   tags?: string[];
   content?: string;
   knowledgeRef?: string;
+  /** Set on a competing claim: the established entry it challenges. */
+  competesWith?: string;
+  accessCount?: number;
+  usefulCount?: number;
   /** How predictions and assumptions resting on the entry fared (KnowledgeBase evidence counters). */
   evidence?: EntryEvidence;
   pattern?: {
@@ -798,6 +813,22 @@ function renderFlagged(entries: Array<ShownEntry | null | undefined>): string {
   if (!flagged.length) return '';
   return `Entries whose evidence is flagged (predictions resting on them missed more often than they held): candidates to narrow (narrow_entry, with the scope where the claim still holds) or dispute (dispute_entry), after reading the misses behind them:\n`
     + flagged.slice(0, 8).map(e => `- ${clipText(e.title, 100)} [id=${e.id}]: ${evidenceLine(e.evidence!)}`).join('\n');
+}
+
+/** A competing claim beside the established entry it challenges, both clipped. */
+function renderCompeting(pairs: Array<{ claim: ShownEntry; established: ShownEntry }>): string {
+  if (!pairs.length) return '';
+  const clip = (e: ShownEntry) => clipText((e.content ?? '').replace(/\s+/g, ' '), 280);
+  return `Competing claims (an agent wrote a different claim under the title of established knowledge; the established entry was left as it was). Weigh each pair against what this work observed: when the challenger holds, revise the established entry (update_entry) and archive the challenger, or confirm the challenger (confirm_entry) and supersede the established one with it; when the established entry holds, archive the challenger; when this work says nothing about it, leave both:\n`
+    + pairs.map(({ claim, established }) =>
+      `- ${clipText(established.title, 100)}\n  established [id=${established.id}${established.evidence ? `; ${evidenceLine(established.evidence)}` : ''}]: ${clip(established)}\n  challenger [id=${claim.id}]: ${clip(claim)}`).join('\n');
+}
+
+/** Entries agents rely on most and have tested least, bearing on the reviewed work. */
+function renderUncertain(entries: ShownEntry[]): string {
+  if (!entries.length) return '';
+  return `Relied on, little tested, and bearing on this work (the knowledge most worth checking): where this work's record bears on one, record what it showed (confirm_entry when the work bore it out; update_entry, narrow_entry or dispute_entry when it did not). Where the record is silent, leave it:\n`
+    + entries.map(e => `- ${clipText(e.title, 100)} [id=${e.id}] read ${e.accessCount ?? 0}x, ${e.evidence ? evidenceLine(e.evidence) : 'untested'}: ${clipText((e.content ?? '').replace(/\s+/g, ' '), 200)}`).join('\n');
 }
 
 /** One observe_entry effect, with the key that dedupes it within a review. */
@@ -3251,6 +3282,18 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (applications) append(applications, PATTERN_APPLICATIONS_BUDGET);
       const flagged = renderFlagged([...fetched.values()]);
       if (flagged) append(flagged, FLAGGED_BUDGET);
+      const competing = await this.competingClaims(kb, focus, this.reviewScope(records));
+      for (const { claim, established } of competing) {
+        if (claim.knowledgeRef) knowledgeRefs[claim.id] = claim.knowledgeRef;
+        if (established.knowledgeRef) knowledgeRefs[established.id] = established.knowledgeRef;
+      }
+      if (competing.length) append(renderCompeting(competing), COMPETING_BUDGET);
+      const shownIds = new Set([...ids, ...competing.flatMap(c => [c.claim.id, c.established.id])]);
+      const uncertain = (await this.request<ShownEntry[]>(request(this.id, kb, 'recall', {
+        query: focus, order: 'uncertain', limit: UNCERTAIN_LIMIT * 2, scope: this.reviewScope(records), track: false,
+      })).catch(() => [] as ShownEntry[])).filter(e => e.type !== 'pattern' && !shownIds.has(e.id)).slice(0, UNCERTAIN_LIMIT);
+      for (const e of uncertain) if (e.knowledgeRef) knowledgeRefs[e.id] = e.knowledgeRef;
+      if (uncertain.length) append(renderUncertain(uncertain), UNCERTAIN_BUDGET);
       append('Knowledge reconciliation: use explicit parent evidenceRefs such as learning/task/<taskId>, learning/observation/<taskId>:<step>, learning/assessment/<taskId>:<step>. Put shared evidence and evidenceRefs alongside knowledgeUpdates in done.result; archive items inherit this shared context. Effects can update_entry, archive_entry (global only), supersede_entry (replacementId, optional scope), dispute_entry, narrow_entry (scope), confirm_entry, save_entry, save_pattern, update_pattern, or no_change. A single learn action uses {context:{evidence,evidenceRefs,scope},effects:[...]}. Connect interpretation to the affected claim; no_change and uncertainty are valid. Compare historical claims with observed actions and completion evidence. Correct obsolete claims even when the task succeeded and no pattern was applied. Injection does not prove usefulness. Excerpts are bounded; use recall by id before replacing a partially shown entry.', 600);
       const perEntry = Math.floor(8400 / Math.max(1, ids.length));
       for (let i = 0; i < ids.length; i++) {
@@ -3554,6 +3597,27 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     }
   }
 
+  /**
+   * Open competing claims, those matching the reviewed work first, each with
+   * the established entry it challenges (skipped when that entry is gone or
+   * retired: the challenge settled itself). Reads leave no access trace.
+   */
+  private async competingClaims(kb: AbjectId, focus: string | undefined, scope?: string): Promise<Array<{ claim: ShownEntry; established: ShownEntry }>> {
+    const read = (payload: Record<string, unknown>) => this.request<ShownEntry[]>(request(this.id, kb, 'recall', {
+      tags: [COMPETING_TAG], limit: COMPETING_LIMIT * 2, track: false, ...(scope ? { scope } : {}), ...payload,
+    })).catch(() => [] as ShownEntry[]);
+    const [matching, recent] = await Promise.all([focus ? read({ query: focus }) : Promise.resolve([] as ShownEntry[]), read({})]);
+    const claims = [...new Map([...matching, ...recent].filter(e => e.competesWith).map(e => [e.id, e])).values()];
+    const pairs: Array<{ claim: ShownEntry; established: ShownEntry }> = [];
+    for (const claim of claims) {
+      if (pairs.length >= COMPETING_LIMIT) break;
+      const established = await this.request<(ShownEntry & { archived?: boolean }) | null>(
+        request(this.id, kb, 'get', { id: claim.competesWith, track: false })).catch(() => null);
+      if (established && !established.archived) pairs.push({ claim, established });
+    }
+    return pairs;
+  }
+
   private async startCuration(): Promise<boolean> {
     type Entry = { id: string; title: string; type: string; tags: string[]; origin: string; usefulCount: number; archived: boolean; content: string;
       learning?: { goals?: number };
@@ -3582,16 +3646,27 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const curatable = all.filter(e => (e.origin === 'agent' || e.origin === 'reviewer') && !e.archived);
     if (curatable.length === 0) return false;
 
+    // What agents lean on hardest with the least evidence behind it ranks
+    // the store for attention, ahead of the recency the list comes in.
+    const kb = this.knowledgeBaseId!;
+    const [uncertain, competing] = await Promise.all([
+      this.request<ShownEntry[]>(request(this.id, kb, 'recall', { order: 'uncertain', limit: 12, track: false }), 10000).catch(() => [] as ShownEntry[]),
+      this.competingClaims(kb, undefined),
+    ]);
     const listing = curatable
       .map(e => `- ${e.id} [${e.type}] useful:${e.usefulCount}${e.type !== 'pattern' && (e.learning?.goals ?? 0) >= 2 ? ` met in ${e.learning!.goals} goals` : ''} tags:${e.tags.join(',') || '-'}\n  ${e.title}: ${e.content.slice(0, 220)}${language(e)}`)
       .join('\n');
+    const attention = [
+      uncertain.length ? `## Relied on most, tested least\nThe entries agents read most with the least evidence behind them. A curation pass has no task record to test them against: sharpen the vague ones, merge the overlapping ones, and leave their truth to the reviews that can check it.\n${uncertain.map(e => `- ${e.id} read ${e.accessCount ?? 0}x, ${e.evidence ? evidenceLine(e.evidence) : 'untested'}: ${clipText(e.title, 100)}`).join('\n')}` : '',
+      competing.length ? `## Competing claims\nEach challenger was written under the title of established knowledge and kept beside it. Without a task record to weigh them, archive a challenger that is plainly wrong or only restates the established entry, and leave the rest for a goal review.\n${competing.map(({ claim, established }) => `- established ${established.id} vs challenger ${claim.id}: ${clipText(established.title, 100)}`).join('\n')}` : '',
+    ].filter(Boolean).join('\n\n');
 
     try {
       const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
           task: 'Curate the knowledge store: merge near-duplicates and archive stale entries.',
           systemPrompt: this.curationSystemPrompt(),
-          initialMessages: [{ role: 'user', content: `## Curatable entries (agent/reviewer-authored, active)\n${listing}` }],
+          initialMessages: [{ role: 'user', content: `## Curatable entries (agent/reviewer-authored, active)\n${listing}${attention ? `\n\n${attention}` : ''}` }],
           config: { maxSteps: 14, timeout: 300000 },
         }),
         15000,
@@ -3756,6 +3831,19 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           const decision = await this.request<{ success: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'archive', { id }), 10000);
           if (!decision?.success) throw new Error(decision?.error ?? 'archive failed');
           result = `Archived ${id}`;
+          break;
+        }
+
+        case 'flag_map_page': {
+          // A map page is tested by its sources, not by predictions: the
+          // reviewer reports what misled, and the map's writer rewrites it.
+          const { map, page, reason } = action as { map?: string; page?: string; reason?: string };
+          if (!map || !page || !reason) return { success: false, error: 'flag_map_page requires "map", "page" and "reason"' };
+          const documentMap = await this.discoverDep('DocumentMap');
+          if (!documentMap) return { success: false, error: 'DocumentMap not available' };
+          const res = await this.request<{ success?: boolean; error?: string }>(request(this.id, documentMap, 'flagPage', { map, page, reason }), 15000);
+          if (res?.success === false) throw new Error(res.error ?? 'flagPage failed');
+          result = `Flagged "${page}" in map ${map}`;
           break;
         }
 
@@ -4156,6 +4244,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, linkedFrom?, tags? | Add a pattern to the workspace's pattern language; linkedFrom lists the ids of existing patterns that should lead to it |
 | update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Strengthen an existing pattern; only the sections you supply change |
 | author_skill | name, description, instructions | Package a reusable multi-step procedure as a skill |
+| flag_map_page | map, page, reason | A page of a map (read through recall with a "map" field) misled the work: say what its sources actually say. Map pages are corrected by rewriting them against their sources, never through knowledgeUpdates |
 | done | result: {assessments, applications, knowledgeUpdates?, summary?, unresolvedReason?} | Submit assessments, knowledge corrections and pattern-language updates together (knowledgeUpdates carries save_entry, save_pattern, update_pattern and the dispositions below); receiver messages record them without a separate LLM turn per item |
 | fail | reason | The material was unreviewable |
 

@@ -79,6 +79,8 @@ import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillAgent } from '../src/objects/skill-agent.js';
 import { ObjectAgent } from '../src/objects/object-agent.js';
 import { ExternalProjectRegistry } from '../src/objects/external-project-registry.js';
+import { DocumentMap } from '../src/objects/document-map.js';
+import { Cartographer } from '../src/objects/cartographer.js';
 import { ExternalCreator } from '../src/objects/external-creator.js';
 import { MCPBridge } from '../src/objects/mcp-bridge.js';
 import { MCPRegistryClient } from '../src/objects/mcp-registry-client.js';
@@ -515,6 +517,8 @@ export async function bootServer(options: BootOptions): Promise<void> {
   runtime.objectFactory.registerConstructor('SkillAgent', () => new SkillAgent());
   runtime.objectFactory.registerConstructor('ObjectAgent', () => new ObjectAgent());
   runtime.objectFactory.registerConstructor('ExternalProjectRegistry', () => new ExternalProjectRegistry());
+  runtime.objectFactory.registerConstructor('DocumentMap', () => new DocumentMap());
+  runtime.objectFactory.registerConstructor('Cartographer', () => new Cartographer());
   runtime.objectFactory.registerConstructor('ExternalCreator', () => new ExternalCreator());
   runtime.objectFactory.registerConstructor('MCPRegistryClient', () => new MCPRegistryClient());
   runtime.objectFactory.registerConstructor('ClawHubClient', () => new ClawHubClient());
@@ -555,6 +559,7 @@ export async function bootServer(options: BootOptions): Promise<void> {
       'JobManager',
       'AgentAbject', 'ScrumMaster', 'AgentCreator',
       'ObjectAgent', 'SkillAgent', 'WebAgent', 'ExternalProjectRegistry', 'ExternalCreator',
+      'DocumentMap', 'Cartographer',
       'TriggerManager', 'CollectionStore',
       'Scheduler',
       'ObjectCreator', 'Chat', 'ChatManager',

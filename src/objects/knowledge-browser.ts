@@ -22,6 +22,15 @@
  * pattern in the list or through a link chip selects it on the map. A
  * newly woven pattern arrives as a flow of living light along its links.
  *
+ * The Maps tab reads the workspace's DocumentMap instead of the
+ * KnowledgeBase: the list holds every page of every map (each map's index
+ * first), the search field searches pages, and a selected page shows its
+ * sources, flags and body with the same link chips patterns use. The graph
+ * pane draws the selected page's map (pages, their `[[links]]`, and
+ * see-through nodes for pages not written yet). Pages are written by agents
+ * or edited in Files, so the forget, restore and curate controls are hidden
+ * there. DocumentMap's `pageChanged` and `mapsChanged` events reload it.
+ *
  * The Learning tab is a read-only report over GoalManager's learning funnel
  * (`getLearningFunnel`): how many actions stated a prediction and named the
  * belief behind it, how the reviewer judged them and what it blamed for the
@@ -50,6 +59,7 @@ import { UndoHistory, UndoRefused, UNDO_EVENTS, undoMethods, type UndoAction } f
 import { emptyStateMarkdown, emptyStateStyle, hintStyle, sectionHeaderStyle, sectionHeaderText } from './ui-kit.js';
 import { readPattern, readStructured, renderPatternText } from '../core/pattern.js';
 import type { KnowledgeEntry, KnowledgeType } from '../core/knowledge.js';
+import { INDEX_SLUG, linkKey, slugOf } from '../core/map-page.js';
 import { OCCURRENCE_BUCKETS, NEGATIVE_REACTIONS, type OccurrenceBucket } from '../core/surprise.js';
 import type { ListItem } from './widgets/list-widget.js';
 
@@ -69,10 +79,115 @@ const GHOST_PREFIX = 'unwritten:';
  * Vector icon names for knowledge types. ListWidget renders these at the
  * row leading edge (via ListItem.iconName); colors come from the theme.
  */
-const TAB_LABELS = ['All', 'Patterns', 'Learned', 'Facts', 'Insights', 'References', 'Learning'];
+const TAB_LABELS = ['All', 'Patterns', 'Learned', 'Facts', 'Insights', 'References', 'Maps', 'Learning'];
 const TAB_TYPES: (KnowledgeType | undefined)[] = [undefined, 'pattern', 'learned', 'fact', 'insight', 'reference'];
+/** The Maps tab: DocumentMap's pages, not a KnowledgeBase type filter. */
+const MAPS_TAB = TAB_LABELS.indexOf('Maps');
 /** The Learning tab: a report over GoalManager's learning funnel, not a type filter. */
 const LEARNING_TAB = TAB_LABELS.indexOf('Learning');
+
+/** Map node id prefix for a written map page (the rest is its slug). */
+const PAGE_PREFIX = 'page:';
+/** Most pages the Maps tab's search lists (DocumentMap caps a search at 20). */
+const MAP_SEARCH_LIMIT = 20;
+const MAPS_EMPTY_TITLE = 'No maps yet';
+const MAPS_EMPTY_BODY =
+  'A map is a short guide to a collection of documents, with a page per subject and links between them. '
+  + 'Ask in Chat to map a folder, for example "map the documents in /uploads/contracts". '
+  + "A project's map appears here after an agent has worked in it.";
+
+/** One page of a map as the Maps tab lists it (from DocumentMap `getMap`). */
+interface MapPageRow {
+  map: string;
+  mapName: string;
+  mapKind: string;
+  title: string;
+  slug: string;
+  revision: number;
+  writer: string;
+  updatedAt: number;
+  sources: number;
+  flagged: boolean;
+  editedInFiles: boolean;
+}
+
+/** DocumentMap's `getMap` reply, as far as the browser reads it. */
+interface MapDetail {
+  id: string;
+  kind: string;
+  name: string;
+  pages?: Array<{
+    title: string; slug: string; aliases?: string[]; revision?: number; writer?: string; updatedAt?: number;
+    sources?: number; flagged?: boolean; editedInFiles?: boolean;
+  }>;
+}
+
+/** DocumentMap's `readPage` reply for a page it found. */
+interface MapPageView {
+  map: string;
+  title: string;
+  slug: string;
+  revision: number;
+  writer: string;
+  updatedAt: number;
+  flagged: boolean;
+  editedInFiles: boolean;
+  path: string;
+  body: string;
+  sources: Array<{ path: string; fp?: string }>;
+  flags: Array<{ reason: string; by: string; at: number }>;
+  sourceRoot: { kind: string; root: string };
+  links: string[];
+  unwrittenLinks: string[];
+  linkedFrom: string[];
+}
+
+/** DocumentMap's `lint` reply, as far as the index summary reads it. */
+interface MapLint {
+  unwritten?: unknown[];
+  broken?: unknown[];
+  orphans?: unknown[];
+  uncited?: unknown[];
+  flagged?: unknown[];
+  editedInFiles?: unknown[];
+  size?: { bloated?: boolean };
+}
+
+/** Where a link chip leads: a KnowledgeBase entry, or a page of a map. */
+type LinkTarget =
+  | { kind: 'entry'; entry: KnowledgeEntry }
+  | { kind: 'page'; map: string; page: string };
+
+/** One node the graph pane draws, with the link names it uses (resolved or not). */
+interface GraphItem { id: string; label: string; size: number; links: string[] }
+
+/** What the graph pane draws: its items, how a link name finds an item, and what to select. */
+interface GraphSource {
+  title: string;
+  emptyText: string;
+  items: GraphItem[];
+  resolve: (name: string) => string | undefined;
+  selectedId?: string;
+}
+
+/** "1 page" / "3 pages". */
+function plural(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+/** A map's lint report in a few plain words, for its index page's meta line. */
+function lintSummary(lint: MapLint): string {
+  const n = (v: unknown[] | undefined) => (Array.isArray(v) ? v.length : 0);
+  const parts: string[] = [];
+  if (n(lint.unwritten)) parts.push(plural(n(lint.unwritten), 'page linked but not written yet', 'pages linked but not written yet'));
+  if (n(lint.broken)) parts.push(plural(n(lint.broken), 'link to an archived page', 'links to archived pages'));
+  if (n(lint.orphans)) parts.push(plural(n(lint.orphans), 'page nothing links to', 'pages nothing links to'));
+  if (n(lint.uncited)) parts.push(plural(n(lint.uncited), 'page citing no sources', 'pages citing no sources'));
+  if (n(lint.flagged)) parts.push(plural(n(lint.flagged), 'flagged page', 'flagged pages'));
+  if (n(lint.editedInFiles)) parts.push(plural(n(lint.editedInFiles), 'page edited in Files', 'pages edited in Files'));
+  if (lint.size?.bloated) parts.push('large next to its sources');
+  return parts.length > 0 ? parts.join(' · ') : 'no problems found';
+}
 
 /** Height of one Learning report row (fixed: a scrolling pane culls rows with no height). */
 const REPORT_ROW_H = 22;
@@ -447,8 +562,26 @@ export class KnowledgeBrowser extends Abject {
   private linkedFromRowId?: AbjectId;
   /** Dynamic chips currently in the link rows, with the row each lives in. */
   private linkRowWidgets: Array<{ rowId: AbjectId; widgetId: AbjectId }> = [];
-  /** Link-navigation buttons mapped to the pattern entry they open. */
-  private linkButtons: Map<AbjectId, KnowledgeEntry> = new Map();
+  /** Link-navigation buttons mapped to the pattern entry or map page they open. */
+  private linkButtons: Map<AbjectId, LinkTarget> = new Map();
+  /** Whether the graph pane is open (the Patterns tab, or the Maps tab once a page is chosen). */
+  private graphShown = false;
+
+  // Maps tab: pages of every map, read from DocumentMap.
+  private documentMapId?: AbjectId;
+  private documentMapSubscribed = false;
+  /** Every page of every map, by map then index first. */
+  private mapRows: MapPageRow[] = [];
+  /** The rows the list shows (all of them, or the search's hits). */
+  private filteredMapRows: MapPageRow[] = [];
+  /** DocumentMap answered the last load. */
+  private mapsAvailable = true;
+  /** Map reloads running, by name, each noting whether another was asked for meanwhile. */
+  private mapReloads = new Map<string, { again: boolean }>();
+  /** The page shown in the detail pane on the Maps tab. */
+  private selectedPage?: { map: string; slug: string; title: string };
+  /** The map the graph pane draws on the Maps tab. */
+  private graphMapId?: string;
 
   private entries: KnowledgeEntry[] = [];
   private filteredEntries: KnowledgeEntry[] = [];
@@ -501,6 +634,7 @@ export class KnowledgeBrowser extends Abject {
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.knowledgeBaseId = await this.discoverDep('KnowledgeBase') ?? undefined;
+    this.documentMapId = await this.discoverDep('DocumentMap').catch(() => null) ?? undefined;
 
     // Peer id, so entries synced from other peers can be attributed and their
     // edit controls withheld. Falls back to this object's id until Identity
@@ -737,10 +871,7 @@ export class KnowledgeBrowser extends Abject {
             style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
           // 8: empty state
           { type: 'label', windowId: this.windowId,
-            text: emptyStateMarkdown(
-              'Select an entry',
-              'Pick one from the list to read it in full, see its tags and links, and forget or restore it.',
-            ),
+            text: this.detailEmptyText(),
             style: emptyStateStyle(this.theme) },
         ],
       })
@@ -823,6 +954,7 @@ export class KnowledgeBrowser extends Abject {
     if (this.knowledgeBaseId) {
       this.send(request(this.id, this.knowledgeBaseId, 'addDependent', {}));
     }
+    this.subscribeDocumentMap();
 
     // Show empty state, hide detail widgets
     await this.showEmptyState(true);
@@ -852,6 +984,10 @@ export class KnowledgeBrowser extends Abject {
     if (this.knowledgeBaseId) {
       this.send(request(this.id, this.knowledgeBaseId, 'removeDependent', {}));
     }
+    if (this.documentMapId && this.documentMapSubscribed) {
+      this.send(request(this.id, this.documentMapId, 'removeDependent', {}));
+    }
+    this.documentMapSubscribed = false;
 
     await this.request(
       request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
@@ -897,6 +1033,12 @@ export class KnowledgeBrowser extends Abject {
     this.linkedFromRowId = undefined;
     this.linkRowWidgets = [];
     this.linkButtons.clear();
+    this.graphShown = false;
+    this.mapRows = [];
+    this.filteredMapRows = [];
+    this.mapsAvailable = true;
+    this.selectedPage = undefined;
+    this.graphMapId = undefined;
     this.entries = [];
     this.filteredEntries = [];
     this.selectedId = undefined;
@@ -913,8 +1055,9 @@ export class KnowledgeBrowser extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
   private async loadEntries(): Promise<void> {
-    // The Learning tab shows no entries (its list is hidden); the next tab change reloads.
-    if (!this.knowledgeBaseId || this.activeTab === LEARNING_TAB) return;
+    // The Learning tab shows no entries (its list is hidden) and the Maps tab
+    // lists map pages (loadMapPages); the next tab change reloads.
+    if (!this.knowledgeBaseId || this.activeTab === LEARNING_TAB || this.activeTab === MAPS_TAB) return;
 
     try {
       const typeFilter = TAB_TYPES[this.activeTab];
@@ -947,6 +1090,208 @@ export class KnowledgeBrowser extends Abject {
       await this.rebuildList();
     } catch (err) {
       log.warn('Failed to load entries:', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /** Reload whatever the list shows on the active tab: map pages or knowledge entries. */
+  private async reloadList(): Promise<void> {
+    if (this.activeTab === MAPS_TAB) await this.loadMapPages();
+    else await this.loadEntries();
+  }
+
+  // ─── Maps tab (DocumentMap pages) ──────────────────────────────────
+
+  /** DocumentMap, discovered again when it was missing (it may spawn after this window). */
+  private async documentMap(): Promise<AbjectId | undefined> {
+    this.documentMapId = await this.resolveDep('DocumentMap', this.documentMapId).catch(() => undefined);
+    this.subscribeDocumentMap();
+    return this.documentMapId;
+  }
+
+  /** Hear DocumentMap's page and map changes while the window is open. */
+  private subscribeDocumentMap(): void {
+    if (!this.windowId || !this.documentMapId || this.documentMapSubscribed) return;
+    this.documentMapSubscribed = true;
+    this.send(request(this.id, this.documentMapId, 'addDependent', {}));
+  }
+
+  /**
+   * Run one reload of a kind at a time. Changes that arrive during a reload
+   * (an agent writing a map page by page) are answered by one more run
+   * after it, not one run each.
+   */
+  private async coalesceReload(key: string, run: () => Promise<void>): Promise<void> {
+    const running = this.mapReloads.get(key);
+    if (running) {
+      running.again = true;
+      return;
+    }
+    const state = { again: false };
+    this.mapReloads.set(key, state);
+    try {
+      do {
+        state.again = false;
+        await run();
+      } while (state.again && this.activeTab === MAPS_TAB && this.windowId);
+    } finally {
+      if (this.mapReloads.get(key) === state) this.mapReloads.delete(key);
+    }
+  }
+
+  /** Reload the Maps tab's list. */
+  private async loadMapPages(): Promise<void> {
+    await this.coalesceReload('list', () => this.readMapPages());
+  }
+
+  /**
+   * DocumentMap changed: reload the list, the page on show when it was the
+   * one changed (or is gone), and the graph when it draws that map.
+   */
+  private async mapsChanged(aspect: string, value: unknown): Promise<void> {
+    if (this.activeTab !== MAPS_TAB || !this.windowId) return;
+    const change = (value && typeof value === 'object' ? value : {}) as { map?: string; title?: string };
+    const touches = (map: string | undefined) => !!map && (aspect === 'mapsChanged' || change.map === map);
+    await this.loadMapPages();
+
+    // The map the graph draws was removed: close the pane.
+    if (aspect === 'mapsChanged' && this.graphMapId && !this.mapRows.some(r => r.map === this.graphMapId)) {
+      this.graphMapId = undefined;
+      await this.updateGraphPane();
+    }
+    const shown = this.selectedPage;
+    if (shown && touches(shown.map) && (aspect === 'mapsChanged' || !change.title || linkKey(change.title) === linkKey(shown.title))) {
+      await this.coalesceReload('page', () => this.refreshSelectedPage());
+    }
+    if (touches(this.graphMapId)) {
+      await this.coalesceReload('graph', () => this.loadGraph());
+      const changed = change.title ? this.mapRows.find(r => r.map === change.map && linkKey(r.title) === linkKey(change.title!)) : undefined;
+      if (changed && changed.map === this.graphMapId) await this.pulseNode(PAGE_PREFIX + changed.slug);
+    }
+  }
+
+  /** Read the page on show again; when it is gone, the detail pane empties. */
+  private async refreshSelectedPage(): Promise<void> {
+    const shown = this.selectedPage;
+    const dm = this.documentMapId;
+    if (!shown || !dm) return;
+    const view = await this.request<(MapPageView & { found: true }) | { found: false }>(
+      request(this.id, dm, 'readPage', { map: shown.map, page: shown.slug }),
+    ).catch(() => ({ found: false as const }));
+    if (this.selectedPage !== shown || this.activeTab !== MAPS_TAB) return; // another page was chosen meanwhile
+    if (view.found) {
+      this.selectedPage = { map: view.map, slug: view.slug, title: view.title };
+      await this.showPageDetail(view);
+    } else {
+      this.selectedPage = undefined;
+      await this.showEmptyState(true);
+    }
+  }
+
+  /** Read every map's pages (and the search's hits) from DocumentMap, then rebuild the list. */
+  private async readMapPages(): Promise<void> {
+    const dm = await this.documentMap();
+    let rows: MapPageRow[] = [];
+    let available = !!dm;
+    if (dm) {
+      try {
+        const maps = await this.request<Array<{ id: string }>>(request(this.id, dm, 'listMaps', {}));
+        const details = await Promise.all((Array.isArray(maps) ? maps : []).map(m =>
+          this.request<MapDetail>(request(this.id, dm, 'getMap', { map: m.id })).catch(() => null)));
+        rows = details
+          .filter((d): d is MapDetail => !!d && typeof d.id === 'string')
+          .sort((a, b) => String(a.name ?? '').localeCompare(String(b.name ?? '')) || a.id.localeCompare(b.id))
+          // getMap lists the index first, then pages by title.
+          .flatMap(d => (d.pages ?? []).map(p => ({
+            map: d.id, mapName: d.name || d.id, mapKind: d.kind,
+            title: p.title, slug: p.slug, revision: count(p.revision), writer: p.writer ?? 'unknown',
+            updatedAt: count(p.updatedAt), sources: count(p.sources),
+            flagged: p.flagged === true, editedInFiles: p.editedInFiles === true,
+          })));
+      } catch (err) {
+        available = false;
+        this.documentMapId = undefined; // rediscover next time: it may have been respawned
+        this.documentMapSubscribed = false;
+        log.warn('Maps unavailable:', err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    let shown = rows;
+    const query = this.searchQuery.trim();
+    if (dm && available && query) {
+      const hits = await this.request<Array<{ map: string; title: string }>>(
+        request(this.id, dm, 'search', { query, limit: MAP_SEARCH_LIMIT }),
+      ).catch(() => [] as Array<{ map: string; title: string }>);
+      const byKey = new Map(rows.map(r => [`${r.map}#${linkKey(r.title)}`, r]));
+      const seen = new Set<MapPageRow>();
+      shown = [];
+      for (const hit of Array.isArray(hits) ? hits : []) {
+        const row = byKey.get(`${hit.map}#${linkKey(String(hit.title ?? ''))}`);
+        if (row && !seen.has(row)) { seen.add(row); shown.push(row); }
+      }
+    }
+
+    if (this.activeTab !== MAPS_TAB || !this.windowId) return; // left the tab meanwhile
+    this.mapsAvailable = available;
+    this.mapRows = rows;
+    this.filteredMapRows = shown;
+    await this.rebuildMapList();
+    ensure(this.filteredMapRows.every(r => this.mapRows.includes(r)), 'the list shows only known map pages');
+  }
+
+  private mapRowKey(map: string, slug: string): string {
+    return `${map}#${slug}`;
+  }
+
+  /** A page's name in the list and the detail title: an index reads as its map's name. */
+  private mapPageLabel(row: { slug: string; title: string; mapName: string }): string {
+    return row.slug === INDEX_SLUG ? `${row.mapName} (index)` : row.title;
+  }
+
+  private async rebuildMapList(): Promise<void> {
+    if (!this.listWidgetId) return;
+    const items: ListItem[] = this.filteredMapRows.map(row => ({
+      label: this.mapPageLabel(row),
+      value: this.mapRowKey(row.map, row.slug),
+      secondary: [row.map, `revision ${row.revision}`, row.writer].join('  ·  '),
+      badge: row.flagged
+        ? { text: 'flagged', color: this.theme.statusWarning }
+        : row.editedInFiles
+          ? { text: 'edited in Files', color: this.theme.statusNeutral }
+          : { text: row.mapKind, color: row.mapKind === 'project' ? this.theme.textHeading : this.theme.textSecondary },
+    }));
+    await this.request(request(this.id, this.listWidgetId, 'update', { items })).catch(() => { /* list gone */ });
+    await this.applyListEmpty(items.length === 0);
+  }
+
+  /**
+   * Open a page of a map: read it from DocumentMap, show it in the detail
+   * pane, select it in the list, and draw its map in the graph pane. `page`
+   * is a slug, title or alias (DocumentMap resolves each).
+   */
+  private async selectMapPage(map: string, page: string): Promise<void> {
+    precondition(map.length > 0 && page.length > 0, 'a map page is named by its map and page');
+    const dm = await this.documentMap();
+    if (!dm) return;
+    const view = await this.request<(MapPageView & { found: true }) | { found: false; error?: string }>(
+      request(this.id, dm, 'readPage', { map, page }),
+    ).catch((err) => ({ found: false as const, error: err instanceof Error ? err.message : String(err) }));
+    if (this.activeTab !== MAPS_TAB || !this.windowId) return; // left the tab meanwhile
+    if (!view.found) {
+      this.playEffect('shake');
+      await this.notify(`That page is not in the map now${view.error ? `: ${view.error.slice(0, 80)}` : ''}`, 'warning');
+      return;
+    }
+    this.selectedPage = { map: view.map, slug: view.slug, title: view.title };
+    const idx = this.filteredMapRows.findIndex(r => r.map === view.map && r.slug === view.slug);
+    if (idx >= 0 && this.listWidgetId) {
+      await this.request(request(this.id, this.listWidgetId, 'update', { selectedIndex: idx })).catch(() => { /* list gone */ });
+    }
+    await this.showPageDetail(view);
+    if (this.graphMapId !== view.map) {
+      this.graphMapId = view.map;
+      await this.updateGraphPane();
+    } else {
+      await this.selectOnMap(PAGE_PREFIX + view.slug);
     }
   }
 
@@ -999,9 +1344,13 @@ export class KnowledgeBrowser extends Abject {
 
   /** Empty-list text for the current tab and search. */
   private listEmptyText(): string {
+    if (this.activeTab === MAPS_TAB && !this.mapsAvailable) {
+      return emptyStateMarkdown('Maps are unavailable', 'The document map for this workspace did not answer. Try again in a moment.');
+    }
     if (this.searchQuery.trim().length > 0) {
       return emptyStateMarkdown('No matches', 'Try other words, or clear the search to see everything.');
     }
+    if (this.activeTab === MAPS_TAB) return emptyStateMarkdown(MAPS_EMPTY_TITLE, MAPS_EMPTY_BODY);
     const type = TAB_TYPES[this.activeTab];
     if (type === 'pattern') {
       return emptyStateMarkdown(
@@ -1086,13 +1435,23 @@ export class KnowledgeBrowser extends Abject {
   // Detail pane
   // ═══════════════════════════════════════════════════════════════════
 
+  /** The detail pane's empty-state text for the active tab. */
+  private detailEmptyText(): string {
+    return this.activeTab === MAPS_TAB
+      ? emptyStateMarkdown('Select a page', 'Pick one from the list to read it, see the sources it cites, and follow its links to other pages.')
+      : emptyStateMarkdown('Select an entry', 'Pick one from the list to read it in full, see its tags and links, and forget or restore it.');
+  }
+
   private async showEmptyState(empty: boolean): Promise<void> {
     if (!this.emptyLabelId) return;
     const detailVis = !empty;
     if (empty) await this.clearLinkRows();
 
     await Promise.all([
-      this.request(request(this.id, this.emptyLabelId, 'update', { style: { visible: empty } })),
+      this.request(request(this.id, this.emptyLabelId, 'update', {
+        ...(empty ? { text: this.detailEmptyText() } : {}),
+        style: { visible: empty },
+      })),
       this.request(request(this.id, this.titleLabelId!, 'update', { style: { visible: detailVis } })),
       this.request(request(this.id, this.typeLabelId!, 'update', { style: { visible: detailVis } })),
       this.request(request(this.id, this.tagsLabelId!, 'update', { style: { visible: detailVis } })),
@@ -1153,6 +1512,120 @@ export class KnowledgeBrowser extends Abject {
     ]);
 
     await this.renderPatternLinks(entry);
+  }
+
+  /**
+   * Show a map page: its map, revision, writer and source root above the
+   * body, any flags readers raised and the sources it cites around it, and
+   * its links as chips. An index page adds its map's lint summary. Pages are
+   * written by agents or edited in Files, so Forget and Restore stay hidden.
+   */
+  private async showPageDetail(view: MapPageView): Promise<void> {
+    await this.showEmptyState(false);
+    const row = this.mapRows.find(r => r.map === view.map && r.slug === view.slug);
+    const mapName = row?.mapName ?? view.map;
+    const isIndex = view.slug === INDEX_SLUG;
+    const sources = Array.isArray(view.sources) ? view.sources : [];
+    const flags = Array.isArray(view.flags) ? view.flags : [];
+    const root = view.sourceRoot ? `${view.sourceRoot.kind === 'host' ? 'this computer' : 'Files'}: ${view.sourceRoot.root}` : 'unknown';
+    const updated = view.updatedAt ? new Date(view.updatedAt).toLocaleDateString() : 'unknown';
+
+    const meta = [
+      `Map ${view.map}`,
+      `Revision ${count(view.revision)}`,
+      `Written by ${view.writer || 'unknown'}`,
+      `Updated ${updated}`,
+      `Sources in ${root}`,
+    ];
+    if (isIndex) {
+      const dm = await this.documentMap();
+      const lint = dm
+        ? await this.request<MapLint>(request(this.id, dm, 'lint', { map: view.map })).catch(() => null)
+        : null;
+      if (lint) meta.push(`Checks: ${lintSummary(lint)}`);
+    }
+
+    const notes: string[] = [];
+    for (const f of flags) {
+      const when = f.at ? ` on ${new Date(f.at).toLocaleDateString()}` : '';
+      notes.push(`> **Flagged** by ${f.by || 'a reader'}${when}: ${String(f.reason ?? '').replace(/\n+/g, ' ')}`);
+    }
+    if (view.editedInFiles) notes.push('> Edited in Files since an agent last wrote it.');
+    const cited = sources.length > 0
+      ? `**Sources**\n\n${sources.map(s => `- \`${s.path}\``).join('\n')}`
+      : '';
+    const content = [notes.join('\n>\n'), view.body ?? '', cited].filter(Boolean).join('\n\n---\n\n');
+
+    await Promise.all([
+      this.request(request(this.id, this.titleLabelId!, 'update', {
+        text: this.mapPageLabel({ slug: view.slug, title: view.title, mapName }),
+        style: { color: this.theme.textHeading, visible: true },
+      })),
+      this.request(request(this.id, this.typeLabelId!, 'update', {
+        text: `${row?.mapKind === 'project' ? 'Project map' : 'Document map'}  ·  ${mapName}${isIndex ? '  ·  index' : ''}`,
+        style: { color: view.flagged ? this.theme.statusWarning : this.theme.textSecondary, visible: true },
+      })),
+      this.request(request(this.id, this.tagsLabelId!, 'update', {
+        text: [
+          sources.length > 0 ? `Cites ${plural(sources.length, 'source', 'sources')}` : 'Cites no sources',
+          ...(flags.length > 0 ? [plural(flags.length, 'flag', 'flags')] : []),
+        ].join('  ·  '),
+        style: { visible: true },
+      })),
+      this.request(request(this.id, this.metaLabelId!, 'update', {
+        text: meta.join('  |  '),
+        style: { visible: true },
+      })),
+      this.request(request(this.id, this.deleteBtnId!, 'update', { style: { visible: false } })),
+      this.request(request(this.id, this.restoreBtnId!, 'update', { style: { visible: false } })),
+      this.request(request(this.id, this.contentLabelId!, 'update', { text: content, style: { visible: true } })),
+    ]);
+
+    await this.renderPageLinks(view);
+  }
+
+  /**
+   * A map page's neighborhood: its links as chips that open the page, names
+   * no page answers yet as dimmed "unwritten" labels, and a row of the pages
+   * that link to it.
+   */
+  private async renderPageLinks(view: MapPageView): Promise<void> {
+    await this.clearLinkRows();
+    if (!this.linksRowId || !this.linkedFromRowId) return;
+    // A page that names itself needs no chip back to itself.
+    const self = new Set([linkKey(view.title), linkKey(view.slug)]);
+    const links = (Array.isArray(view.links) ? view.links : []).filter(name => !self.has(linkKey(name)));
+    const unwritten = Array.isArray(view.unwrittenLinks) ? view.unwrittenLinks : [];
+    const linkedFrom = Array.isArray(view.linkedFrom) ? view.linkedFrom : [];
+    await this.renderLinkRows(
+      [
+        ...links.map(name => ({ text: name, target: { kind: 'page' as const, map: view.map, page: name } })),
+        ...unwritten.map(name => ({ text: `${name} (unwritten)`, dim: true })),
+      ],
+      [...new Set(linkedFrom)].map(title => {
+        const row = this.mapRows.find(r => r.map === view.map && r.title === title);
+        return { text: row ? this.mapPageLabel(row) : title, target: { kind: 'page' as const, map: view.map, page: row?.slug ?? title } };
+      }),
+    );
+  }
+
+  /**
+   * Fill the link rows: 'Links:' then the outgoing chips, 'Linked from:' then
+   * the incoming ones. A row with nothing to show stays empty (zero height).
+   */
+  private async renderLinkRows(
+    outgoing: Array<{ text: string; dim?: boolean; target?: LinkTarget }>,
+    incoming: Array<{ text: string; target: LinkTarget }>,
+  ): Promise<void> {
+    if (!this.linksRowId || !this.linkedFromRowId) return;
+    if (outgoing.length > 0) {
+      await this.addLinkChip(this.linksRowId, { text: 'Links:' });
+      for (const chip of outgoing) await this.addLinkChip(this.linksRowId, chip);
+    }
+    if (incoming.length > 0) {
+      await this.addLinkChip(this.linkedFromRowId, { text: 'Linked from:' });
+      for (const chip of incoming) await this.addLinkChip(this.linkedFromRowId, chip);
+    }
   }
 
   // ─── Pattern link navigation ───────────────────────────────────────
@@ -1218,30 +1691,23 @@ export class KnowledgeBrowser extends Abject {
       p.id !== entry.id
       && this.parsePatternLinks(p.content).some(name => this.normalizeTitle(name) === selfNorm));
 
-    if (outgoing.length > 0) {
-      await this.addLinkChip(this.linksRowId, { text: 'Links:' });
-      for (const name of outgoing) {
-        const target = byTitle.get(this.normalizeTitle(name));
-        if (target && target.id !== entry.id) {
-          await this.addLinkChip(this.linksRowId, { text: target.title, target });
-        } else if (!target) {
-          await this.addLinkChip(this.linksRowId, { text: `${name} (unwritten)`, dim: true });
-        }
+    const chips: Array<{ text: string; dim?: boolean; target?: LinkTarget }> = [];
+    for (const name of outgoing) {
+      const target = byTitle.get(this.normalizeTitle(name));
+      if (target && target.id !== entry.id) {
+        chips.push({ text: target.title, target: { kind: 'entry', entry: target } });
+      } else if (!target) {
+        chips.push({ text: `${name} (unwritten)`, dim: true });
       }
     }
-    if (incoming.length > 0) {
-      await this.addLinkChip(this.linkedFromRowId, { text: 'Linked from:' });
-      for (const p of incoming) {
-        await this.addLinkChip(this.linkedFromRowId, { text: p.title, target: p });
-      }
-    }
+    await this.renderLinkRows(chips, incoming.map(p => ({ text: p.title, target: { kind: 'entry' as const, entry: p } })));
     log.info(`renderPatternLinks("${entry.title}"): ${outgoing.length} outgoing, ${incoming.length} incoming`);
   }
 
-  /** Add one chip to a link row: a button when it targets a pattern, a label otherwise. */
+  /** Add one chip to a link row: a button when it leads to a pattern or map page, a label otherwise. */
   private async addLinkChip(
     rowId: AbjectId,
-    chip: { text: string; dim?: boolean; target?: KnowledgeEntry },
+    chip: { text: string; dim?: boolean; target?: LinkTarget },
   ): Promise<void> {
     const spec = chip.target
       ? { type: 'button', windowId: this.windowId, text: chip.text }
@@ -1264,77 +1730,152 @@ export class KnowledgeBrowser extends Abject {
     }
   }
 
-  // ─── Pattern language map (graph pane) ─────────────────────────────
+  // ─── Graph pane: the pattern language, or the selected page's map ──
 
+  /** Whether the graph pane is open with a graph in it. */
   private graphActive(): boolean {
-    return TAB_TYPES[this.activeTab] === 'pattern' && !!this.graphId;
+    return this.graphShown && !!this.graphId;
   }
 
-  /** Collapse or expand the map pane to match the active tab. */
+  /** The graph pane opens on the Patterns tab, and on the Maps tab once a page (so a map) is chosen. */
+  private graphWanted(): boolean {
+    if (this.activeTab === MAPS_TAB) return !!this.graphMapId;
+    return TAB_TYPES[this.activeTab] === 'pattern';
+  }
+
+  /** Collapse or expand the graph pane to match the active tab, and draw it when open. */
   private async updateGraphPane(): Promise<void> {
     if (!this.innerSplitId || !this.graphId) return;
-    const active = TAB_TYPES[this.activeTab] === 'pattern';
-    await this.request(request(this.id, this.innerSplitId, 'update', {
-      dividerPosition: active ? 0.5 : 0,
-    })).catch(() => { /* window torn down */ });
-    await this.request(request(this.id, this.graphId, 'update', {
-      style: { visible: active },
-    })).catch(() => { /* window torn down */ });
+    const active = this.graphWanted();
+    if (active !== this.graphShown) {
+      this.graphShown = active;
+      await this.request(request(this.id, this.innerSplitId, 'update', {
+        dividerPosition: active ? 0.5 : 0,
+      })).catch(() => { /* window torn down */ });
+      await this.request(request(this.id, this.graphId, 'update', {
+        style: { visible: active },
+      })).catch(() => { /* window torn down */ });
+    }
     if (active) await this.loadGraph();
   }
 
-  /**
-   * Build the language map from ALL workspace patterns (the search box
-   * filters the list, never the map): one node per pattern, one directed
-   * edge per Links reference, and a see-through node per dangling link
-   * name. The map widget keeps existing nodes where they are and springs
-   * the rest into place.
-   */
+  /** Read the active tab's graph (patterns, or the chosen map's pages) and draw it. */
   private async loadGraph(): Promise<void> {
-    if (!this.knowledgeBaseId || !this.graphId) return;
+    if (!this.graphId) return;
+    const source = this.activeTab === MAPS_TAB ? await this.mapGraphSource() : await this.patternGraphSource();
+    if (!source || !this.graphActive()) return;
+    await this.drawGraph(source);
+  }
 
+  /**
+   * The language map's source: ALL workspace patterns (the search box
+   * filters the list, never the map), each with the link names off its
+   * structure, resolved by normalized title.
+   */
+  private async patternGraphSource(): Promise<GraphSource | null> {
+    if (!this.knowledgeBaseId) return null;
     const patterns = await this.request<KnowledgeEntry[]>(
       request(this.id, this.knowledgeBaseId, 'list', { type: 'pattern', limit: 200 }),
     ).catch(() => [] as KnowledgeEntry[]);
-
     const byNorm = new Map(patterns.map((p) => [this.normalizeTitle(p.title), p.id]));
-    const nodes: Array<Record<string, unknown>> = patterns.map((p) => ({
-      id: p.id,
-      label: p.title,
-      group: 'pattern',
-      size: 8 + Math.min(6, p.usefulCount),
+    return {
+      title: 'Pattern language',
+      emptyText: 'No patterns yet',
+      items: patterns.map((p) => ({
+        id: p.id, label: p.title, size: 8 + Math.min(6, p.usefulCount), links: this.parsePatternLinks(p.content),
+      })),
+      resolve: (name) => byNorm.get(this.normalizeTitle(name)),
+      selectedId: this.selectedId,
+    };
+  }
+
+  /**
+   * The chosen map's source: one item per page (the index larger), each
+   * with every link name its body uses. Names resolve by title, alias or
+   * slug, as DocumentMap resolves them; the rest are pages still to write.
+   */
+  private async mapGraphSource(): Promise<GraphSource | null> {
+    const mapId = this.graphMapId;
+    const dm = mapId ? await this.documentMap() : undefined;
+    if (!mapId || !dm) return null;
+    const detail = await this.request<MapDetail>(request(this.id, dm, 'getMap', { map: mapId })).catch(() => null);
+    if (!detail || this.graphMapId !== mapId) return null;
+    const pages = detail.pages ?? [];
+    const views = await Promise.all(pages.map(p =>
+      this.request<Partial<MapPageView> & { found?: boolean }>(request(this.id, dm, 'readPage', { map: mapId, page: p.slug }))
+        .catch(() => null)));
+    if (this.graphMapId !== mapId) return null; // another map was chosen meanwhile
+
+    const byKey = new Map<string, string>();
+    const bySlug = new Map<string, string>();
+    for (const p of pages) {
+      const id = PAGE_PREFIX + p.slug;
+      bySlug.set(p.slug, id);
+      byKey.set(linkKey(p.title), id);
+      for (const a of p.aliases ?? []) byKey.set(linkKey(a), id);
+    }
+    const items: GraphItem[] = pages.map((p, i) => {
+      const v = views[i];
+      const links = v?.found ? [...(v.links ?? []), ...(v.unwrittenLinks ?? [])] : [];
+      return {
+        id: PAGE_PREFIX + p.slug,
+        label: p.slug === INDEX_SLUG ? `${detail.name} (index)` : p.title,
+        size: p.slug === INDEX_SLUG ? 14 : 8 + Math.min(6, count(p.sources)),
+        links,
+      };
+    });
+    return {
+      title: detail.name,
+      emptyText: 'No pages in this map yet',
+      items,
+      resolve: (name) => byKey.get(linkKey(name)) ?? bySlug.get(name.trim()) ?? bySlug.get(slugOf(name)),
+      selectedId: this.selectedPage?.map === mapId ? PAGE_PREFIX + this.selectedPage.slug : undefined,
+    };
+  }
+
+  /**
+   * Draw a graph source: one node per item, one directed edge per link
+   * that resolves, and a see-through node per name nothing answers yet.
+   * The widget keeps existing nodes where they are and springs the rest
+   * into place.
+   */
+  private async drawGraph(source: GraphSource): Promise<void> {
+    if (!this.graphId) return;
+    const nodes: Array<Record<string, unknown>> = source.items.map((item) => ({
+      id: item.id, label: item.label, group: 'pattern', size: item.size,
     }));
     const ghosts = new Set<string>();
     const edges: Array<Record<string, unknown>> = [];
     const seen = new Set<string>();
     this.graphLinks.clear();
-    for (const p of patterns) {
+    for (const item of source.items) {
       const targets: string[] = [];
-      for (const name of this.parsePatternLinks(p.content)) {
-        const norm = this.normalizeTitle(name);
-        let target = byNorm.get(norm);
+      for (const name of item.links) {
+        let target = source.resolve(name);
         const ghost = target === undefined;
         if (ghost) {
-          target = `${GHOST_PREFIX}${norm}`;
+          target = `${GHOST_PREFIX}${this.normalizeTitle(name)}`;
           if (!ghosts.has(target)) {
             ghosts.add(target);
             nodes.push({ id: target, label: name, group: 'unwritten', ghost: true, size: 6 });
           }
         }
-        if (target === p.id || seen.has(`${p.id}>${target}`)) continue;
-        seen.add(`${p.id}>${target}`);
+        if (target === item.id || seen.has(`${item.id}>${target}`)) continue;
+        seen.add(`${item.id}>${target}`);
         targets.push(target!);
-        edges.push({ from: p.id, to: target, ...(ghost ? { style: 'dashed' } : {}) });
+        edges.push({ from: item.id, to: target, ...(ghost ? { style: 'dashed' } : {}) });
       }
-      this.graphLinks.set(p.id, targets);
+      this.graphLinks.set(item.id, targets);
     }
 
+    await this.request(request(this.id, this.graphId, 'update', { title: source.title, emptyText: source.emptyText }))
+      .catch(() => { /* window torn down */ });
     await this.request(request(this.id, this.graphId, 'setGraph', { nodes, edges }))
-      .catch((err) => log.warn('pattern map update failed:', err instanceof Error ? err.message : String(err)));
-    if (this.selectedId && patterns.some((p) => p.id === this.selectedId)) {
-      await this.request(request(this.id, this.graphId, 'select', { id: this.selectedId })).catch(() => {});
+      .catch((err) => log.warn('graph update failed:', err instanceof Error ? err.message : String(err)));
+    if (source.selectedId && source.items.some((item) => item.id === source.selectedId)) {
+      await this.request(request(this.id, this.graphId, 'select', { id: source.selectedId })).catch(() => {});
     }
-    log.info(`Pattern map: ${nodes.length} nodes (${ghosts.size} unwritten), ${edges.length} links`);
+    log.info(`${source.title} graph: ${nodes.length} nodes (${ghosts.size} unwritten), ${edges.length} links`);
   }
 
   /** Show the selection on the map (brought into view when it is outside). */
@@ -1344,8 +1885,8 @@ export class KnowledgeBrowser extends Abject {
       .catch(() => { /* not on the map (yet) */ });
   }
 
-  /** A newly woven pattern arrives as living light flowing along its links. */
-  private async pulseNewPattern(entryId: string): Promise<void> {
+  /** A newly woven pattern (or a page just written) arrives as living light flowing along its links. */
+  private async pulseNode(entryId: string): Promise<void> {
     if (!this.graphActive()) return;
     for (const target of (this.graphLinks.get(entryId) ?? []).slice(0, 6)) {
       await this.request(request(this.id, this.graphId!, 'pulse', { from: entryId, to: target, count: 2 }))
@@ -1387,17 +1928,19 @@ export class KnowledgeBrowser extends Abject {
   private async syncLearningPane(): Promise<void> {
     if (this.activeTab === LEARNING_TAB) await this.ensureLearningPane();
     const show = this.activeTab === LEARNING_TAB && !!this.learningPaneId;
+    const setVisible = (id: AbjectId | undefined, visible: boolean) => id
+      ? this.request(request(this.id, id, 'update', { style: { visible } })).catch(() => { /* window torn down */ })
+      : Promise.resolve();
     if (this.learningShown !== show) {
       this.learningShown = show;
-      const setVisible = (id: AbjectId | undefined, visible: boolean) => id
-        ? this.request(request(this.id, id, 'update', { style: { visible } })).catch(() => { /* window torn down */ })
-        : Promise.resolve();
       await Promise.all([
-        setVisible(this.toolbarRowId, !show),
         setVisible(this.splitPaneId, !show),
         setVisible(this.learningPaneId, show),
       ]);
     }
+    // The toolbar (Show archived, Curate) acts on knowledge entries: the
+    // Learning report and the Maps tab have none.
+    await setVisible(this.toolbarRowId, !show && this.activeTab !== MAPS_TAB);
     if (show && !this.learningLoaded) await this.loadLearning();
   }
 
@@ -1605,8 +2148,15 @@ export class KnowledgeBrowser extends Abject {
       if (!isNaN(idx) && idx >= 0 && idx < TAB_LABELS.length) {
         this.activeTab = idx;
         this.selectedId = undefined;
+        this.selectedPage = undefined;
+        this.graphMapId = undefined;
         await this.showEmptyState(true);
-        await this.loadEntries();
+        if (this.searchInputId) {
+          this.send(event(this.id, this.searchInputId, 'update', {
+            placeholder: idx === MAPS_TAB ? 'Search maps...' : 'Search knowledge...',
+          }));
+        }
+        await this.reloadList();
         await this.updateGraphPane();
         await this.syncLearningPane();
       }
@@ -1620,11 +2170,13 @@ export class KnowledgeBrowser extends Abject {
     }
 
     // Search input changed -- full-text search via KnowledgeBase recall
+    // (DocumentMap search on the Maps tab)
     if (fromId === this.searchInputId && aspect === 'change') {
       this.searchQuery = typeof value === 'string' ? value : '';
       this.selectedId = undefined;
+      this.selectedPage = undefined;
       await this.showEmptyState(true);
-      await this.loadEntries();
+      await this.reloadList();
       return;
     }
 
@@ -1685,11 +2237,15 @@ export class KnowledgeBrowser extends Abject {
       return;
     }
 
-    // Pattern link chip -- navigate to the linked pattern
+    // Link chip -- navigate to the linked pattern or map page
     if (aspect === 'click' && this.linkButtons.has(fromId)) {
       const target = this.linkButtons.get(fromId)!;
+      if (target.kind === 'page') {
+        await this.selectMapPage(target.map, target.page);
+        return;
+      }
       // Prefer the live entry (the cached one may predate an update)
-      const live = this.filteredEntries.find(e => e.id === target.id) ?? target;
+      const live = this.filteredEntries.find(e => e.id === target.entry.id) ?? target.entry;
       await this.selectPattern(live);
       return;
     }
@@ -1698,6 +2254,11 @@ export class KnowledgeBrowser extends Abject {
     if (fromId === this.listWidgetId && aspect === 'selectionChanged') {
       const data = typeof value === 'string' ? JSON.parse(value) : value;
       const entryId = (data as { value?: string })?.value;
+      if (entryId && this.activeTab === MAPS_TAB) {
+        const row = this.filteredMapRows.find(r => this.mapRowKey(r.map, r.slug) === entryId);
+        if (row) await this.selectMapPage(row.map, row.slug);
+        return;
+      }
       if (entryId) {
         this.selectedId = entryId;
         const entry = this.filteredEntries.find(e => e.id === entryId);
@@ -1715,6 +2276,10 @@ export class KnowledgeBrowser extends Abject {
       const data = typeof value === 'string' ? JSON.parse(value) as { id?: string } : value as { id?: string };
       const id = data?.id;
       if (!id || id.startsWith(GHOST_PREFIX)) return;
+      if (this.activeTab === MAPS_TAB) {
+        if (this.graphMapId && id.startsWith(PAGE_PREFIX)) await this.selectMapPage(this.graphMapId, id.slice(PAGE_PREFIX.length));
+        return;
+      }
       const entry = this.filteredEntries.find(e => e.id === id) ?? this.entries.find(e => e.id === id)
         ?? await this.request<KnowledgeEntry | null>(request(this.id, this.knowledgeBaseId!, 'get', { id })).catch(() => null);
       if (entry) await this.selectPattern(entry);
@@ -1781,6 +2346,12 @@ export class KnowledgeBrowser extends Abject {
       return;
     }
 
+    // DocumentMap events: a page written, flagged or archived, or a map made or removed
+    if (fromId === this.documentMapId && (aspect === 'pageChanged' || aspect === 'mapsChanged')) {
+      await this.mapsChanged(aspect, value);
+      return;
+    }
+
     // KnowledgeBase events
     if (fromId === this.knowledgeBaseId) {
       if (aspect === 'entryAdded' || aspect === 'entryUpdated' || aspect === 'entryRemoved') {
@@ -1791,10 +2362,10 @@ export class KnowledgeBrowser extends Abject {
           this.playEffect('flash');
         }
         await this.loadEntries();
-        if (this.graphActive()) {
+        if (this.graphActive() && TAB_TYPES[this.activeTab] === 'pattern') {
           await this.loadGraph();
           const added = value as { id?: string; type?: string } | undefined;
-          if (aspect === 'entryAdded' && added?.type === 'pattern' && added.id) await this.pulseNewPattern(added.id);
+          if (aspect === 'entryAdded' && added?.type === 'pattern' && added.id) await this.pulseNode(added.id);
         }
         if (this.selectedId && aspect === 'entryUpdated') {
           const entry = this.filteredEntries.find(e => e.id === this.selectedId);

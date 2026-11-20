@@ -441,7 +441,7 @@ All but `file-edit.ts` and `tool-output.ts` import Node built-ins (`fs`,
 
 - **knowledge.ts**: the message vocabulary of the KnowledgeBase, which is the
   C++/WASM package in `native/knowledge-base` (there is no TypeScript
-  KnowledgeBase). `KNOWLEDGE_BASE_ID`, `PROFILE_TAG`, `KnowledgeEntry`,
+  KnowledgeBase). `KNOWLEDGE_BASE_ID`, `PROFILE_TAG`, `COMPETING_TAG`, `KnowledgeEntry`,
   `KnowledgeType` (`learned`, `fact`, `insight`, `reference`, `pattern`),
   `KnowledgeOrigin`.
 - **learning.ts**: durable learning decisions and effects
@@ -477,6 +477,13 @@ All but `file-edit.ts` and `tool-output.ts` import Node built-ins (`fs`,
   each clipped); GoalManager stores the whole record once under
   `evidence:<sha256>` (`evidenceKey()`). The digest fields match
   `evidence_digest` in `native/knowledge-base`.
+- **map-page.ts**: the page format of a DocumentMap map: markdown with a YAML
+  frontmatter (title, aliases, sources with their fingerprints, writer,
+  revision, updatedAt, flags), `[[Page Name]]` links resolved by `linkKey`
+  (the same normalization pattern links use), where pages live under `/maps`
+  (`mapIdOf`, `mapDir`, `pagePath`), `parsePage` / `serializePage`,
+  `replaceSection`, `wikiLinks`, `fingerprintOf`, and the limits
+  (`PAGE_MAX_CHARS`, `BLOAT_RATIO`).
 - **pattern.ts**: the structured pattern-language entry (`PatternBody`:
   context, forces, therefore, evidence, links, ...) stored as JSON and
   rendered for people. `makePattern`, `serializePattern`, `readPattern`,

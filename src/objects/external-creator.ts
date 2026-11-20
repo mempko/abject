@@ -52,8 +52,9 @@ import { isPrivatePayload, shown } from '../core/privacy.js';
 import { systemMessage, userMessage, type LLMMessage } from '../llm/provider.js';
 import {
   MAP_LIST_LIMIT, MAP_SYSTEM_PROMPT, cleanMap, entryPointsOf, keyFilesOf, mapDrift, mapUserPrompt,
-  numbered, renderMapSection, renderTree, shapeOf, type ProjectMap,
+  numbered, projectMapId, renderMapSection, renderTree, shapeOf, type ProjectMap,
 } from './project-map.js';
+import { INDEX_SLUG, type MapInfo } from '../core/map-page.js';
 
 const log = new Log('ExternalCreator');
 
@@ -1602,10 +1603,9 @@ clean result I did not observe.`;
    */
   private async prepareProjectMap(extra: TaskExtra): Promise<void> {
     const project = extra.project;
-    const reg = await this.projects();
-    if (!project?.trusted || !reg) return;
+    if (!project?.trusted) return;
     try {
-      const stored = await this.call<ProjectMap | null>(reg, 'getProjectMap', { name: project.name }, 15_000);
+      const stored = await this.loadProjectMap(project);
       const files = await this.projectFiles(project.root);
       if (stored) {
         const drift = mapDrift(stored, { fileCount: files.length, shape: shapeOf(files) });
@@ -1632,10 +1632,9 @@ clean result I did not observe.`;
 
   /** After a task: rewrite the map when the layout has moved away from it (or there is none yet). */
   private async refreshProjectMap(extra: TaskExtra, project: ExternalProject): Promise<void> {
-    const reg = await this.projects();
-    if (!project.trusted || !reg) return;
+    if (!project.trusted) return;
     try {
-      const stored = await this.call<ProjectMap | null>(reg, 'getProjectMap', { name: project.name }, 15_000);
+      const stored = await this.loadProjectMap(project);
       const files = await this.projectFiles(project.root);
       const drift = stored ? mapDrift(stored, { fileCount: files.length, shape: shapeOf(files) }) : { stale: true, reason: 'no map yet' };
       if (!drift.stale || files.length === 0) return;
@@ -1668,9 +1667,8 @@ clean result I did not observe.`;
    * project root (the person's checkout), the same tree the layout comes from.
    */
   private async composeProjectMap(extra: TaskExtra, project: ExternalProject, files: string[]): Promise<ProjectMap | undefined> {
-    const reg = await this.projects();
     const llm = await this.discoverDep('LLM');
-    if (!reg || !llm) return undefined;
+    if (!llm) return undefined;
     const fs = await this.hostFs();
     const root = project.root;
     const read = async (rel: string, lines: number) => {
@@ -1705,14 +1703,63 @@ clean result I did not observe.`;
     }
 
     const shape = shapeOf(files);
-    const stored = await this.call<{ success: boolean; builtAt?: number; error?: string }>(
-      reg, 'setProjectMap', { name: project.name, text, fileCount: files.length, shape, builtBy: extra.taskId }, 30_000);
+    const stored = await this.storeProjectMap(project, text, { fileCount: files.length, shape }, excerpts.map(e => e.path), extra.taskId);
     if (!stored.success) {
-      log.warn(`the registry did not keep the map for ${project.name}: ${stored.error}`);
+      log.warn(`DocumentMap did not keep the map for ${project.name}: ${stored.error}`);
       return undefined;
     }
     this.audit(extra, `wrote the project map for ${project.name} (${text.length} chars from ${excerpts.length} key files)`);
-    return { project: project.name, text, builtAt: stored.builtAt ?? Date.now(), builtBy: extra.taskId, fileCount: files.length, shape };
+    return { project: project.name, text, builtAt: Date.now(), builtBy: extra.taskId, fileCount: files.length, shape };
+  }
+
+  /**
+   * The project's map as DocumentMap keeps it: the index page of the
+   * project's map, with the layout it was written from. A map left by an
+   * older build in the registry's storage is moved into DocumentMap the first
+   * time it is asked for.
+   */
+  private async loadProjectMap(project: ExternalProject): Promise<ProjectMap | null> {
+    const dm = await this.discoverDep('DocumentMap');
+    if (!dm) return null;
+    const id = projectMapId(project.name);
+    const map = await this.request<{ info?: MapInfo } | null>(request(this.id, dm, 'getMap', { map: id }), 15_000).catch(() => null);
+    // The registry removes a project's map when the project goes or its root
+    // moves, so a map under the project's id describes the project as it is.
+    if (map?.info && map.info.layout) {
+      const index = await this.request<{ found: boolean; body?: string; writer?: string; updatedAt?: number }>(
+        request(this.id, dm, 'readPage', { map: id, page: INDEX_SLUG }), 15_000).catch(() => null);
+      if (index?.found && index.body) {
+        return { project: project.name, text: index.body, builtAt: map.info.builtAt ?? index.updatedAt ?? Date.now(),
+          ...(index.writer ? { builtBy: index.writer } : {}), fileCount: map.info.layout.fileCount, shape: map.info.layout.shape };
+      }
+    }
+    const reg = await this.projects();
+    const legacy = reg ? await this.call<ProjectMap | null>(reg, 'takeLegacyProjectMap', { name: project.name }, 15_000).catch(() => null) : null;
+    if (!legacy?.text) return null;
+    const moved = await this.storeProjectMap(project, legacy.text, { fileCount: legacy.fileCount, shape: legacy.shape }, [], legacy.builtBy);
+    log.info(`moved the map for ${project.name} into DocumentMap${moved.success ? '' : ` (not kept: ${moved.error})`}`);
+    return legacy;
+  }
+
+  /** Store a project's map as the index page of its DocumentMap map, creating the map when it is new. */
+  private async storeProjectMap(project: ExternalProject, text: string, layout: { fileCount: number; shape: Record<string, number> },
+    sources: string[], taskId?: string): Promise<{ success: boolean; error?: string }> {
+    const dm = await this.discoverDep('DocumentMap');
+    if (!dm) return { success: false, error: 'DocumentMap is not available' };
+    try {
+      const created = await this.request<{ success: boolean; id?: string; error?: string }>(request(this.id, dm, 'createMap', {
+        name: project.name, kind: 'project', source: { kind: 'host', root: project.root }, description: project.description || undefined,
+      }), 15_000);
+      if (!created.success || !created.id) return { success: false, error: created.error ?? 'the map was not created' };
+      const current = await this.request<{ found: boolean; revision?: number }>(request(this.id, dm, 'readPage', { map: created.id, page: INDEX_SLUG }), 15_000);
+      const written = await this.request<{ success: boolean; error?: string }>(request(this.id, dm, 'writePage', {
+        map: created.id, title: INDEX_SLUG, body: text, sources, layout, ...(taskId ? { taskId } : {}),
+        ...(current.found ? { expectedRevision: current.revision } : {}),
+      }), 60_000);
+      return written.success ? { success: true } : { success: false, error: written.error };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   // ─── Working beside other tasks ─────────────────────────────────
