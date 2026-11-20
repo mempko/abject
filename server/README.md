@@ -79,8 +79,8 @@ platform, arch, workerCount, edition, display }`; `/version` answers
     (AppUpdater, GlobalSettings), Packages, InstanceInfo, the capability
     enforcement mode, HeapMonitor, SkillRegistry, WebGateway,
     MCPRegistryClient, ClawHubClient, SecretsVault, OAuthHelper,
-    ProxyGenerator, Negotiator, HealthMonitor, CassetteRecorder, then
-    `ui.spawnGlobalUi`.
+    ProxyGenerator, Negotiator, HealthMonitor, CassetteRecorder,
+    FitnessJudge, then `ui.spawnGlobalUi`.
 11. System-scoped packages spawn once; an `autostart` one gets `startup`.
 12. CliServer spawns, registers with DialogBroker as its responder, and
     DialogBroker seals its surfaces.

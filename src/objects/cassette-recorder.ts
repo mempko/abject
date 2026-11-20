@@ -1,33 +1,43 @@
 /**
- * CassetteRecorder - accumulates objects' HTTP traffic as replayable evidence.
+ * CassetteRecorder - accumulates objects' traffic as replayable evidence.
  *
- * Receives HttpClient's `httpExchange` events and persists each exchange as
- * a cassette under the caller's durable typeId (`cassettes:<typeId>` in
- * Storage). A live AbjectId dies with its object; the typeId survives
+ * Two kinds of recording, both keyed by the caller's durable typeId in
+ * Storage. A live AbjectId dies with its object; the typeId survives
  * restarts, so the evidence does too.
  *
- * The link is HttpClient's to make, not this object's: HttpClient discovers
- * the recorder through the registry and sends each exchange to that one id
- * (re-resolving on recipientGone), so exchanges are never broadcast to
+ *   `cassettes:<typeId>`   - HttpClient's `httpExchange` events: the HTTP
+ *                            the object's requests turned into, at the
+ *                            transport level.
+ *   `invocations:<typeId>` - ScriptableAbject's `invocation` events: which
+ *                            handler ran, with what, every outbound `call()`
+ *                            it made and the reply, and what it returned.
+ *                            This is what the FitnessJudge replays. An
+ *                            invocation that threw, was truncated, or left
+ *                            an outbound call unanswered is not kept,
+ *                            because it cannot be replayed.
+ *
+ * The link is the emitter's to make, not this object's: HttpClient and each
+ * ScriptableAbject discover the recorder through the registry and send to
+ * that one id (re-resolving on recipientGone), so nothing is broadcast to
  * whoever asks via addDependent - a generated object cannot subscribe to
  * other objects' traffic. Everything still crosses the bus as messages
- * (exchanges as events, persistence as Storage requests): HttpClient and
+ * (recordings as events, persistence as Storage requests): emitters and
  * this recorder may be hosted on different worker threads, so no in-process
  * seam would work - see mempko/abject#11.
  *
- * Caller attribution comes from `resolveCallerIdentity`, which resolves the
- * exchange's caller id against the registry rather than trusting anything in
- * the payload. Exchanges whose caller has no durable typeId (unregistered or
- * anonymous callers) are not recorded: a cassette that cannot be tied to a
- * type is evidence about nothing.
+ * Caller attribution comes from `resolveCallerIdentity`, which resolves an
+ * id against the registry rather than trusting anything in the payload.
+ * Recordings whose caller has no durable typeId, or whose outbound calls
+ * address an object that is neither registered nor an id the invocation was
+ * handed, are not kept: evidence that cannot be tied to a type, or replayed
+ * against the target it addressed, is evidence about nothing.
  *
  * Failure independence: recording proceeds in memory while Storage is
  * missing, with persistence catching up - and merging what the store already
- * held - once Storage appears. A recorder restart is HttpClient's problem to
- * notice (recipientGone) and it does.
+ * held - once Storage appears. A recorder restart is the emitter's problem
+ * to notice (recipientGone) and it does.
  *
- * This object only records. Judging the evidence is a separate concern (and a
- * separate PR in the #11 series).
+ * This object only records. Judging the evidence is FitnessJudge's job.
  */
 
 import { AbjectId, AbjectMessage, TypeId } from '../core/types.js';
@@ -36,6 +46,7 @@ import { request } from '../core/message.js';
 import { ensure, invariant, requirePositive } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 import type { HttpExchangeEvent } from './capabilities/http-client.js';
+import type { InvocationEvent } from './scriptable-abject.js';
 
 const log = new Log('CASSETTE-RECORDER');
 
@@ -65,29 +76,53 @@ export interface Cassette {
   at: number;
 }
 
-/** Per-endpoint retention: a hot parameterized endpoint must not evict the
- *  one recording of a rarely-hit endpoint, so the per-bucket cap trims hot
- *  buckets, and global overflow always comes out of the LARGEST bucket. */
+/** What Storage holds under `invocations:<typeId>`: one handler invocation
+ *  as emitted (see InvocationEvent), with each outbound call's live target
+ *  id replaced by the registered NAME the registry gave for it, unless the
+ *  invocation was handed that id (in its arguments or an earlier reply), in
+ *  which case it stays the id - the shape `protocol/fitness.ts` replays. */
+export interface InvocationCassette {
+  method: string;
+  argsText: string;
+  calls: Array<{ target: string; targetName?: string; method: string; payloadText: string; replyText?: string; errorText?: string }>;
+  resultText?: string;
+  errorText?: string;
+  truncated?: boolean;
+  durationMs?: number;
+  at: number;
+}
+
+/** Per-bucket retention: a hot parameterized endpoint (or a chatty handler)
+ *  must not evict the one recording of a rarely-hit one, so the per-bucket
+ *  cap trims hot buckets, and global overflow always comes out of the
+ *  LARGEST bucket. */
 const PER_BUCKET_CAP = 5;
 const PER_TYPE_CAP = 50;
 
+/** One Storage row's worth of recordings, with its persistence state. */
+interface Tracked<T> {
+  key: string;
+  list: T[];
+  bucketKey: (item: T) => string;
+  /** Whether the in-memory list has been merged with what Storage held. */
+  merged: boolean;
+  merging?: Promise<void>;
+  flushTimer?: ReturnType<typeof setTimeout>;
+  /** When the oldest unwritten recording arrived. Bounds how long steady traffic can hold a flush back. */
+  unflushedSince?: number;
+}
+
 export class CassetteRecorder extends Abject {
   private storageId?: AbjectId;
-  private byType = new Map<TypeId, Cassette[]>();
-  /** typeIds whose in-memory list has been merged with what Storage held. */
-  private merged = new Set<TypeId>();
-  private flushTimers = new Map<TypeId, ReturnType<typeof setTimeout>>();
-  /** When each typeId's oldest unwritten exchange arrived. Bounds how long
-   *  steady traffic can hold a flush back. */
-  private unflushedSince = new Map<TypeId, number>();
-  /** Single FIFO pump: exchanges append in arrival order regardless of how
+  private rows = new Map<string, Tracked<unknown>>();
+  /** Single FIFO pump: recordings append in arrival order regardless of how
    *  long identity resolution or the initial Storage load takes. */
   private pump: Promise<void> = Promise.resolve();
-  /** A flush waits for this much quiet after the latest exchange... */
+  /** A flush waits for this much quiet after the latest recording... */
   private readonly flushMs: number;
   /** ...but never longer than this after the oldest unwritten one, so an
    *  object polling faster than flushMs is still persisted, and a busy one
-   *  rewrites its list at most once per interval. */
+   *  rewrites its row at most once per interval. */
   private readonly flushMaxWaitMs: number;
   private storageRetryDelay: number;
 
@@ -96,12 +131,12 @@ export class CassetteRecorder extends Abject {
       manifest: {
         name: 'CassetteRecorder',
         description:
-          'Records objects\' HTTP traffic as cassettes in Storage, keyed by the caller\'s durable typeId. Receives HttpClient httpExchange events; evidence for judging generated objects accumulates here.',
-        version: '1.0.0',
+          'Records objects\' traffic as evidence in Storage, keyed by the caller\'s durable typeId: HttpClient httpExchange events as cassettes, ScriptableAbject invocation events as replayable invocations. Evidence for judging generated objects accumulates here.',
+        version: '1.1.0',
         interface: {
           id: CASSETTE_RECORDER_INTERFACE,
           name: 'CassetteRecorder',
-          description: 'HTTP traffic recording',
+          description: 'Traffic recording',
           methods: [],
         },
         tags: ['system', 'recording', 'evidence'],
@@ -115,171 +150,255 @@ export class CassetteRecorder extends Abject {
 
   protected override checkInvariants(): void {
     super.checkInvariants();
-    for (const [typeId, list] of this.byType) {
-      invariant(list.length <= PER_TYPE_CAP, `cassettes for ${typeId} must stay within the per-type cap`);
-    }
-    for (const typeId of this.flushTimers.keys()) {
-      invariant(this.byType.has(typeId), `a flush is only scheduled for a typeId with recordings (${typeId})`);
-    }
-    for (const typeId of this.merged) {
-      invariant(this.byType.has(typeId), `a merged typeId must hold a list (${typeId})`);
+    for (const row of this.rows.values()) {
+      invariant(row.list.length <= PER_TYPE_CAP, `recordings under ${row.key} must stay within the per-type cap`);
+      invariant(!row.flushTimer || row.list.length > 0, `a flush is only scheduled for a row with recordings (${row.key})`);
     }
   }
 
   protected override async onInit(): Promise<void> {
     this.on('httpExchange', (msg: AbjectMessage) => {
       const exchange = msg.payload as HttpExchangeEvent;
-      this.pump = this.pump
-        .then(() => this.record(exchange))
-        .catch((err) => log.error('record failed', err));
+      this.enqueue(() => this.recordExchange(exchange));
+      return true;
+    });
+    // The sender IS the invoked object, so its identity is the message's
+    // origin - the payload's `caller` is informational.
+    this.on('invocation', (msg: AbjectMessage) => {
+      const ev = msg.payload as InvocationEvent;
+      this.enqueue(() => this.recordInvocation(msg.routing.from, ev));
       return true;
     });
   }
 
-  private async record(exchange: HttpExchangeEvent): Promise<void> {
-    const identity = await this.resolveCallerIdentity(exchange.caller);
-    const typeId = identity?.typeId;
-    if (!typeId || !isUserTypeId(typeId)) return;
+  protected override async onStop(): Promise<void> {
+    for (const row of this.rows.values()) {
+      this.cancelTimer(row.flushTimer);
+      row.flushTimer = undefined;
+    }
+  }
 
-    await this.mergeFromStore(typeId);
-    const list = this.byType.get(typeId) ?? [];
-    this.byType.set(typeId, list);
-    list.push({
+  private enqueue(job: () => Promise<void>): void {
+    this.pump = this.pump.then(job).catch((err) => log.error('record failed', err));
+  }
+
+  private async userTypeIdOf(objectId: AbjectId): Promise<TypeId | undefined> {
+    const identity = await this.resolveCallerIdentity(objectId);
+    const typeId = identity?.typeId;
+    return typeId && isUserTypeId(typeId) ? typeId : undefined;
+  }
+
+  private async recordExchange(exchange: HttpExchangeEvent): Promise<void> {
+    const typeId = await this.userTypeIdOf(exchange.caller);
+    if (!typeId) return;
+    await this.append<Cassette>(`cassettes:${typeId}`, httpBucketKey, {
       method: '_http',
       request: exchange.request,
       response: exchange.response,
       durationMs: exchange.durationMs,
       at: exchange.at,
     });
-    this.evict(list);
-    this.scheduleFlush(typeId);
+  }
+
+  private async recordInvocation(from: AbjectId, ev: InvocationEvent): Promise<void> {
+    // Replay needs the value a handler returned, whole, and an answer for
+    // every outbound call. An invocation that threw, was cut at a size cap,
+    // or returned before an un-awaited call was answered can never be
+    // replayed, and kept here it would take one of its method's
+    // PER_BUCKET_CAP slots: a handler that often rejects bad input would
+    // push every replayable recording out.
+    if (ev.resultText === undefined || ev.truncated) return;
+    if ((ev.calls ?? []).some(c => c.replyText === undefined && c.errorText === undefined)) return;
+    const typeId = await this.userTypeIdOf(from);
+    if (!typeId) return;
+    // Each outbound target is keyed the way a replay will address it. An id
+    // the handler was handed in its arguments or got back from an earlier
+    // call (a window from createWindowAbject, a widget, a spawned child)
+    // reaches the replay the same way, from the same recorded text, so it is
+    // kept as that id. Any other target becomes the name the registry knows
+    // it by, since dep()/find() resolve a name. A handed id the registry can
+    // also name keeps that name beside it (targetName): the id may only have
+    // appeared in a reply while the handler addressed the object by name, and
+    // a replay matches either. A target that is neither makes the recording
+    // unreplayable, so it is dropped rather than kept as a half-truth.
+    const calls: InvocationCassette['calls'] = [];
+    for (const c of ev.calls ?? []) {
+      const handed = ev.argsText.includes(c.targetId)
+        || calls.some(prev => prev.replyText?.includes(c.targetId));
+      const name = (await this.resolveCallerIdentity(c.targetId))?.name;
+      const target = handed ? c.targetId : name;
+      if (!target) {
+        log.info(`invocation of ${typeId}.${ev.method} dropped: outbound target ${c.targetId} is not registered`);
+        return;
+      }
+      calls.push({ target, ...(handed && name ? { targetName: name } : {}), method: c.method, payloadText: c.payloadText,
+        ...(c.replyText !== undefined ? { replyText: c.replyText } : {}),
+        ...(c.errorText !== undefined ? { errorText: c.errorText } : {}) });
+    }
+    await this.append<InvocationCassette>(`invocations:${typeId}`, invocationBucketKey, {
+      method: ev.method,
+      argsText: ev.argsText,
+      calls,
+      ...(ev.resultText !== undefined ? { resultText: ev.resultText } : {}),
+      ...(ev.errorText !== undefined ? { errorText: ev.errorText } : {}),
+      ...(ev.truncated ? { truncated: true } : {}),
+      durationMs: ev.durationMs,
+      at: ev.at,
+    });
+  }
+
+  private row<T>(key: string, bucketKey: (item: T) => string): Tracked<T> {
+    let row = this.rows.get(key) as Tracked<T> | undefined;
+    if (!row) {
+      row = { key, list: [], bucketKey, merged: false };
+      this.rows.set(key, row as Tracked<unknown>);
+    }
+    return row;
+  }
+
+  private async append<T>(key: string, bucketKey: (item: T) => string, item: T): Promise<void> {
+    const row = this.row<T>(key, bucketKey);
+    await this.mergeFromStore(row);
+    row.list.push(item);
+    evict(row.list, row.bucketKey);
+    this.scheduleFlush(row);
     this.checkInvariants();
   }
 
-  /** The first contact with Storage for a typeId merges what the store
-   *  already holds ahead of this session's recordings - a recorder restart
-   *  must never clobber accumulated evidence. While Storage is missing this
-   *  stays pending and recording continues in memory; the merge happens at
+  /** The first contact with Storage for a row merges what the store already
+   *  holds ahead of this session's recordings - a recorder restart must never
+   *  clobber accumulated evidence. While Storage is missing this stays
+   *  pending and recording continues in memory; the merge happens at
    *  whichever comes first, the next record or the flush that finds Storage. */
-  private async mergeFromStore(typeId: TypeId): Promise<void> {
-    if (this.merged.has(typeId)) return;
+  private async mergeFromStore<T>(row: Tracked<T>): Promise<void> {
+    if (row.merged) return;
+    if (row.merging) return row.merging;
     this.storageId ??= (await this.discoverDep('Storage')) ?? undefined;
     if (!this.storageId) return;
+    const storageId = this.storageId;
     this.storageRetryDelay = this.flushMs;
-    let existing: Cassette[] = [];
-    try {
-      const raw = await this.request<unknown>(
-        request(this.id, this.storageId, 'get', { key: `cassettes:${typeId}` }), 5000);
-      existing = Array.isArray(raw) ? (raw as Cassette[]) : [];
-    } catch (err) {
-      log.warn(`existing cassettes unreadable for ${typeId}`, err);
-      return; // try again next time rather than risk clobbering
-    }
-    const current = this.byType.get(typeId) ?? [];
-    const list = [...existing, ...current];
-    this.evict(list);
-    this.byType.set(typeId, list);
-    this.merged.add(typeId);
-    this.checkInvariants();
-  }
-
-  /** Endpoint bucket: method + URL with the query stripped, so parameterized
-   *  hits on one route churn their own bucket only. */
-  private bucketKey(c: Cassette): string {
-    let path = c.request.url;
-    try {
-      const u = new URL(c.request.url);
-      path = u.origin + u.pathname;
-    } catch {
-      path = c.request.url.split('?')[0];
-    }
-    return `${c.request.method} ${path}`;
-  }
-
-  /** FIFO within each over-cap bucket first; then global overflow comes out
-   *  of the LARGEST bucket's oldest entry, so a rare endpoint's only
-   *  recording survives no matter how old it is. In place: the array
-   *  instance is the store. */
-  private evict(list: Cassette[]): void {
-    const counts = new Map<string, number>();
-    for (const c of list) {
-      const key = this.bucketKey(c);
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-    for (let i = 0; i < list.length;) {
-      const key = this.bucketKey(list[i]);
-      const n = counts.get(key)!;
-      if (n > PER_BUCKET_CAP) {
-        counts.set(key, n - 1);
-        list.splice(i, 1);
-      } else {
-        i++;
+    row.merging = (async () => {
+      let existing: T[] = [];
+      try {
+        const raw = await this.request<unknown>(
+          request(this.id, storageId, 'get', { key: row.key }), 5000);
+        existing = Array.isArray(raw) ? (raw as T[]) : [];
+      } catch (err) {
+        log.warn(`existing recordings unreadable for ${row.key}`, err);
+        return; // try again next time rather than risk clobbering
+      } finally {
+        row.merging = undefined;
       }
-    }
-    while (list.length > PER_TYPE_CAP) {
-      let maxKey = '';
-      let maxN = 0;
-      for (const [key, n] of counts) {
-        if (n > maxN) { maxN = n; maxKey = key; }
+      if (!row.merged) {
+        row.list = [...existing, ...row.list];
+        evict(row.list, row.bucketKey);
+        row.merged = true;
+        this.checkInvariants();
       }
-      const victim = list.findIndex(c => this.bucketKey(c) === maxKey);
-      ensure(victim >= 0, 'the largest bucket must have an entry in the list');
-      counts.set(maxKey, maxN - 1);
-      list.splice(victim, 1);
-    }
-    ensure(list.length <= PER_TYPE_CAP, 'eviction must bring the list within the per-type cap');
+    })();
+    return row.merging;
   }
 
-  /** New exchanges debounce the flush, up to flushMaxWaitMs after the oldest
+  /** New recordings debounce the flush, up to flushMaxWaitMs after the oldest
    *  unwritten one. Until the store has been merged (Storage unknown, or its
-   *  read failed) a backoff retry is already pending, and new exchanges leave
-   *  its delay alone rather than cut the backoff short. */
-  private scheduleFlush(typeId: TypeId): void {
+   *  read failed) a backoff retry is already pending, and new recordings
+   *  leave its delay alone rather than cut the backoff short. */
+  private scheduleFlush<T>(row: Tracked<T>): void {
     const now = Date.now();
-    if (!this.unflushedSince.has(typeId)) this.unflushedSince.set(typeId, now);
-    if (!this.merged.has(typeId) && this.flushTimers.has(typeId)) return;
-    const deadline = this.unflushedSince.get(typeId)! + this.flushMaxWaitMs;
-    this.armFlush(typeId, Math.max(0, Math.min(this.flushMs, deadline - now)));
+    row.unflushedSince ??= now;
+    if (!row.merged && row.flushTimer) return;
+    const deadline = row.unflushedSince + this.flushMaxWaitMs;
+    this.armFlush(row, Math.max(0, Math.min(this.flushMs, deadline - now)));
   }
 
-  private armFlush(typeId: TypeId, delayMs: number): void {
-    this.cancelTimer(this.flushTimers.get(typeId));
-    this.flushTimers.delete(typeId);
+  private armFlush<T>(row: Tracked<T>, delayMs: number): void {
+    this.cancelTimer(row.flushTimer);
+    row.flushTimer = undefined;
     // A flush that fails with "Object stopped" after stop() must not re-arm.
     if (this._status === 'stopped') return;
-    this.flushTimers.set(typeId, this.setTimer(() => {
-      this.flushTimers.delete(typeId);
-      void this.flush(typeId);
-    }, delayMs));
+    row.flushTimer = this.setTimer(() => {
+      row.flushTimer = undefined;
+      void this.flush(row);
+    }, delayMs);
   }
 
-  private async flush(typeId: TypeId): Promise<void> {
+  private async flush<T>(row: Tracked<T>): Promise<void> {
     // Storage may have appeared since recording started; the merge guard
     // inside mergeFromStore keeps this idempotent.
-    await this.mergeFromStore(typeId);
-    const list = this.byType.get(typeId);
-    if (!list) return;
+    await this.mergeFromStore(row);
     if (!this.storageId) {
       // Nowhere to persist yet: keep the data in memory and back off
       // polling discoverDep('Storage') instead of spinning every 500ms.
-      this.armFlush(typeId, this.storageRetryDelay);
+      this.armFlush(row, this.storageRetryDelay);
       this.storageRetryDelay = Math.min(this.storageRetryDelay * 2, 5000);
       return;
     }
-    if (!this.merged.has(typeId)) {
+    if (!row.merged) {
       // Still waiting to merge existing store data
-      this.armFlush(typeId, this.storageRetryDelay);
+      this.armFlush(row, this.storageRetryDelay);
       return;
     }
-    // Everything recorded so far rides this write; later exchanges start a
+    // Everything recorded so far rides this write; later recordings start a
     // fresh max-wait window.
-    this.unflushedSince.delete(typeId);
+    row.unflushedSince = undefined;
     try {
       await this.request(
-        request(this.id, this.storageId, 'set', { key: `cassettes:${typeId}`, value: list }), 5000);
+        request(this.id, this.storageId, 'set', { key: row.key, value: row.list }), 5000);
     } catch (err) {
-      log.warn(`cassette flush failed for ${typeId}`, err);
-      this.armFlush(typeId, this.flushMs);
+      log.warn(`flush failed for ${row.key}`, err);
+      this.armFlush(row, this.flushMs);
     }
   }
+}
+
+/** Endpoint bucket: method + URL with the query stripped, so parameterized
+ *  hits on one route churn their own bucket only. */
+function httpBucketKey(c: Cassette): string {
+  let path = c.request.url;
+  try {
+    const u = new URL(c.request.url);
+    path = u.origin + u.pathname;
+  } catch {
+    path = c.request.url.split('?')[0];
+  }
+  return `${c.request.method} ${path}`;
+}
+
+/** Handler bucket: one per method, so a chatty handler cannot evict the
+ *  only recording of a quiet one. */
+function invocationBucketKey(c: InvocationCassette): string {
+  return c.method;
+}
+
+/** FIFO within each over-cap bucket first; then global overflow comes out
+ *  of the LARGEST bucket's oldest entry, so a rare bucket's only recording
+ *  survives no matter how old it is. In place: the array instance is the row. */
+function evict<T>(list: T[], bucketKey: (item: T) => string): void {
+  const counts = new Map<string, number>();
+  for (const c of list) {
+    const key = bucketKey(c);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  for (let i = 0; i < list.length;) {
+    const key = bucketKey(list[i]);
+    const n = counts.get(key)!;
+    if (n > PER_BUCKET_CAP) {
+      counts.set(key, n - 1);
+      list.splice(i, 1);
+    } else {
+      i++;
+    }
+  }
+  while (list.length > PER_TYPE_CAP) {
+    let maxKey = '';
+    let maxN = 0;
+    for (const [key, n] of counts) {
+      if (n > maxN) { maxN = n; maxKey = key; }
+    }
+    const victim = list.findIndex(c => bucketKey(c) === maxKey);
+    ensure(victim >= 0, 'the largest bucket must have an entry in the list');
+    counts.set(maxKey, maxN - 1);
+    list.splice(victim, 1);
+  }
+  ensure(list.length <= PER_TYPE_CAP, 'eviction must bring the list within the per-type cap');
 }
