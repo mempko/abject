@@ -64,7 +64,8 @@ Credentials come from SettingsManager (stored under each description's
   types (`LLMMessage` with text, image and PDF `ContentPart`s and an optional
   `cacheBreakpoint`), `LLMCompletionOptions` (`tier`, `model`, `effort`,
   `maxTokens`, `cacheKey`, `jsonMode`, `signal`, ...; `signal` fires on Kill
-  and stays in this process: `openai.ts` closes its connection on it, and
+  and stays in this process: `openai.ts` closes its connection on it (also
+  while the response body is still arriving), and
   `remote-provider.ts` sends the provider abject `providerCancel { callId }`), `ModelTier`
   (`smart | balanced | fast | code`), `EffortLevel`, `ModelInfo`,
   `LLMProviderDescription` (what Settings renders: credential mode, default
@@ -251,6 +252,13 @@ Run with `pnpm test` (Node test runner over `src/llm/*.test.ts` among others).
   target to be there.
 - **`execution-context.test.ts`**: Codex parsing and arguments, boundary
   enforcement, execution context and prompt guidance on real LLMObject calls.
+- **`openai.abort.test.ts`**: Kill on a non-streaming `complete()` while the
+  response body is still arriving, against a `node:http` server on 127.0.0.1
+  that sends the headers and holds the body open: the call rejects with the
+  AbortError before any retry, the connection closes, and an error body
+  killed mid-read rejects the same way. Also: a slow body that is not killed
+  still completes, an error reply that is not killed reads as the API error,
+  and no abort listener is left once a call settles or fails.
 - **`peerllm.test.ts`**: PeerLLM description, model listing, request shape,
   pricing, and conditional registration.
 
