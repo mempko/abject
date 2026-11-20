@@ -6,6 +6,7 @@ import os from 'node:os';
 import { AntigravityCliProvider, AGY_TIER_MODELS } from './antigravity-cli.js';
 import { peekCachedModels, resetModelDiscoveryCache } from './cli-model-discovery.js';
 import { NativeToolAbandonedError } from './provider.js';
+import { resolveTierModels } from './tier-resolver.js';
 import { LLMObject } from '../objects/llm-object.js';
 
 /** A stand-in agy: records the prompt it was given, then reports a denied native tool and no answer. */
@@ -83,6 +84,26 @@ test('every id the catalog ever shipped is either still listed or migrated to a 
   for (const [tier, id] of Object.entries(AGY_TIER_MODELS)) {
     assert.ok(listed.has(id), `tier ${tier} default ${id} is not listed`);
   }
+});
+
+test('tierRules resolves Neon when present and degrades gracefully on older catalogs', () => {
+  resetModelDiscoveryCache();
+  const desc = new AntigravityCliProvider().describe();
+  assert.ok(desc.tierRules, 'AntigravityCliProvider should declare tierRules');
+
+  const withNeon = resolveTierModels(desc, desc.models);
+  assert.equal(withNeon.smart.model, 'gemini-4-neon-high');
+  assert.equal(withNeon.code.model, 'gemini-4-neon-high');
+  assert.equal(withNeon.balanced.model, 'gemini-4-neon-medium');
+  assert.equal(withNeon.fast.model, 'gemini-4-neon-low');
+
+  const withoutNeon = resolveTierModels(
+    desc,
+    desc.models.filter(m => !m.id.includes('neon') && !m.id.includes('carbon') && !m.id.includes('hydrogen')),
+  );
+  assert.equal(withoutNeon.smart.model, 'gemini-4-argon-high');
+  assert.equal(withoutNeon.balanced.model, 'gemini-3.8-flash-medium');
+  assert.equal(withoutNeon.fast.model, 'gemini-3.8-flash-low');
 });
 
 test('tripwire (AGY_LIVE=1): the installed agy accepts every catalog id, tier default and migration target', { skip: process.env.AGY_LIVE !== '1' && 'set AGY_LIVE=1 to check the installed agy' }, async () => {
