@@ -1,5 +1,25 @@
 [
   {
+    "version": "0.16.12",
+    "date": "2026-11-20",
+    "title": "Maps your agents can cite, and claims that compete",
+    "summary": "Agents can now build small cited wikis over your folders and projects, and notice when a page has gone stale. When an agent learns something that contradicts what the KnowledgeBase already holds, the new claim is kept beside the old one for review instead of replacing it.",
+    "highlights": [
+      "Document maps: a workspace can keep small wikis over a Files folder, a host folder or a registered project. Pages are plain markdown with frontmatter under /maps in the workspace's files, so you can read and edit them yourself.",
+      "Each page cites its sources, and every cited source is fingerprinted. When a source changes, the pages that rely on it are named as stale.",
+      "Map lint reports pages that are linked but not yet written, broken links, orphan pages, pages with no citations, flagged pages, pages edited by hand in Files, and how big the map is compared with its sources.",
+      "A new agent, Cartographer, builds and repairs document maps when a goal reaches it.",
+      "Agents read maps when they recall what they know, and each task's prompt points to up to three matching map pages. When a page misled the work, the task review can flag it.",
+      "The KnowledgeBrowser has a new Maps tab with page details and a graph of the links in each map.",
+      "Competing claims in the KnowledgeBase: if an agent or planner remembers something that differs from established knowledge with the same title, the new claim is kept beside the old one, marked as competing, and the established entry stays as it was.",
+      "Reviews and curation now bring up open competing claims for you to reconcile, along with the entries agents rely on most that have been tested least.",
+      "Project maps now live in the document maps as the index page of each project's map. A map saved by an older version is moved over once, and removing a project or moving its root deletes its map."
+    ],
+    "fixes": [
+      "Saving over a map page that someone else changed since you read it is now a conflict you are told about; it no longer silently overwrites their edit."
+    ]
+  },
+  {
     "version": "0.16.11",
     "date": "2026-11-19",
     "title": "A desktop that fits its window, and Argon by default",
