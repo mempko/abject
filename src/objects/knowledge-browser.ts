@@ -200,7 +200,7 @@ const LEARNING_UNAVAILABLE = 'The learning report is unavailable: the goal manag
 /** GoalManager's `getLearningFunnel` reply, normalized. */
 interface LearningFunnel {
   scope: string;
-  predictions: { observed: number; withExpectation: number; namingBelief: number; declaringPattern: number };
+  predictions: { observed: number; withExpectation: number; withRelated: number; namingBelief: number; declaringPattern: number };
   judgments: { total: number; byVerdict: Record<string, number>; missesByBlame: Record<string, number> };
   updates: { byState: Record<string, number>; openReasons: Array<{ reason: string; n: number }> };
   lifetime: { applied: number; abandoned: number };
@@ -260,6 +260,7 @@ function readFunnel(raw: unknown): LearningFunnel {
     predictions: {
       observed: count(r.predictions.observed),
       withExpectation: count(r.predictions.withExpectation),
+      withRelated: count(r.predictions.withRelated),
       namingBelief: count(r.predictions.namingBelief),
       declaringPattern: count(r.predictions.declaringPattern),
     },
@@ -301,8 +302,12 @@ function funnelRows(f: LearningFunnel): ReportRow[] {
   rows.push({ kind: 'heading', text: 'Predictions' });
   rows.push(stat('Actions agents recorded', { value: String(p.observed) }));
   rows.push(stat('Said what they expected to happen', share(p.withExpectation, p.observed)));
-  rows.push(stat('Named the knowledge they relied on', share(p.namingBelief, p.withExpectation)));
-  rows.push(stat('Named a pattern they followed', share(p.declaringPattern, p.withExpectation)));
+  // Citing is measured over the actions that had related knowledge in view;
+  // a step with nothing related shown has nothing to name.
+  const related = p.withRelated || p.withExpectation;
+  rows.push(stat('Had related knowledge in view', share(p.withRelated, p.withExpectation)));
+  rows.push(stat('Named the knowledge they relied on', share(p.namingBelief, related)));
+  rows.push(stat('Named a pattern they followed', share(p.declaringPattern, related)));
 
   rows.push({ kind: 'heading', text: 'Judgments' });
   rows.push(stat('Actions the reviewer judged', share(j.total, p.observed)));

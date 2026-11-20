@@ -5489,7 +5489,7 @@ When an observation or a result is too big to sit in the conversation, you get a
 **The reader is for locating and inspecting**, when you want a specific thing rather than all of them: \`grep\` to jump to it, \`outline\` to see the structure when you are unsure what to search for, \`offset\`/\`length\` to read a region in order. A grep that reports further matches it did not show is telling you the question was an all-of-them question; switch to code rather than paging on.
 
 The preview often answers the question on its own — when it does, just act.`, true);
-    add('prediction', '\n\n## Prediction\nEvery action carries an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. Comparing what you expected with what happened is how this system learns, so predict routine steps too. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"). The expectation comes from what you know: your own understanding, the knowledge and patterns in this prompt, and what earlier steps showed.\n\nBeside `expect`, say how sure you are: `"confidence": "sure" | "likely" | "guess"`. Sure means a miss would surprise you; likely means it probably holds; guess means it could go either way. Honest confidence is what makes a miss informative: a sure expectation that misses marks exactly the belief that needs correcting.\n\nThe real result comes back beside your expectation. Your next action carries your reading of it as one more field, `"lastPrediction": {"verdict": "held" | "missed" | "unclear", "learned": "one line"}`, in the same JSON object as its `action` and `expect`: your honest reading of the previous expectation against that result, and on a miss, what you now believe instead. One action, one object, for example `{"action": "<your next action>", "expect": "<what it will show>", "confidence": "likely", "lastPrediction": {"verdict": "held", "learned": "<one line>"}}`. Operation success alone does not make a free-text prediction hold, and an expected rejection can. Optionally add `"expectOutcome": "success" | "failure"` for the operation outcome itself.\n\nKnowledge shown in this prompt carries a short label, `K1`, `K2`, ... for entries and `P1`, `P2`, ... for patterns. When an expectation rests on an entry, cite it by its label in the same action: `"basis": [{"id": "K2", "why": "what it told you"}]`, for example `{"action": "...", "expect": "the call lists the three saved items", "confidence": "sure", "basis": [{"id": "K2", "why": "it says saved items are listed newest first"}]}`. A citation is how a wrong entry gets corrected: when a cited expectation misses, the reviewer fixes the entry that misled you; an uncited miss can only be put down to your own judgment, and the entry stays as it was. When you apply a pattern, declare it by its label: `"patterns": [{"id": "P1", "why": "how its Therefore shapes this action"}]`; seeing a pattern is different from using it. The runtime tracks versions, so leave revision numbers out. Predictions, your readings of them and their citations are kept for Scrum replanning and retrospective learning. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
+    add('prediction', '\n\n## Prediction\nEvery action carries an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. Comparing what you expected with what happened is how this system learns, so predict routine steps too. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"). The expectation comes from what you know: your own understanding, the knowledge and patterns in this prompt, and what earlier steps showed.\n\nBeside `expect`, say how sure you are: `"confidence": "sure" | "likely" | "guess"`. Sure means a miss would surprise you; likely means it probably holds; guess means it could go either way. Honest confidence is what makes a miss informative: a sure expectation that misses marks exactly the belief that needs correcting.\n\nThe real result comes back beside your expectation. Your next action carries your reading of it as one more field, `"lastPrediction": {"verdict": "held" | "missed" | "unclear", "learned": "one line"}`, in the same JSON object as its `action` and `expect`: your honest reading of the previous expectation against that result, and on a miss, what you now believe instead. One action, one object, for example `{"action": "<your next action>", "expect": "<what it will show>", "confidence": "likely", "basis": [{"id": "K2", "why": "<what the entry told you>"}], "lastPrediction": {"verdict": "held", "learned": "<one line>"}}` (basis only when an entry shown here is what the expectation rests on). Operation success alone does not make a free-text prediction hold, and an expected rejection can. Optionally add `"expectOutcome": "success" | "failure"` for the operation outcome itself.\n\nKnowledge shown in this prompt carries a short label, `K1`, `K2`, ... for entries and `P1`, `P2`, ... for patterns. When an expectation rests on an entry, cite it by its label in the same action: `"basis": [{"id": "K2", "why": "what it told you"}]`, for example `{"action": "...", "expect": "the call lists the three saved items", "confidence": "sure", "basis": [{"id": "K2", "why": "it says saved items are listed newest first"}]}`. A citation is how a wrong entry gets corrected: when a cited expectation misses, the reviewer fixes the entry that misled you; an uncited miss can only be put down to your own judgment, and the entry stays as it was. When you apply a pattern, declare it by its label: `"patterns": [{"id": "P1", "why": "how its Therefore shapes this action"}]`; seeing a pattern is different from using it. The runtime tracks versions, so leave revision numbers out. Predictions, your readings of them and their citations are kept for Scrum replanning and retrospective learning. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
 
     // Per-task addendum from the caller (task hints, the browsing goal): the
     // reason `systemPrompt` can stay identical across an agent's tasks.
@@ -5989,30 +5989,58 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const messages = entry.state.llmMessages;
     const last = messages[messages.length - 1];
     if (!last || last.role !== 'user') return;
-    const reminder = `\n\nRespond with JSON action blocks as specified by your agent instructions; batch only where they allow it. Action names: ${this.vocabularyFor(entry).join(', ')}.`;
-    // Only the newest turn carries the reminder: strip last turn's copy so
-    // the history does not grow by one reminder per step.
+    const reminder = `${AgentAbject.REMINDER_MARK} batch only where they allow it. Action names: ${this.vocabularyFor(entry).join(', ')}.${this.knowledgeInView(entry)}`;
+    // Only the newest turn carries the reminder: strip earlier copies so the
+    // history does not grow by one reminder per step. The reminder changes as
+    // knowledge comes into view, so an earlier copy is found by its opening.
+    const strip = (text: string): string => {
+      const at = text.lastIndexOf(AgentAbject.REMINDER_MARK);
+      return at >= 0 ? text.slice(0, at) : text;
+    };
     for (const m of messages) {
       if (m === last || m.role !== 'user') continue;
-      if (typeof m.content === 'string') {
-        if (m.content.endsWith(reminder)) m.content = m.content.slice(0, -reminder.length);
-      } else {
+      if (typeof m.content === 'string') m.content = strip(m.content);
+      else {
         const t = m.content[m.content.length - 1];
-        if (t?.type === 'text' && t.text.endsWith(reminder)) t.text = t.text.slice(0, -reminder.length);
+        if (t?.type === 'text') t.text = strip(t.text);
       }
     }
     if (typeof last.content === 'string') {
-      if (last.content.endsWith(reminder)) return;
-      last.content += reminder;
+      last.content = strip(last.content) + reminder;
       return;
     }
     const tail = last.content[last.content.length - 1];
-    if (tail?.type === 'text') {
-      if (tail.text.endsWith(reminder)) return;
-      tail.text += reminder;
-    } else {
-      last.content.push({ type: 'text', text: reminder.trimStart() });
-    }
+    if (tail?.type === 'text') tail.text = strip(tail.text) + reminder;
+    else last.content.push({ type: 'text', text: reminder.trimStart() });
+  }
+
+  /** How the per-step reminder opens; an earlier copy is found and removed by it. */
+  private static readonly REMINDER_MARK = '\n\nRespond with JSON action blocks as specified by your agent instructions;';
+  /** Entries and patterns the per-step reminder names. */
+  private static readonly IN_VIEW_ENTRIES = 6;
+  private static readonly IN_VIEW_PATTERNS = 4;
+
+  /**
+   * The labelled knowledge and patterns this task has in view (shown in the
+   * prompt or fetched with recall), named at the end of the newest message
+   * with how to cite them. The citation instructions sit early in a long
+   * prompt; models that skip optional fields cite far more when the labels
+   * are in front of them as they write the action. Profile facts are left
+   * out: they describe the person and rarely carry a step's expectation.
+   */
+  private knowledgeInView(entry: TaskEntry): string {
+    const labels = entry.knowledgeLabels ?? {};
+    const shown = new Map((entry.injectedKnowledge ?? []).map(k => [k.id, k] as const));
+    const named = (kind: 'K' | 'P', max: number): string[] => Object.entries(labels)
+      .filter(([label, id]) => label[0] === kind && shown.has(id) && shown.get(id)!.source !== 'profile')
+      .sort((a, b) => Number(a[0].slice(1)) - Number(b[0].slice(1)))
+      .slice(-max)
+      .map(([label, id]) => `${label} "${String(shown.get(id)!.title ?? '').replace(/\s+/g, ' ').slice(0, 60)}"`);
+    const entries = named('K', AgentAbject.IN_VIEW_ENTRIES), patterns = named('P', AgentAbject.IN_VIEW_PATTERNS);
+    if (!entries.length && !patterns.length) return '';
+    return ` In view: ${[...entries, ...patterns].join(', ')}.`
+      + (entries.length ? ' When this step\'s expectation rests on an entry, add "basis": [{"id": "<label>", "why": "what it told you"}].' : '')
+      + (patterns.length ? ' When a pattern shapes this step, add "patterns": [{"id": "<label>", "why": "how its Therefore shapes it"}].' : '');
   }
 
   // ═══════════════════════════════════════════════════════════════════

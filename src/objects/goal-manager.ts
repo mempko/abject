@@ -2768,12 +2768,20 @@ hear assumptionResolved and goalReaction.
       const effects: LearningEffect[] = [];
       const reactionKinds: Record<string, number> = {}, assumptionStatuses: Record<string, number> = {};
       let reactions = 0, awaitingReactionReview = 0, assumptions = 0;
+      const steps = new Map<string, Record<string, unknown>>();
       for (const goal of this.goals.values()) {
         if (this.isPrivateGoal(goal.id)) continue; // nothing private is learned
         if (goal.scratchpad['learning/reactionReview'] === 'pending') awaitingReactionReview++;
         for (const a of this.assumptionsOf(goal)) { assumptions++; assumptionStatuses[a.status] = (assumptionStatuses[a.status] ?? 0) + 1; }
         for (const [key, value] of Object.entries(goal.scratchpad)) {
-          if (key.startsWith('learning/observation/') && !key.endsWith(':self')) observations.push(value as Record<string, unknown>);
+          if (key.startsWith('learning/observation/') && !key.endsWith(':self')) {
+            // One action leaves two records: the prediction before it ran
+            // (':prediction', which holds the citations) and the observation
+            // of its result. Merged here so each action counts once.
+            const step = `${goal.id}/${key.replace(/:prediction$/, '')}`;
+            const prior = steps.get(step) ?? {};
+            steps.set(step, key.endsWith(':prediction') ? { ...prior, ...(value as Record<string, unknown>) } : { ...(value as Record<string, unknown>), ...prior });
+          }
           else if (key.startsWith('learning/assessment/')) assessments.push(value as Record<string, unknown>);
           else if (key.startsWith('learning/decision/')) effects.push(...(value as LearningDecision).effects);
           else if (key.startsWith('learning/reaction/')) {
@@ -2783,6 +2791,8 @@ hear assumptionResolved and goalReaction.
           }
         }
       }
+      observations.push(...steps.values());
+      const listed = (o: Record<string, unknown>, field: string) => Array.isArray(o[field]) && (o[field] as unknown[]).length > 0;
       const verdicts: Record<string, number> = {}, blame: Record<string, number> = {}, missBlame: Record<string, number> = {}, states: Record<string, number> = {}, reasons: Record<string, number> = {};
       for (const a of assessments) {
         const verdict = String(a.verdict ?? 'unknown'), source = String((a.attribution as { source?: string } | undefined)?.source ?? 'none');
@@ -2802,8 +2812,13 @@ hear assumptionResolved and goalReaction.
         predictions: {
           observed: observations.length,
           withExpectation: observations.filter(o => typeof o.expect === 'string' && o.expect.trim()).length,
-          namingBelief: observations.filter(o => Array.isArray(o.basis) && o.basis.length > 0).length,
-          declaringPattern: observations.filter(o => Array.isArray(o.patterns) && o.patterns.length > 0).length,
+          namingBelief: observations.filter(o => listed(o, 'basis')).length,
+          declaringPattern: observations.filter(o => listed(o, 'patterns')).length,
+          // Actions with knowledge or patterns bearing on them in view: the
+          // ones that cited, and the ones the runtime found related entries
+          // for (basisCandidates). Citing is measured against these, since a
+          // mechanical step with nothing related in view has nothing to cite.
+          withRelated: observations.filter(o => listed(o, 'basis') || listed(o, 'patterns') || listed(o, 'basisCandidates')).length,
           withConfidence: observations.filter(o => confidenceOf(o.confidence)).length,
           withCandidates: observations.filter(o => Array.isArray(o.basisCandidates) && o.basisCandidates.length > 0).length,
         },
