@@ -72,6 +72,7 @@ import {
   LLMStreamChunk,
   ModelInfo,
   ModelTier,
+  TierRules,
   cliIsRetryable,
 } from './provider.js';
 
@@ -83,9 +84,9 @@ import {
 const AUTO_MODEL = 'auto';
 
 /**
- * Mirrors `agy models` (agy 1.3.4). IDs carry the reasoning effort suffix.
+ * Mirrors `agy models` (agy 1.5.13). IDs carry the reasoning effort suffix.
  * Older agy versions rejected bare names without a separate `--effort`, and
- * rejected `--effort` outright for pro/claude models; agy 1.3.4 accepts both
+ * rejected `--effort` outright for pro/claude models; agy 1.3.4+ accepts both
  * forms, but the suffixed ID alone is the one form every version accepts.
  *
  * vision is false throughout: agy rejects an image content block outright
@@ -94,6 +95,17 @@ const AUTO_MODEL = 'auto';
  */
 const AGY_MODELS = [
   { id: AUTO_MODEL,                 name: 'Auto (recommended)', vision: false },
+  { id: 'gemini-4-neon-xhigh',      name: 'Gemini 4 Neon (XHigh)', vision: false },
+  { id: 'gemini-4-neon-high',       name: 'Gemini 4 Neon (High)', vision: false },
+  { id: 'gemini-4-neon-medium',     name: 'Gemini 4 Neon (Medium)', vision: false },
+  { id: 'gemini-4-neon-low',        name: 'Gemini 4 Neon (Low)', vision: false },
+  { id: 'gemini-4-carbon-high',     name: 'Gemini 4 Carbon (High)', vision: false },
+  { id: 'gemini-4-carbon-medium',   name: 'Gemini 4 Carbon (Medium)', vision: false },
+  { id: 'gemini-4-carbon-low',      name: 'Gemini 4 Carbon (Low)', vision: false },
+  { id: 'gemini-4-hydrogen-xhigh',  name: 'Gemini 4 Hydrogen (XHigh)', vision: false },
+  { id: 'gemini-4-hydrogen-high',   name: 'Gemini 4 Hydrogen (High)', vision: false },
+  { id: 'gemini-4-hydrogen-medium', name: 'Gemini 4 Hydrogen (Medium)', vision: false },
+  { id: 'gemini-4-hydrogen-low',    name: 'Gemini 4 Hydrogen (Low)', vision: false },
   { id: 'gemini-4-argon-high',      name: 'Gemini 4 Argon (High)', vision: false },
   { id: 'gemini-4-argon-medium',    name: 'Gemini 4 Argon (Medium)', vision: false },
   { id: 'gemini-4-argon-low',       name: 'Gemini 4 Argon (Low)', vision: false },
@@ -167,21 +179,42 @@ function shouldOmitModelFlag(model: string | undefined): boolean {
  * amplifier on hard prompts (LINC#571). Explicit suffixes bound thinking
  * per tier; AUTO_MODEL remains user-selectable in AGY_MODELS.
  *
- * code and smart share gemini-4-argon-high. Measured on agy 1.4.12 through
- * this provider with the antigravity-v2 guidance applied (10 runs each of a
- * small, an ~18 KB and an agent-loop prompt): Argon high answered all 30
- * with 3-17x fewer reasoning tokens than flash-high, p50 21 s against 74 s on
- * the 18 KB prompt and level on the others; neither returned an empty answer.
- * Flash keeps balanced and fast, whose medium and low efforts already bound
- * its thinking. Plan availability was checked on one Google plan only; the
- * opt-in tripwire test (AGY_LIVE=1, antigravity-cli.test.ts) fails when the
- * installed agy does not list a tier default.
+ * smart/code default to gemini-4-neon-high, with balanced on gemini-4-neon-medium
+ * and fast on gemini-4-neon-low (agy 1.5.13). AGY_TIER_RULES below lets
+ * tier-resolver pick Neon dynamically when the user's live `agy models` catalog
+ * exposes it and fall back cleanly to Carbon / Argon / Hydrogen / 3.8 Flash on
+ * accounts without Neon. The opt-in tripwire test (AGY_LIVE=1,
+ * antigravity-cli.test.ts) verifies every catalog entry, tier default, and
+ * migration target against the installed `agy` binary.
  */
 export const AGY_TIER_MODELS: Record<ModelTier, AgyModelId> = {
-  smart: 'gemini-4-argon-high',
-  balanced: 'gemini-3.8-flash-medium',
-  fast: 'gemini-3.8-flash-low',
-  code: 'gemini-4-argon-high',
+  smart: 'gemini-4-neon-high',
+  balanced: 'gemini-4-neon-medium',
+  fast: 'gemini-4-neon-low',
+  code: 'gemini-4-neon-high',
+};
+
+/**
+ * Dynamic tier recommendations against the live `agy models` catalog.
+ * Prefers Gemini 4 Neon when the account exposes it, degrading gracefully to
+ * Carbon / Argon / Hydrogen / 3.8 Flash on plans without Neon, and picking up
+ * future Gemini generations via the family regex fallback.
+ */
+const AGY_TIER_RULES: TierRules = {
+  tiers: {
+    smart: [
+      { aliases: ['gemini-4-neon-high', 'gemini-4-carbon-high', 'gemini-4-argon-high'] },
+      { family: '^gemini-\\d+(\\.\\d+)?-.*-high$' },
+    ],
+    balanced: [
+      { aliases: ['gemini-4-neon-medium', 'gemini-4-hydrogen-medium', 'gemini-3.8-flash-medium'] },
+      { family: '^gemini-\\d+(\\.\\d+)?-.*-medium$' },
+    ],
+    fast: [
+      { aliases: ['gemini-4-neon-low', 'gemini-4-hydrogen-low', 'gemini-3.8-flash-low'] },
+      { family: '^gemini-\\d+(\\.\\d+)?-.*-low$' },
+    ],
+  },
 };
 
 /**
@@ -536,6 +569,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
       // built-in list.
       models: peekCachedModels(MODEL_DISCOVERY_KEY) ?? [...AGY_MODELS],
       defaultTierModels: AGY_TIER_MODELS,
+      tierRules: AGY_TIER_RULES,
       // agy 1.3.4 lists only the 3.8 flash line, Gemini 4 Argon and the 5.5
       // Claude models. Migrate saved tier routing on every id this list ever
       // carried that agy no longer accepts: flash lines to 3.8 flash at the
