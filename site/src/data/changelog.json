@@ -1,5 +1,19 @@
 [
   {
+    "version": "0.16.13",
+    "date": "2026-11-20",
+    "title": "Agents keep what they know in view",
+    "summary": "Agents now see the knowledge and patterns relevant to their task at every step, so they lean on what they have learned more often, and the learning numbers in the Knowledge browser now describe what agents actually do.",
+    "highlights": [
+      "At each step, an agent's reminder now ends with an \"In view\" list: up to six knowledge entries and four patterns the task has already been shown, with a short note on citing them. Before, that guidance sat far up a long prompt and agents often missed it, so they now cite what they rely on more often",
+      "The Knowledge browser has a new \"Had related knowledge in view\" row. Knowledge and pattern citation rates now count only the steps where related knowledge was actually shown, so routine steps with nothing to cite no longer pull the rates down"
+    ],
+    "fixes": [
+      "The learning funnel counted every agent action twice (once when the agent predicted the result, once when it observed it). Each action is now counted once, so the observed and prediction totals are accurate",
+      "Citation rates still display correctly when the workspace's goal data comes from an older version that does not report the new count"
+    ]
+  },
+  {
     "version": "0.16.12",
     "date": "2026-11-20",
     "title": "Maps your agents can cite, and claims that compete",
