@@ -1752,23 +1752,29 @@ export class GoalManager extends Abject {
     // only the owner's journal keys for goals not already loaded (a loaded
     // goal merged its checkpoint above); never require a live task to
     // recover it.
+    //
+    // Checkpoints of swept goals stay in Storage as their retained evidence
+    // (readRetainedGoal), so there can be hundreds, some tens of MB each. Each
+    // is judged as it is read and dropped unless its learning is unfinished:
+    // holding them all until the scan ended ran the worker out of heap at
+    // boot once they passed a gigabyte. Recovered goals keep index order.
     const keys = await this.request<string[]>(request(this.id, this.storageId, 'keys', {})).catch(() => []);
     const unloaded = keys.filter(k => k.startsWith('goals:learning:') && !this.goals.has(k.slice('goals:learning:'.length)));
-    const checkpoints: Array<{ key: string; checkpoint: { version?: number; goalState?: Partial<Goal>; scratchpad?: Record<string, unknown> } | null }> = [];
+    const recoveredAt: Array<Goal | undefined> = new Array(unloaded.length);
     await runBounded(unloaded.length, GoalManager.LOAD_CONCURRENCY, async (i) => {
       const key = unloaded[i];
       const checkpoint = await this.request<{ version?: number; goalState?: Partial<Goal>; scratchpad?: Record<string, unknown> } | null>(request(this.id, this.storageId!, 'get', { key })).catch(() => null);
-      checkpoints.push({ key, checkpoint });
-    });
-    for (const { key, checkpoint } of checkpoints) {
-      if (checkpoint?.version !== 2 || !checkpoint.scratchpad) continue;
+      if (checkpoint?.version !== 2 || !checkpoint.scratchpad) return;
       const id = key.slice('goals:learning:'.length), state = checkpoint.goalState ?? {};
-      if (this.goals.has(id)) continue;
       const recovered: Goal = { id, title: state.title ?? 'Recovered learning episode', description: state.description ?? 'Durable evidence retained for unfinished retrospective learning',
         status: 'archived', createdBy: state.createdBy ?? this.id, creatorName: state.creatorName ?? 'Recovered episode', createdAt: state.createdAt ?? 0,
         updatedAt: state.updatedAt ?? 0, result:state.result,error:state.error, progress:[],childIds:state.childIds ?? [],interjections:[],currentScrumNumber:0,scratchpad:checkpoint.scratchpad };
-      if (!this.hasPendingLearning(recovered) && recovered.scratchpad['learning/review'] !== 'pending') continue;
-      this.goals.set(id,recovered); if (!this.goalOrder.includes(id)) this.goalOrder.push(id);
+      if (!this.hasPendingLearning(recovered) && recovered.scratchpad['learning/review'] !== 'pending') return;
+      recoveredAt[i] = recovered;
+    });
+    for (const recovered of recoveredAt) {
+      if (!recovered || this.goals.has(recovered.id)) continue;
+      this.goals.set(recovered.id, recovered); if (!this.goalOrder.includes(recovered.id)) this.goalOrder.push(recovered.id);
     }
     if (this.goals.size > 0) {
       log.info(`Loaded ${this.goals.size} persisted goals from index`);
