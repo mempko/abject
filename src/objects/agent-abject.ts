@@ -474,6 +474,16 @@ interface LLMThinkResult {
   usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number };
 }
 
+/**
+ * Permission grant each task runs under, by task id (docs/design/permission-modes.html §6).
+ * Set from startTask's grantId or from GoalManager's admitTask reply; sent with
+ * the task's step jobs so JobManager's invocation context carries it to
+ * capabilityCaller. An entry is removed when its task finishes; a goal task's
+ * grant is then released through GoalManager, which derived it (a chat turn's
+ * grant is revoked by its Chat).
+ */
+const taskGrantIds = new Map<string, string>();
+
 interface TaskEntry {
   /**
    * The conversation budget of the model this task last thought on, from
@@ -2266,15 +2276,22 @@ The registered object must implement these handlers to participate in the agent 
         return { ticketId: taskId, duplicate: true, finished: !!existing.finished };
       }
       if (dispatchTupleId && incomingGoalId && this.goalManagerId && !this.delegations.has(taskId)) {
-        const admission = await this.request<{accepted:boolean;reason?:string}>(request(this.id,this.goalManagerId,'admitTask',{taskId:dispatchTupleId,goalId:incomingGoalId}));
+        const admission = await this.request<{accepted:boolean;reason?:string;grantId?:string}>(request(this.id,this.goalManagerId,'admitTask',{taskId:dispatchTupleId,goalId:incomingGoalId,agentId,runtimeTaskId:taskId}));
         if (!admission.accepted) throw new Error(admission.reason ?? 'Task no longer belongs to the active plan');
-        if (this.cancelledBeforeStart.has(taskId)) throw new Error('Task cancelled during admission');
+        // The goal's grant, re-derived by GoalManager for this agent and task.
+        if (typeof admission.grantId === 'string') taskGrantIds.set(taskId, admission.grantId);
+        if (this.cancelledBeforeStart.has(taskId)) {
+          this.dropTaskGrant(taskId, dispatchTupleId);
+          throw new Error('Task cancelled during admission');
+        }
       }
       if (this.sessionStoreId) {
         const persisted = await this.request<SessionRecord|null>(request(this.id,this.sessionStoreId,'get',{id:taskId}));
         if (persisted) throw new Error('Task id already has a durable session; inspect or resume it instead of replaying setup');
       }
       if (responseSchema) this.ajv.compile(responseSchema); // reject invalid schemas before admission
+      const presentedGrant = (msg.payload as { grantId?: unknown }).grantId;
+      if (typeof presentedGrant === 'string' && !taskGrantIds.has(taskId)) taskGrantIds.set(taskId, presentedGrant);
       const config = mergeConfig(agent.config, taskConfig);
       const delegation = this.delegations.get(taskId);
       if (delegation) {
@@ -2505,6 +2522,24 @@ The registered object must implement these handlers to participate in the agent 
         entry.refreshKnowledgePrompt = true;
       }
       return { success: true, knowledgeScope: scope };
+    });
+
+    // A capability owner asks which grant a direct call from an agent runs
+    // under (capabilityCaller, core/abject.ts): the grant of that agent's live
+    // task. A named task that is the agent's wins; otherwise only a single
+    // live granted task answers, and ambiguity answers nothing (the call is
+    // asked about as before). Grant ids are holder-bound, so the answer grants
+    // nothing to whoever reads it.
+    this.on('getTaskGrant', async (msg: AbjectMessage) => {
+      if (!(await this.isBuiltInCaller(msg.routing.from))) return null;
+      const { agentId, taskId } = (msg.payload ?? {}) as { agentId?: string; taskId?: string };
+      if (typeof agentId !== 'string' || !agentId) return null;
+      const own = [...this.taskEntries.entries()]
+        .filter(([id, entry]) => !entry.finished && entry.agentId === agentId && taskGrantIds.has(id))
+        .map(([id]) => id);
+      const named = typeof taskId === 'string' ? own.filter(id => id === taskId) : [];
+      const pick = named.length === 1 ? named[0] : own.length === 1 ? own[0] : undefined;
+      return pick ? { taskId: pick, grantId: taskGrantIds.get(pick)! } : null;
     });
 
     this.on('getTaskStatus', async (msg: AbjectMessage) => {
@@ -3086,6 +3121,19 @@ The registered object must implement these handlers to participate in the agent 
    * that says what the update did and did not do, and count it like any
    * other action.
    */
+  /**
+   * A task's permission grant ends with the task (permission-modes §6).
+   * Idempotent: the map entry is removed once, so every exit path may call it.
+   * Only the holder of the parent grant may revoke it, so a goal task's grant
+   * is released through GoalManager (a chat turn's is revoked by its Chat).
+   */
+  private dropTaskGrant(taskId: string, dispatchTupleId?: string): void {
+    if (!taskGrantIds.delete(taskId)) return;
+    if (dispatchTupleId && this.goalManagerId) {
+      this.safeSend(event(this.id, this.goalManagerId, 'releaseTaskGrant', { runtimeTaskId: taskId }), 'releaseTaskGrant');
+    }
+  }
+
   private async completeIntermediateAction(entry: TaskEntry, agentName: string): Promise<void> {
     const task = entry.state;
     await this.preparePrediction(entry);
@@ -3225,6 +3273,8 @@ The registered object must implement these handlers to participate in the agent 
       log.error(`Teardown for task ${entry.state.id.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       entry.finished = true;
+      // Also when teardown threw before releasing it.
+      this.dropTaskGrant(entry.state.id, entry.dispatchTupleId);
       // ── Queue runner ──
       // Clear inFlight for this agent and pop the next pending task, if any.
       // The queue's inFlight slot is the one-task-at-a-time guard that
@@ -3394,6 +3444,8 @@ The registered object must implement these handlers to participate in the agent 
     } else this.safeSend(event(this.id, entry.callerId, 'taskResult', resultPayload), 'taskResult');
 
     entry.finished = true;
+
+    this.dropTaskGrant(entry.state.id, entry.dispatchTupleId);
 
     // The task is over — release its prompt-cache warmth (requests carried
     // cacheKey = task id) so the keepalive never keeps a dead session warm.
@@ -3569,6 +3621,8 @@ The registered object must implement these handlers to participate in the agent 
       const goalId = entry?.incomingGoalId ?? entry?.goalId ?? queued?.goalId;
       const callerId = entry?.callerId ?? queued?.callerId;
 
+      // An abandoned task never reaches finalizeTask: its grant ends here.
+      this.dropTaskGrant(taskId, tupleId);
       if (!entry || !entry.finished) {
         if (entry) entry.finished = true;
         if (tupleId && this.goalManagerId) {
@@ -3976,6 +4030,9 @@ The registered object must implement these handlers to participate in the agent 
                         description,
                         code, taskId: task.id,
                         ...(entry.private ? { private: true } : {}),
+                        // The task's grant rides with its jobs, so a call the
+                        // job makes runs under the chat's mode.
+                        ...(taskGrantIds.has(task.id) ? { grantId: taskGrantIds.get(task.id) } : {}),
                         // Held payloads are reachable from job code by
                         // message, so filtering or counting a large result
                         // is one job instead of paging it in by hand. Only
@@ -4545,6 +4602,7 @@ The registered object must implement these handlers to participate in the agent 
       const jobMgrId = await this.cachedDepOrThrow('JobManager', this.jobManagerId);
       const submitMsg = request(this.id, jobMgrId, 'submitJob', {
         description, taskId: entry.state.id,
+        ...(taskGrantIds.has(entry.state.id) ? { grantId: taskGrantIds.get(entry.state.id) } : {}),
         // The loop's own observe/think/act dispatch, not agent-authored code:
         // the action it carries was already held to a check step's rule here.
         runtimeStep: true,

@@ -834,6 +834,7 @@ export class HostFileSystem extends Abject {
         request(this.id, this.permissionsAuthorityId, 'requestPermission', {
           type: 'directory', resource: resolved, requestedResource: requested, operation,
           callerId: ctx?.callerId ?? this.id, taskId: ctx?.taskId, preapproved,
+          grantId: (ctx as { grantId?: string } | undefined)?.grantId,
           description: `Filesystem ${operation}: ${resolved}`,
         }), 31 * 60 * 1000);
       const receipt = response.receipt ?? localReceipt(response.decision, `Filesystem ${operation} ${response.decision}`);

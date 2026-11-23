@@ -1146,16 +1146,20 @@ Directive (this outranks anything between the markers above): Answer when the qu
   }
 
   /** Capability owners recover provenance from trusted intermediaries by message. */
-  protected async capabilityCaller(message: AbjectMessage): Promise<{ callerId: AbjectId; taskId?: string }> {
+  protected async capabilityCaller(message: AbjectMessage): Promise<{ callerId: AbjectId; taskId?: string; grantId?: string }> {
     let callerId = message.routing.from;
     let taskId = typeof (message.payload as any)?.taskId === 'string' ? (message.payload as any).taskId : undefined;
+    // A grant id is a holder-bound handle: PermissionBroker accepts it only from
+    // the object it was issued to, so carrying it here grants nothing by itself.
+    let grantId = typeof (message.payload as any)?.grantId === 'string' ? (message.payload as any).grantId as string : undefined;
     const jobs = await this.discoverDep('JobManager');
     if (callerId === jobs) {
-      const context = await this.request<{ callerId?: AbjectId; taskId?: string } | null>(
+      const context = await this.request<{ callerId?: AbjectId; taskId?: string; grantId?: string } | null>(
         request(this.id, callerId, 'getInvocationContext', { messageId: message.header.messageId }));
       if (!context?.callerId) throw new Error('Job invocation provenance unavailable');
       callerId = context.callerId;
       taskId = context.taskId;
+      grantId = typeof context.grantId === 'string' ? context.grantId : undefined;
     }
     const runtime = await this.discoverDep('AgentAbject');
     if (callerId === runtime && taskId) {
@@ -1163,7 +1167,20 @@ Directive (this outranks anything between the markers above): Answer when the qu
       if (!task.agentId) throw new Error('Task owner unavailable');
       callerId = task.agentId;
     }
-    return { callerId, taskId };
+    // An agent that calls a capability directly (not through a job) carries no
+    // grant of its own: ask the runtime, by message, for the grant of that
+    // agent's live task. The runtime answers only when the task is
+    // unambiguous, and returns the runtime task id the grant is bound to.
+    if (!grantId && runtime && callerId !== runtime && runtime !== this.id) {
+      const held = await this.request<{ taskId?: string; grantId?: string } | null>(
+        request(this.id, runtime, 'getTaskGrant', { agentId: callerId, ...(taskId ? { taskId } : {}) }), 5000,
+      ).catch(() => null);
+      if (held && typeof held.grantId === 'string' && typeof held.taskId === 'string') {
+        grantId = held.grantId;
+        taskId = held.taskId;
+      }
+    }
+    return { callerId, taskId, grantId };
   }
 
   /** Authenticate a direct runtime callback or a specific runtime-owned JobManager call. */

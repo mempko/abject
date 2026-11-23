@@ -292,6 +292,93 @@ removal is refused if the rule changed while the question was open.
 `takeTheWheel` puts every project back to `ask` and drops session grants and
 allow rules; deny rules stay.
 
+### Permission modes and grants
+
+A permission mode says how far an agent's tool calls go without asking (see
+`src/core/permission-modes.ts`). Modes travel as grants, which PermissionBroker
+alone owns (`grant-store.ts`, persisted beside its rules; task grants are not
+persisted):
+
+- **Root.** ChatManager claims its workspace's root grant (`claimRootGrant`):
+  Auto, with ceiling Auto, unless Settings → Grants changed it
+  (`grantMode`, GlobalSettings and CliServer only). The root's mode is the
+  default a new chat starts at; its ceiling is what bounds every chat. Auto
+  reaches as far as each project's own autonomy level, so a new chat behaves
+  as the broker did before modes: trusted projects run at their level,
+  everything else asks.
+- **Chat.** ChatManager derives one grant per conversation, rebound by
+  conversation id when the chat respawns. A fork derives from the source
+  chat's grant (Chat `deriveForkGrant`), or from the root when the source is
+  not running or holds none.
+- **Task.** Chat derives a grant for each turn task (revoked after the turn)
+  and for each goal it creates (held by GoalManager, which derives one per
+  dispatched task for the agent that runs it, and revokes the goal's when
+  the goal completes, fails or is stopped; after a restart GoalManager takes
+  its workspace's goal grants back with `claimGoalGrants`). These grants
+  *inherit*: they follow the chat's mode live, so switching the chat to Auto
+  mid-goal moves the running work too, until a task lowers its own. The grant id rides
+  `AgentAbject.startTask` and the job's invocation context in JobManager, so
+  `capabilityCaller` finds it and capabilities send it with
+  `requestPermission`. A task's grant is dropped when the task ends.
+
+Only a grant's holder may derive from it, and a child is never wider than its
+parent (mode, ceiling, covered types, folders, pass-on depth, `maySetMode`,
+expiry, workspace). `setMode` raises a grant up to its ceiling when it
+`maySetMode`; a task grant may only lower. The effective mode is the meet of
+the chain below the root, bounded by the root's ceiling, so lowering or
+revoking a chat (or lowering the workspace ceiling) narrows everything under
+it, while changing the workspace default only affects chats created after.
+Other methods: `deriveGrant`, `getMyGrant`,
+`describeGrant`, `listGrants`, `revokeGrant` (the grant and everything under
+it); every change emits `grantsChanged`.
+
+When a request presents a grant, the grant's reach caps the effective level,
+Plan mode denies every write (a filesystem write or a command that is not a
+read) before any rule, and the grant's `beyond` takes the place of the
+prompt mode (deny or allow without asking, or ask the person); rules, protected
+paths and the other floors still apply, and a revoked or expired grant denies.
+An Unattended grant never asks, even about a request type it does not cover
+(a web action, say): that request is denied instead.
+Decision records and receipts carry the basis (`grant` or `person`) and the
+grant chain. A question asked under a grant adds *Authorized by* (the chain
+with each mode) and *Effective mode*, and a *This chat's grant* group:
+
+- **Switch this chat to Auto** (a live chat grant is in the chain): raises the
+  chat's grant to Auto, still held to its ceiling, and allows this request.
+  If the broker refuses, the request is allowed once and a *Chat mode not
+  changed* notice tells the person why.
+- **Deny and stop this task** (the caller holds a task grant): revokes that
+  grant and everything under it, denies, then stops the work: the whole goal
+  through GoalManager `stopGoal` for a goal task, otherwise AgentAbject
+  `cancelTask`. If neither stops it, a *Task not stopped* notice says so.
+
+Where the person sees it:
+
+- **The chat's mode picker** (ChatWindow): a pill first in the composer row
+  shows the chat's effective mode (*Ask every time* with no grant). Clicking
+  opens *Mode for this chat* above the message box, listing the presets with
+  the current one marked. Modes past the ceiling (Full access, unless the
+  person allowed it in Settings → Grants) are disabled with the reason, as is
+  every mode when the grant may not change its own. A
+  note names the grant's source and ceiling and says when the workspace caps
+  it. A choice goes through Chat `setMode` to the broker, where the chat's own
+  window counts as the person. The pill follows the broker's `grantsChanged`,
+  so a change from the approval dialog or the terminal shows at once. The terminal's `/mode` does the same
+  ([../../cli/README.md](../../cli/README.md)).
+- **Settings → Grants** (GlobalSettings): one row per workspace root grant to
+  edit its default mode, ceiling (reach and beyond), how many levels it may
+  pass the grant on, what it covers (shell, directory, clipboard, terminal,
+  outward) and whether it may change its own mode. Raising a ceiling's beyond
+  to `allow` (which makes Full access possible) asks the person to confirm a
+  warning first. Each change is sent as
+  `grantMode` and read back from `listGrants`; folder limits are shown, not
+  editable. An *Always enforced* card lists what no grant overrides.
+- **Live grant chains**, on the same tab: every grant as a tree, root → chat
+  → task, with stored, effective and ceiling modes and flags for grants
+  limited by an ancestor or revoked. It rebuilds when the broker emits
+  `grantsChanged` (or on Refresh), deferred while the tab is hidden or a menu
+  is open.
+
 SettingsManager owns the global settings (sections `ai`, `auth`, `filesystem`,
 `shell`, `web`, `permissions`). It loads them from global Storage,
 applies them (LLM `configure`, AuthGate `updateAuth`, permissions and the prompt
@@ -372,7 +459,7 @@ The KnowledgeBase in `INFRA_OBJECTS` is the C++/WASM package in `native/knowledg
 | File | Object | Runs | Role |
 |------|--------|------|------|
 | `chat.ts` | Chat | on demand (ChatManager), worker | One conversation as data: routes requests into goals, keeps the transcript, emits `messageAdded`; draws nothing, and `show` returns false with no display. Cards: a ```card block in a reply, `card` in a goal result, or `postCard` (card data, or the typeId of any kept object that draws itself) puts a card under the message; a standard card is its own object (`standard-card.ts`) in the conversation's folder `chats/<id>`, asleep until shown, and the message keeps its typeId and plain text (what the model and the terminal read). Questions (its own `clarify`, a goal's `ask_user`) are saved with their `choices` and marked answered by the next reply (`messageAnswered`). The person's first message after a goal result (within a day, no goal running) is read as a reaction (site `chat.reaction`, riding on the `chat.route` call when there is one) and anything but neutral goes to GoalManager `recordReaction`; errors and pause notes are saved display-only (`media`), outside the model's context. The assistant's messages are signed `Abject`. An `![…](abject://…)` image in a reply goes to listeners as the image itself (a view cannot reach the FileSystem); the transcript keeps the reference. `clearHistory` and `setTitle` are undoable from one history per conversation; undo restores the cleared messages ahead of newer ones and redraws the window (`chatReloaded`). A Chat spawned with `private: true` is a private conversation: only its window, ChatManager and CliServer may subscribe or read and drive it; it saves to `private:` Storage keys (history, active goal, uploads), starts private turns and goals, learns nothing, keeps card content in the message instead of card objects, gives a private goal its attachments through the goal's data, takes private goal outcomes through `privateGoalOutcome`, and is marked `sharing: 'user-local'`. Every Chat's routing prompt, private or not, says another private conversation is read only in its own window (`PRIVATE_ELSEWHERE_CHAT_PROMPT`) |
-| `chat-window.ts` | ChatWindow | on demand (Chat `show`), desktop, worker | The desktop view of one Chat: bubbles (new ones rise in), the live activity (kept under the newest message; a running goal shows as one sentence of what it is doing, with its steps behind Show details and a link to the Goals window), a question's answers as buttons that send the answer, a message's card in a slot (a card's `say` action is sent as the person's words, `open` shows that object), the welcome (greeting and tiles), composer whose placeholder follows what typing does; sends what the person does back to Chat. Forwards Ctrl+Z to its Chat. A private Chat's window shows a lock and the privacy banner and is created `private: true` |
+| `chat-window.ts` | ChatWindow | on demand (Chat `show`), desktop, worker | The desktop view of one Chat: the permission-mode pill and picker in the composer, bubbles (new ones rise in), the live activity (kept under the newest message; a running goal shows as one sentence of what it is doing, with its steps behind Show details and a link to the Goals window), a question's answers as buttons that send the answer, a message's card in a slot (a card's `say` action is sent as the person's words, `open` shows that object), the welcome (greeting and tiles), composer whose placeholder follows what typing does; sends what the person does back to Chat. Forwards Ctrl+Z to its Chat. A private Chat's window shows a lock and the privacy banner and is created `private: true` |
 | `chat-manager.ts` | ChatManager | workspace, worker | The conversation roster and Chat lifecycle: `newConversation({ show })`, `openConversation` (no window, as a terminal does), `showConversation`; deleting a conversation removes its cards' folder. `listConversations` rows carry `working: true` while the conversation works, and `activityChanged` (naming none) says when that changes. Deleting a conversation sets it aside (roster row, transcript, goal marker on disk for the session and three days; its cards through AbjectStore); per-caller `undo` brings it back and the Chat respawns when opened. Renames are undoable in memory. A conversation created with `private: true` keeps its row in `private:chats:roster` and its history and goal marker under `private:` keys, and is listed and readable only by the person's views (ChatBrowser, CliServer, ChatWindow, CommandPalette; a Chat only its own); roster events show `PRIVATE_TITLE`. Deleting one purges its goals and keys, kept for undo in memory until restart; a fork of one is private and copies its attachments. `deliverPrivateOutcome` (GoalManager only) hands a private goal's outcome to its Chat. The private roster is never written until it has been read, so a failed read (tried again a few times) cannot erase it |
 
 ChatBrowser, the roster window, is under Per-workspace UI.
@@ -382,9 +469,9 @@ ChatBrowser, the roster window, is under Per-workspace UI.
 | File | Object | Runs | Role |
 |------|--------|------|------|
 | `settings-manager.ts` | SettingsManager | global, worker | Owns the global settings: load, validate, persist, apply, `settingsChanged`; presets; admits writers. AI section includes `learningBudgetUsdPerDay` (default 3, about $90 to $100 a month; 0 turns learning model work off), shown in the AI tab and the `abject` command. Undo/redo per caller for the AI section's plain fields and saved presets, re-applied through `setSettings`; credentials and access sections are never undone. Providers: `listProviders` gives each one's state (connected, needsKey, unreachable, missing), looked up through the LLM object's `probeProvider`; `connectProvider` checks a key with its provider before saving it and, when no tier is set, routes every tier to that provider's recommended models. Removing a key moves the tiers that used it to a provider that still serves. No tier set at all is valid. `applyPreset` refuses a preset whose providers are not all connected unless `onlyReady`: then the ready part applies and the rest waits in `ai.pending` until its provider connects |
-| `permission-broker.ts` | PermissionBroker | global, worker | Decides capability permissions by rules, project autonomy, workspace access mode and prompt mode; asks through DialogBroker. Denies, without asking, anything but reads for a task its AgentAbject reports `readOnly` (a check step); this only restricts |
+| `permission-broker.ts` | PermissionBroker | global, worker | Decides capability permissions by rules, project autonomy, workspace access mode, the caller's permission-mode grant and prompt mode; owns the grants (`grant-store.ts`, see Permission modes and grants); asks through DialogBroker. Denies, without asking, anything but reads for a task its AgentAbject reports `readOnly` (a check step); this only restricts |
 | `dialog-broker.ts` | DialogBroker | global, worker | Holds every open question to a person; presenters and responders answer; sealed at boot. A confirm or prompt may carry a `card` ({ typeId, storeId, text }): shown in a slot on the desktop, as text in a terminal; only the dialog's own buttons answer |
-| `global-settings.ts` | GlobalSettings | global, desktop, worker | The Settings window over SettingsManager (plus Skills, Packages, Updates tabs); presenter for permission dialogs; opens itself on first boot. Forwards Ctrl+Z to SettingsManager and repaints the AI tab |
+| `global-settings.ts` | GlobalSettings | global, desktop, worker | The Settings window over SettingsManager (plus Grants, Skills, Packages, Updates tabs); presenter for permission dialogs; opens itself on first boot. Forwards Ctrl+Z to SettingsManager and repaints the AI tab |
 | `ai-settings-pane.ts` | (part of GlobalSettings, not an Abject) | with GlobalSettings | The Settings window's AI tab: a status line (whether an AI is connected) and Undo over three sub-tabs. Providers: what each needs (key field, CLI found or not, local server answering or not). Models: presets with what they still need, then the model behind each tier. Advanced: the less-used rows. Opens on Providers until a tier is set, then on Models. No Save button: each control writes its one change through SettingsManager, and Undo takes the last back. Having no provider is a state it shows, with the way out, not an error |
 | `modal-dialog.ts` | ModalDialog | on demand (WidgetManager), desktop, in WidgetManager's thread | Draws one confirm or prompt dialog for WidgetManager and reports the answer; a dialog's card sits in a slot above the buttons, and its taps never answer the dialog |
 

@@ -341,7 +341,7 @@ export class MCPBridge extends Abject {
       void _envelopeTimeout;  // currently unused; could be wired into sendRequest deadline later
       contractRequire(typeof toolName === 'string' && toolName.length > 0, 'toolName must be non-empty (accepts toolName, tool, or name)');
 
-      return await this.callTool(toolName, input, msg.routing.from);
+      return await this.callTool(toolName, input, msg.routing.from, msg);
     });
 
     this.on('listTools', async (_msg: AbjectMessage) => {
@@ -638,6 +638,7 @@ export class MCPBridge extends Abject {
     toolName: string,
     input: Record<string, unknown>,
     callerId: AbjectId,
+    msg?: AbjectMessage,
   ): Promise<{ content: string; isError: boolean; images?: MCPImage[]; permission?: PermissionReceipt }> {
     this.requireConnected();
 
@@ -659,7 +660,7 @@ export class MCPBridge extends Abject {
       throw err;
     }
 
-    const refusal = await this.consentFor(tool, input, callerId);
+    const refusal = await this.consentFor(tool, input, callerId, msg);
     if (refusal) return refusal;
     // The person may have taken a while; the server may be gone by now.
     this.requireConnected();
@@ -688,9 +689,15 @@ export class MCPBridge extends Abject {
     tool: MCPToolDefinition,
     input: Record<string, unknown>,
     callerId: AbjectId,
+    msg?: AbjectMessage,
   ): Promise<{ content: string; isError: true; permission: PermissionReceipt } | undefined> {
     const hints = (tool as MCPToolDefinition & { annotations?: MCPToolAnnotations }).annotations;
     if (hints?.destructiveHint !== true || hints.readOnlyHint === true) return undefined;
+    // Who is asking, with the task and grant it runs under (permission-modes §6),
+    // resolved only for a call that needs consent.
+    const who: { callerId: AbjectId; taskId?: string; grantId?: string } = msg
+      ? await this.capabilityCaller(msg).catch(() => ({ callerId }))
+      : { callerId };
 
     const scope = `${this.serverName}/${tool.name}`;
     const args = summarizeArguments(input);
@@ -709,7 +716,9 @@ export class MCPBridge extends Abject {
     try {
       const response = await this.request<{ decision: string; receipt?: PermissionReceipt }>(
         request(this.id, brokerId, 'requestPermission', {
-          type: 'mcp_tool', scope, resource, callerId,
+          type: 'mcp_tool', scope, resource, callerId: who.callerId,
+          ...(who.taskId ? { taskId: who.taskId } : {}),
+          ...(who.grantId ? { grantId: who.grantId } : {}),
           description: hints.title ?? tool.name,
           detail: [
             ...(tool.description ? [`Tool       ${tool.description.replace(/\s+/g, ' ').slice(0, 160)}`] : []),

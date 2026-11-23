@@ -194,6 +194,7 @@ the socket may have no login:
 | `listChats`, `newChat`, `openChat`, `closeChat`, `renameChat`, `deleteChat`, `history`, `send` | the workspace's ChatManager and Chat (opening subscribes the connection; no window opens) |
 | `stopGoal`, `pauseGoal`, `resumeGoal`, `goalStatus` | the conversation's Chat, the workspace's GoalManager |
 | `listDialogs`, `respondDialog` | DialogBroker |
+| `chatMode` | the conversation's Chat: `setMode` with a preset matched by name or label (when `mode` is given), then `getMode`; the terminal counts as the person, so it may raise the mode up to the grant's ceiling |
 | `instanceInfo`, `shutdown`, `isConfigured` | InstanceInfo, the backend's shutdown, SettingsManager |
 | `listProjects`, `setProjectTrusted`, `setProjectAutonomy` | the workspace's ExternalProjectRegistry |
 | `getSettingsSchema`, `getSettings`, `setSettings`, `listPresets`, `applyPreset`, `savePreset`, `deletePreset`, `listModels`, `listProviders`, `connectProvider` | SettingsManager |

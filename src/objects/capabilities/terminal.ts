@@ -192,7 +192,7 @@ export class Terminal extends Abject {
     if (!await this.isBuiltInCaller(msg.routing.from, TERMINAL_CALLERS)) {
       throw new Error('A terminal session is opened by a terminal view; this caller holds no shell capability');
     }
-    const payload = msg.payload as { cwd?: string; cols?: number; rows?: number; taskId?: string };
+    const payload = msg.payload as { cwd?: string; cols?: number; rows?: number; taskId?: string; grantId?: string };
     const callerId = msg.routing.from;
     const cwd = path.resolve(payload.cwd && payload.cwd.length > 0 ? payload.cwd : os.homedir());
     const cols = clampInt(payload.cols, DEFAULT_COLS, 2, MAX_COLS);
@@ -200,8 +200,10 @@ export class Terminal extends Abject {
     const command = this.defaultShell();
     const args = this.defaultShellArgs();
 
-    await this.askDirectory(cwd, callerId, payload.taskId);
-    const permission = await this.askShell(command, args, cwd, callerId, payload.taskId);
+    // A grant id is holder-bound: the broker honours it only from its holder.
+    const grantId = typeof payload.grantId === 'string' ? payload.grantId : undefined;
+    await this.askDirectory(cwd, callerId, payload.taskId, grantId);
+    const permission = await this.askShell(command, args, cwd, callerId, payload.taskId, grantId);
 
     const spec: TerminalSessionSpec = {
       command, args, cwd, cols, rows,
@@ -258,7 +260,7 @@ export class Terminal extends Abject {
   }
 
   /** The working directory is its own question, exactly as it is for a single command. */
-  private async askDirectory(cwd: string, callerId: AbjectId, taskId?: string): Promise<PermissionReceipt> {
+  private async askDirectory(cwd: string, callerId: AbjectId, taskId?: string, grantId?: string): Promise<PermissionReceipt> {
     return this.ask({
       type: 'directory',
       operation: 'read',
@@ -266,6 +268,7 @@ export class Terminal extends Abject {
       description: `Terminal working directory: ${cwd}`,
       callerId,
       taskId,
+      ...(grantId ? { grantId } : {}),
     }, callerId, 'read', cwd, taskId);
   }
 
@@ -275,7 +278,7 @@ export class Terminal extends Abject {
    * A per-command approval would be a lie here: the approval covers the session,
    * and everything typed after it runs without being asked about again.
    */
-  private async askShell(command: string, args: string[], cwd: string, callerId: AbjectId, taskId?: string): Promise<PermissionReceipt> {
+  private async askShell(command: string, args: string[], cwd: string, callerId: AbjectId, taskId?: string, grantId?: string): Promise<PermissionReceipt> {
     const resource = [command, ...args].join(' ');
     return this.ask({
       type: 'shell',
@@ -283,6 +286,7 @@ export class Terminal extends Abject {
       cwd,
       callerId,
       taskId,
+      ...(grantId ? { grantId } : {}),
       commandName: path.basename(command),
       preapproved: false,
       description: 'Open a terminal: approve this shell for the whole session. Everything typed in it afterwards runs on this machine without further prompts.',

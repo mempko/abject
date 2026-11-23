@@ -193,13 +193,24 @@ work with Alt.
 Up, Down, PageUp and PageDown scroll. Ctrl+C twice quits (once while the link
 is down).
 
+**A chat's permission mode.** `/mode` in a chat tab (and in `--plain`) prints
+the chat's mode, which grant it came from, and the names it takes; `/mode <name>`
+sets it. The name is a preset, `plan`, `manual`, `accept-edits`, `auto` or
+`unattended`; case, spaces, `-` and `_` are ignored, and the label (`Accept
+edits`) works too. It goes through CliServer's `chatMode` op to the chat's
+`setMode`; the terminal counts as the person, so it may raise the mode up to
+the grant's ceiling, and a refusal is printed. A chat that holds no grant shows
+`Ask every time`. Inside a chat tab `/mode` means this, not the setting for
+requests no rule covers: that one is `abject mode [ask|allow|deny]` or
+`/set permissions.mode <value>`.
+
 **Slash commands (TUI).** `/new [title]`, `/private [title]` (a private chat:
 nothing in it is learned, its goals are deleted when they finish), `/open`
 (its chat picker takes `n` for a new chat and `p` for a private one), `/tabs`,
 `/tab N|next|prev`, `/close`, `/rename <title>`, `/delete`, `/history`,
 `/stop`, `/pause`, `/resume`, `/ws` (list), `/ws <n|name>` (set the active
 workspace, which is what a desktop shows), `/ws new <name>`, `/questions`,
-`/answer N <choice>`, `/mode [ask|allow|deny]`, `/projects`,
+`/answer N <choice>`, `/mode [plan|manual|accept-edits|auto|unattended]` (this chat's permission mode, below), `/projects`,
 `/trust <project> [ask|read|edit|full]` and `/trust <project> off`,
 `/settings`, the settings commands below, `/help`, `/quit` (or `/exit`).
 Anything else is sent to the tab's chat. Private chats show `[private]` in

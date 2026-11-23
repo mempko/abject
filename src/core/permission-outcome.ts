@@ -1,4 +1,5 @@
 import type { AbjectId } from './types.js';
+import type { DecisionBasis, GrantReceipt } from './permission-modes.js';
 
 /** Evidence returned by the owner of an operation, never supplied by its caller. */
 export interface PermissionReceipt {
@@ -11,6 +12,10 @@ export interface PermissionReceipt {
   source: 'policy' | 'user' | 'unavailable';
   reason: string;
   project?: string;
+  /** What decided: a grant, a rule, a session grant, a floor, the global prompt mode, a preapproval or the person. */
+  basis?: DecisionBasis;
+  /** The grant that was presented or found, with its chain from the root. */
+  grant?: GrantReceipt;
 }
 
 export class PermissionDenied extends Error {

@@ -313,6 +313,13 @@ governs and before SettingsManager for that reason. From then on:
   when nothing is asking anyone any more.
 - HttpClient does not prompt per request. Its master switch, allow and deny
   lists and Private hosts arrive as settings.
+- Every request carries the caller's grant. A capability resolves the caller
+  with `capabilityCaller(msg)` (the task's agent, and a `grantId` from the
+  payload or the job's invocation context) and sends `callerId`, `taskId` and
+  `grantId` with `requestPermission`; ShellExecutor (including its
+  working-directory check), HostFileSystem, Terminal, Clipboard, StreamClient,
+  WebBrowser and MCPBridge do. The broker uses the grant's permission mode
+  (see [../README.md](../README.md), Permission modes and grants).
 - Decisions come back with a `PermissionReceipt` and refusals raise
   `PermissionDenied` (`src/core/permission-outcome.ts`); results of
   ShellExecutor and HostFileSystem carry the receipt.

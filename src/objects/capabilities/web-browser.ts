@@ -1871,8 +1871,15 @@ export class WebBrowser extends Abject {
    * PermissionDenied with a sentence the calling agent can act on when not.
    * A verdict that is not consequential passes without asking.
    */
-  private async requireConsent(requesterId: AbjectId, verdict: ActionVerdict | null | undefined): Promise<void> {
+  private async requireConsent(requester: AbjectId | AbjectMessage, verdict: ActionVerdict | null | undefined): Promise<void> {
     if (!verdict?.consequential) return;
+    // Who is asking, with the task and grant it runs under
+    // (docs/design/permission-modes.html §6): an agent's step job reaches here
+    // through JobManager, whose invocation context names the agent and grant.
+    const who: { callerId: AbjectId; taskId?: string; grantId?: string } = typeof requester === 'string'
+      ? { callerId: requester }
+      : await this.capabilityCaller(requester).catch(() => ({ callerId: requester.routing.from }));
+    const requesterId = who.callerId;
     requireContract(typeof verdict.action === 'string' && verdict.action.length > 0, 'a consequential action names itself');
     const site = siteOf(verdict.url);
     const resource = `${site}: ${verdict.action}`;
@@ -1892,6 +1899,8 @@ export class WebBrowser extends Abject {
       response = await this.request<{ decision?: string; receipt?: PermissionReceipt }>(
         request(this.id, brokerId, 'requestPermission', {
           type: 'web_action', scope: site, resource, callerId: requesterId,
+          ...(who.taskId ? { taskId: who.taskId } : {}),
+          ...(who.grantId ? { grantId: who.grantId } : {}),
           description: verdict.action,
           detail: [`Page       ${pageOf(verdict.url)}`, `Effect     ${verdict.effect}`],
         }),
@@ -2003,7 +2012,7 @@ export class WebBrowser extends Abject {
    */
   private async actOnMarked(
     page: PlaywrightPage,
-    requesterId: AbjectId,
+    requesterId: AbjectId | AbjectMessage,
     verdict: ActionVerdict,
     mark: string,
     act: (selector: string) => Promise<void>,
@@ -2036,7 +2045,7 @@ export class WebBrowser extends Abject {
    * so one yes never becomes five clicks. Reads and ordinary DOM edits pass
    * untouched; a direct fetch from the script is not seen here.
    */
-  private async evaluateGuarded(page: PlaywrightPage, requesterId: AbjectId, script: string): Promise<unknown> {
+  private async evaluateGuarded(page: PlaywrightPage, requesterId: AbjectId | AbjectMessage, script: string): Promise<unknown> {
     await page.evaluate(this.guardScript('install'));
     let result: unknown;
     let failure: unknown;
@@ -2251,7 +2260,7 @@ export class WebBrowser extends Abject {
       const mark = randomUUID();
       const verdict = await this.locatorVerdict(tracked.page.locator(selector).first(), 'click', mark);
       if (verdict?.consequential) {
-        await this.actOnMarked(tracked.page, msg.routing.from, verdict, mark, (marked) => tracked.page.click(marked, options));
+        await this.actOnMarked(tracked.page, msg, verdict, mark, (marked) => tracked.page.click(marked, options));
       } else {
         await tracked.page.click(selector, options);
       }
@@ -2280,7 +2289,7 @@ export class WebBrowser extends Abject {
         ? await this.locatorVerdict(tracked.page.locator(selector).first(), 'enter', mark)
         : null;
       if (verdict?.consequential) {
-        await this.actOnMarked(tracked.page, msg.routing.from, verdict, mark, (marked) => tracked.page.type(marked, text));
+        await this.actOnMarked(tracked.page, msg, verdict, mark, (marked) => tracked.page.type(marked, text));
       } else {
         await tracked.page.type(selector, text);
       }
@@ -2317,7 +2326,7 @@ export class WebBrowser extends Abject {
       const kind = keyKind(key);
       const verdict = kind ? await this.focusedVerdict(tracked.page, kind) : null;
       if (verdict?.consequential) {
-        await this.requireConsent(msg.routing.from, verdict);
+        await this.requireConsent(msg, verdict);
         if (!sameControl(verdict, await this.focusedVerdict(tracked.page, kind!))) {
           throw new Error('Keyboard focus moved while waiting for approval; look at the page again before pressing');
         }
@@ -2475,7 +2484,7 @@ export class WebBrowser extends Abject {
         : action === 'type' && /[\r\n]/.test(value ?? '') ? 'enter' : undefined;
       const verdict = kind ? await this.locatorVerdict(locator, kind) : null;
       if (verdict?.consequential) {
-        await this.requireConsent(msg.routing.from, verdict);
+        await this.requireConsent(msg, verdict);
         if (payload.expectedGeneration !== undefined
           && payload.expectedGeneration !== await this.documentId(tracked.page)) {
           throw new Error('Page navigated while waiting for approval; get a fresh snapshot before acting');
@@ -2524,7 +2533,7 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('evaluate', async (tracked, payload, msg) => {
       const t0 = Date.now();
       requireContract(typeof payload.script === 'string', 'evaluate needs a script');
-      const result = await this.evaluateGuarded(tracked.page, msg.routing.from, (payload.script as string).trim());
+      const result = await this.evaluateGuarded(tracked.page, msg, (payload.script as string).trim());
       log.info(`evaluate (${payload.pageId}) [${Date.now() - t0}ms]`);
       return { result };
     });
@@ -2542,7 +2551,7 @@ export class WebBrowser extends Abject {
       // Only the left button activates; the others open menus or new tabs.
       const verdict = button === 'left' ? await this.pointVerdict(tracked.page, x, y) : null;
       if (verdict?.consequential) {
-        await this.requireConsent(msg.routing.from, clickCount > 1
+        await this.requireConsent(msg, clickCount > 1
           ? { ...verdict, action: `${verdict.action} (${clickCount} clicks)` } : verdict);
         if (!sameControl(verdict, await this.pointVerdict(tracked.page, x, y))) {
           throw new Error('The page changed under the pointer while waiting for approval; look again before clicking');
@@ -2569,7 +2578,7 @@ export class WebBrowser extends Abject {
       // Pressed and released on the same button is a click on it.
       const pressed = await this.pointVerdict(tracked.page, from.x, from.y);
       if (pressed?.consequential && sameControl(pressed, await this.pointVerdict(tracked.page, to.x, to.y))) {
-        await this.requireConsent(msg.routing.from, pressed);
+        await this.requireConsent(msg, pressed);
       }
       const fromTarget = await this.elementAt(tracked.page, from.x, from.y);
       const mouse = tracked.page.mouse;
@@ -2619,7 +2628,7 @@ export class WebBrowser extends Abject {
       if (text.length <= WebBrowser.KEY_BY_KEY_MAX_CHARS && /[\r\n]/.test(text)) {
         const verdict = await this.focusedVerdict(tracked.page, 'enter');
         if (verdict?.consequential) {
-          await this.requireConsent(msg.routing.from, verdict);
+          await this.requireConsent(msg, verdict);
           if (!sameControl(verdict, await this.focusedVerdict(tracked.page, 'enter'))) {
             throw new Error('Keyboard focus moved while waiting for approval; look at the page again before typing');
           }

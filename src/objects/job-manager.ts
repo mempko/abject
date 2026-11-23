@@ -42,6 +42,13 @@ export interface Job {
   callerId: AbjectId;
   taskId?: string;
   /**
+   * Holder-bound permission grant the job's calls run under
+   * (docs/design/permission-modes.html §6). Carried into each call's
+   * invocation context so capabilityCaller can hand it to PermissionBroker,
+   * which honours it only from its holder.
+   */
+  grantId?: string;
+  /**
    * Set only for AgentAbject's own observe/think/act dispatch jobs (checked
    * at submit): AgentAbject holds a check step's action to reads before it
    * hands it over, so these are exempt from the read-only rule below.
@@ -109,7 +116,7 @@ const RESERVED_CONTEXT_KEYS = new Set<string>([
 const PRIVATE_JOB_READERS = ['AgentAbject', 'GoalManager'] as const;
 
 export class JobManager extends Abject {
-  private invocationContexts = new Map<string,{callerId?:AbjectId;taskId?:string;target:AbjectId}>();
+  private invocationContexts = new Map<string,{callerId?:AbjectId;taskId?:string;grantId?:string;target:AbjectId}>();
   private jobs: Map<string, Job> = new Map();
   private queues: Map<string, QueueState> = new Map();
   private static readonly DEFAULT_QUEUE = 'default';
@@ -223,7 +230,7 @@ export class JobManager extends Abject {
   private setupHandlers(): void {
     this.on('getInvocationContext', msg=>{
       const context=this.invocationContexts.get((msg.payload as {messageId:string}).messageId);
-      return context?.target===msg.routing.from?{callerId:context.callerId,taskId:context.taskId}:null;
+      return context?.target===msg.routing.from?{callerId:context.callerId,taskId:context.taskId,...(context.grantId?{grantId:context.grantId}:{})}:null;
     });
     // NOTE: no custom 'progress' handler here. A previous version registered
     // one to forward heartbeats to job submitters, but Abject.init() registers
@@ -241,6 +248,9 @@ export class JobManager extends Abject {
       requireNonEmpty(description, 'description');
       requireNonEmpty(code, 'code');
       const taskId = typeof (msg.payload as any)?.taskId === 'string' ? (msg.payload as any).taskId as string : undefined;
+      // A grant id is holder-bound: carrying it grants nothing unless the call's
+      // resolved caller is its holder, which PermissionBroker checks.
+      const grantId = typeof (msg.payload as any)?.grantId === 'string' ? (msg.payload as any).grantId as string : undefined;
       // Private work: flagged by its submitter, or a private task by AgentAbject's word.
       const isPrivate = isPrivatePayload(msg.payload) || (!!taskId && await this.taskIsPrivate(taskId));
 
@@ -277,6 +287,7 @@ export class JobManager extends Abject {
         code,
         callerId,
         taskId,
+        ...(grantId ? { grantId } : {}),
         ...(runtimeStep ? { runtimeStep: true } : {}),
         requestMessageId: msg.header.messageId,
         context: sanitisedContext,
@@ -601,7 +612,7 @@ export class JobManager extends Abject {
     /** Send one call for the job; the helpers below decide whether it may go. */
     const sendCall = async (resolved: AbjectId, actualMethod: string, actualPayload: unknown) => {
       const msg = request(this.id, resolved as AbjectId, actualMethod, await markedPrivate(resolved, actualPayload));
-      this.invocationContexts.set(msg.header.messageId, { callerId, taskId: job.taskId, target: resolved as AbjectId });
+      this.invocationContexts.set(msg.header.messageId, { callerId, taskId: job.taskId, ...(job.grantId ? { grantId: job.grantId } : {}), target: resolved as AbjectId });
       running.awaiting.set(resolved, (running.awaiting.get(resolved) ?? 0) + 1);
       try {
         return await this.request<unknown>(msg, JOB_WAIT_MS);

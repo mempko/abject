@@ -37,10 +37,243 @@ const DISMISSED = '\u0000dismissed';
  * The settings window's tabs, in tab-bar order. Updates shows only in the
  * packaged desktop app, where AppUpdater exists (see visibleTabs).
  */
-const SETTINGS_TABS = ['ai', 'auth', 'permissions', 'skills', 'packages', 'updates'] as const;
+import {
+  MODE_PRESETS, REACH_ORDER, BEYOND_ORDER, GRANT_TYPES, DEFAULT_GRANT_TYPES,
+  modeLabel, sameMode, modeWithin, presetOf, minReach, minBeyond,
+  type ModeCeiling, type PermissionMode, type Reach, type Beyond,
+} from '../core/permission-modes.js';
+
+/** A grant as PermissionBroker's listGrants reports it (grantView): what the Grants tab draws. */
+export interface GrantRow {
+  id: string;
+  parent?: string;
+  holderLabel?: string;
+  workspaceId?: string;
+  conversationId?: string;
+  taskId?: string;
+  mode: PermissionMode;
+  ceiling: ModeCeiling;
+  effective: PermissionMode;
+  label: string;
+  types?: string[];
+  roots?: string[] | null;
+  mayDerive?: number;
+  maySetMode?: boolean;
+  live?: boolean;
+}
+
+/** The modes a root grant's default can be set to (design 9.2). */
+const GRANT_MODE_OPTIONS = MODE_PRESETS.filter(p => p.name !== 'ask');
+
+/**
+ * The mode select's options. SelectWidget reports a pick as
+ * changed('change', option.value), so each option carries its preset name
+ * (e.g. 'acceptEdits') as its value: never an index, a label or an object.
+ */
+export const GRANT_MODE_SELECT_OPTIONS: ReadonlyArray<{ label: string; value: string }> =
+  GRANT_MODE_OPTIONS.map(p => ({ label: p.label, value: p.name }));
+
+/** The preset name a mode select reported, or undefined for anything else. */
+export function presetNameFromSelectValue(value: unknown): string | undefined {
+  return typeof value === 'string' && GRANT_MODE_OPTIONS.some(p => p.name === value) ? value : undefined;
+}
+
+/** How many levels the editor offers for passing a grant on. */
+const GRANT_MAX_PASS_ON = 5;
+
+/** CheckboxWidget reports changed('change', 'true' | 'false'). */
+const checkboxOn = (value: unknown): boolean => value === true || value === 'true';
+
+const isReach = (v: string): v is Reach => (REACH_ORDER as readonly string[]).includes(v);
+const isBeyond = (v: string): v is Beyond => (BEYOND_ORDER as readonly string[]).includes(v);
+
+/**
+ * What PermissionBroker.grantMode reads. mode and ceiling are required and the
+ * mode must sit within the ceiling; types, mayDerive and maySetMode keep their
+ * stored values when absent. The broker does not read roots, so a grant's
+ * folder limits cannot be changed through it.
+ */
+export interface GrantModePayload {
+  workspaceId: string;
+  holderLabel?: string;
+  mode: PermissionMode;
+  ceiling: ModeCeiling;
+  types?: string[];
+  mayDerive?: number;
+  maySetMode?: boolean;
+}
+
+/** One change the Grants editor can make to a root grant. */
+export type GrantEdit =
+  | { field: 'mode'; preset: string }
+  | { field: 'ceilingReach'; reach: string }
+  | { field: 'ceilingBeyond'; beyond: string }
+  | { field: 'covers'; type: string; on: boolean }
+  | { field: 'mayDerive'; levels: number }
+  | { field: 'maySetMode'; on: boolean };
+
+export type GrantEditResult =
+  | { ok: true; payload: GrantModePayload; summary: string }
+  | { ok: false; reason: string; unchanged?: boolean };
+
+/**
+ * The grantMode payload that applies one edit to a root grant, carrying every
+ * other field as the grant has it now, or why the edit cannot be made.
+ */
+export function grantEditPayload(g: GrantRow, edit: GrantEdit): GrantEditResult {
+  contractRequire(typeof g.id === 'string' && g.id.length > 0, 'a grant edit needs a grant');
+  if (!g.workspaceId) return { ok: false, reason: 'this grant has no workspace, so the editor cannot address it' };
+  const unchanged: GrantEditResult = { ok: false, unchanged: true, reason: 'already set' };
+  const payload: GrantModePayload = {
+    workspaceId: g.workspaceId, holderLabel: g.holderLabel,
+    mode: { ...g.mode }, ceiling: { ...g.ceiling },
+    ...(Array.isArray(g.types) ? { types: [...g.types] } : {}),
+    ...(typeof g.mayDerive === 'number' ? { mayDerive: g.mayDerive } : {}),
+    ...(typeof g.maySetMode === 'boolean' ? { maySetMode: g.maySetMode } : {}),
+  };
+  const ceilingText = (c: ModeCeiling): string => modeLabel({ ...c, readOnly: false });
+  switch (edit.field) {
+    case 'mode': {
+      const preset = GRANT_MODE_OPTIONS.find(p => p.name === edit.preset);
+      if (!preset) return { ok: false, reason: `unknown mode '${edit.preset}'` };
+      // Unattended keeps the reach already chosen (design 3.2).
+      const mode: PermissionMode = preset.name === 'unattended' && g.mode.reach !== 'ask'
+        ? { reach: g.mode.reach, beyond: preset.mode.beyond, readOnly: false }
+        : { ...preset.mode };
+      if (sameMode(mode, g.mode)) return unchanged;
+      if (!modeWithin(mode, g.ceiling)) {
+        return { ok: false, reason: `${modeLabel(mode)} is above this grant's ceiling (${ceilingText(g.ceiling)}); raise the ceiling first` };
+      }
+      payload.mode = mode;
+      return { ok: true, payload, summary: `default mode is now ${modeLabel(mode)}` };
+    }
+    case 'ceilingReach':
+    case 'ceilingBeyond': {
+      const ceiling: ModeCeiling = { ...g.ceiling };
+      if (edit.field === 'ceilingReach') {
+        if (!isReach(edit.reach)) return { ok: false, reason: `unknown reach '${edit.reach}'` };
+        ceiling.reach = edit.reach;
+      } else {
+        if (!isBeyond(edit.beyond)) return { ok: false, reason: `unknown beyond policy '${edit.beyond}'` };
+        ceiling.beyond = edit.beyond;
+      }
+      if (ceiling.reach === g.ceiling.reach && ceiling.beyond === g.ceiling.beyond) return unchanged;
+      // A lower ceiling brings the default mode down with it, as the broker requires.
+      const mode: PermissionMode = { reach: minReach(g.mode.reach, ceiling.reach), beyond: minBeyond(g.mode.beyond, ceiling.beyond), readOnly: g.mode.readOnly };
+      payload.ceiling = ceiling;
+      payload.mode = mode;
+      const lowered = sameMode(mode, g.mode) ? '' : `, and its default mode came down to ${modeLabel(mode)} to stay within it`;
+      return { ok: true, payload, summary: `ceiling is now ${ceilingText(ceiling)}${lowered}` };
+    }
+    case 'covers': {
+      if (!(GRANT_TYPES as readonly string[]).includes(edit.type)) return { ok: false, reason: `unknown kind of access '${edit.type}'` };
+      const current = Array.isArray(g.types) ? g.types : [...DEFAULT_GRANT_TYPES];
+      if (current.includes(edit.type) === edit.on) return unchanged;
+      const types = edit.on ? [...current, edit.type] : current.filter(t => t !== edit.type);
+      if (types.length === 0) {
+        return { ok: false, reason: 'a grant must cover at least one kind of access; to stop it acting on its own, set its mode to Manual or Plan' };
+      }
+      payload.types = types;
+      return { ok: true, payload, summary: `covers ${types.join(', ')}` };
+    }
+    case 'mayDerive': {
+      if (!Number.isInteger(edit.levels) || edit.levels < 0 || edit.levels > 9) return { ok: false, reason: 'pass-on levels must be a whole number from 0 to 9' };
+      if (edit.levels === g.mayDerive) return unchanged;
+      payload.mayDerive = edit.levels;
+      return { ok: true, payload, summary: edit.levels === 0 ? 'may not pass the grant on' : `may pass the grant on ${edit.levels} level(s)` };
+    }
+    case 'maySetMode': {
+      if (edit.on === (g.maySetMode === true)) return unchanged;
+      payload.maySetMode = edit.on;
+      return { ok: true, payload, summary: edit.on ? 'may change its own mode' : 'may no longer change its own mode' };
+    }
+  }
+  return { ok: false, reason: 'unknown field' };
+}
+
+/** The fields of a re-read grant that do not show what the payload asked for. */
+export function grantMismatches(row: GrantRow, p: GrantModePayload): string[] {
+  const off: string[] = [];
+  if (!sameMode(row.mode, p.mode)) off.push('mode');
+  if (row.ceiling.reach !== p.ceiling.reach || row.ceiling.beyond !== p.ceiling.beyond) off.push('ceiling');
+  if (p.types) {
+    const a = [...(row.types ?? [])].sort().join(','), b = [...p.types].sort().join(',');
+    if (a !== b) off.push('covers');
+  }
+  if (p.mayDerive !== undefined && row.mayDerive !== p.mayDerive) off.push('may pass on');
+  if (p.maySetMode !== undefined && (row.maySetMode === true) !== p.maySetMode) off.push('may change own mode');
+  return off;
+}
+
+/** Minimum pixel height for a single-line entry in the Live grant chains inspector. */
+export const GRANT_CHAIN_MIN_LINE_HEIGHT = 34;
+
+/** Trailing scroll clearance below the final Grants tab card so wrapped lines scroll fully into view. */
+export const GRANT_TAB_BOTTOM_PADDING = 36;
+
+/** Minimal grant fields needed to format a Live grant chains row. */
+export type GrantChainRow = Pick<
+  GrantRow,
+  'id' | 'parent' | 'taskId' | 'conversationId' | 'holderLabel' | 'mode' | 'effective' | 'label' | 'ceiling' | 'live'
+>;
+
+/**
+ * Kind label for a row in the Live grant chains tree ('Root → chat → task.').
+ * Child grants without a conversationId (such as Goal or task grants) render
+ * as 'task' rather than falling back to 'root'.
+ */
+export function grantKindLabel(
+  g: Pick<GrantRow, 'parent' | 'conversationId' | 'taskId'>,
+  depth = 0,
+): 'root' | 'chat' | 'task' {
+  if (g.taskId) return 'task';
+  if (g.conversationId) return 'chat';
+  return depth > 0 || g.parent ? 'task' : 'root';
+}
+
+/**
+ * Row height for a monospace wrapped grant-chain line in the 720px Settings
+ * window so 2- and 3-line wrapped entries do not clip past their box.
+ */
+export function grantChainLineHeight(text: string, charsPerLine = 72): number {
+  const wrappedLines = Math.max(1, Math.ceil(text.length / charsPerLine));
+  return Math.max(GRANT_CHAIN_MIN_LINE_HEIGHT, wrappedLines * 18 + 8);
+}
+
+/** Build the indented Live grant chains rows and their wrapped heights. */
+export function formatGrantChainLines(
+  grants: readonly GrantChainRow[],
+  error?: string,
+): Array<{ text: string; height: number }> {
+  const byId = new Map(grants.map(g => [g.id, g]));
+  const roots = grants.filter(g => !g.parent || !byId.has(g.parent));
+  const children = new Map<string, GrantChainRow[]>();
+  for (const g of grants) {
+    if (!g.parent || !byId.has(g.parent)) continue;
+    const list = children.get(g.parent) ?? [];
+    list.push(g);
+    children.set(g.parent, list);
+  }
+  const rows: Array<{ text: string; height: number }> = [];
+  const walk = (g: GrantChainRow, depth: number): void => {
+    if (rows.length >= 80) return;
+    const kind = grantKindLabel(g, depth);
+    const limited = sameMode(g.mode, g.effective) ? '' : '  ← limited by an ancestor or its ceiling';
+    const text = `${'    '.repeat(depth)}${depth ? '└ ' : '▾ '}${kind} ${g.holderLabel ?? '?'} [${g.id.slice(0, 8)}]  stored ${modeLabel(g.mode)}  ·  effective ${g.label}  ·  ceiling ${modeLabel({ ...g.ceiling, readOnly: false })}${g.live === false ? '  ·  revoked or expired' : ''}${limited}`;
+    rows.push({ text, height: grantChainLineHeight(text) });
+    for (const c of children.get(g.id) ?? []) walk(c, depth + 1);
+  };
+  for (const r of roots) walk(r, 0);
+  if (rows.length === 0) {
+    rows.push({ text: error ? 'Grants could not be read.' : 'No grants are live.', height: GRANT_CHAIN_MIN_LINE_HEIGHT });
+  }
+  return rows;
+}
+
+const SETTINGS_TABS = ['ai', 'auth', 'permissions', 'grants', 'skills', 'packages', 'updates'] as const;
 type SettingsTab = typeof SETTINGS_TABS[number];
 const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
-  ai: 'AI', auth: 'Auth', permissions: 'Permissions', skills: 'Skills & MCP', packages: 'Packages', updates: 'Updates',
+  ai: 'AI', auth: 'Auth', permissions: 'Permissions', grants: 'Grants', skills: 'Skills & MCP', packages: 'Packages', updates: 'Updates',
 };
 
 /** How each install gets a new version, as the Updates tab says it. */
@@ -225,6 +458,22 @@ export class GlobalSettings extends Abject {
 
   // Permissions tab
   private permissionsContainerId?: AbjectId;
+  // Grants tab (design 9.2 editor, 9.3 chain inspector)
+  private grantsContainerId?: AbjectId;
+  private grantsRefreshBtnId?: AbjectId;
+  private grantsStatusId?: AbjectId;
+  /** Every editable control on the Grants tab: the grant it edits and how its change value becomes an edit. */
+  private grantControls = new Map<AbjectId, { grant: GrantRow; toEdit: (value: unknown) => GrantEdit | undefined }>();
+  /** PermissionBroker, once this window is subscribed to its grantsChanged events. */
+  private permissionBrokerId?: AbjectId;
+  /** The outcome of the last grant edit, kept in the status line across rebuilds. */
+  private grantsNote?: { text: string; at: number };
+  private grantsBuilding = false;
+  private grantsRebuildQueued = false;
+  /** Grants changed while the tab was hidden or a menu was open: rebuild when that ends. */
+  private grantsStale = false;
+  private grantsMenuOpen = false;
+  private grantsRefreshTimer?: ReturnType<typeof setTimeout>;
   private autonomyStatusId?: AbjectId;
   private takeWheelBtnId?: AbjectId;
   private platformLabelId?: AbjectId;
@@ -376,6 +625,8 @@ undo() / redo() take back the last change made in this window to the AI settings
     this.settingsManagerId = await this.requireDep('SettingsManager');
     // Its settingsChanged events repaint an open window.
     try { await this.request(request(this.id, this.settingsManagerId, 'addDependent', {})); } catch { /* repaints on reopen */ }
+    // PermissionBroker's grantsChanged events keep the Grants tab live.
+    void this.subscribeToGrants();
     // Packaged desktop app only: AppUpdater (spawned before us) feeds the Updates tab.
     await this.connectAppUpdater();
 
@@ -505,6 +756,22 @@ undo() / redo() take back the last change made in this window to the AI settings
     this.on('changed', async (m: AbjectMessage) => {
       const { aspect, value } = m.payload as { aspect: string; value?: unknown };
       const fromId = m.routing.from;
+
+      // Grants tab (design 9.2, 9.3): refresh, live updates from the broker, and each editable field.
+      if (fromId === this.grantsRefreshBtnId && aspect === 'click') { this.grantsNote = undefined; await this.refreshGrantsTab(); return; }
+      if (fromId === this.permissionBrokerId && aspect === 'grantsChanged') { this.scheduleGrantsRefresh(); return; }
+      const grantControl = this.grantControls.get(fromId);
+      if (grantControl) {
+        if (aspect === 'expanded') {
+          // Never rebuild under an open menu; catch up when it closes.
+          this.grantsMenuOpen = value === true;
+          if (!this.grantsMenuOpen && this.grantsStale) { this.grantsStale = false; this.scheduleGrantsRefresh(); }
+        } else if (aspect === 'change') {
+          const edit = grantControl.toEdit(value);
+          if (edit) await this.applyGrantEdit(grantControl.grant, edit);
+        }
+        return;
+      }
 
       // Permission prompt buttons
       if (this._pendingPermissionPrompt && aspect === 'click') {
@@ -894,6 +1161,20 @@ undo() / redo() take back the last change made in this window to the AI settings
     // Permissions container (plain VBox, initially hidden): the active
     // category card expands to fill the viewport (its lists stretch), and
     // the Save Permissions row stays pinned at the bottom.
+    // Grants container (scrollable VBox, initially hidden): design 9.2 and 9.3.
+    this.grantsContainerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.grantsContainerId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+    await this.request(request(this.id, this.grantsContainerId, 'update', { style: { visible: false } }));
+
     this.permissionsContainerId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: this.rootLayoutId,
@@ -967,6 +1248,8 @@ undo() / redo() take back the last change made in this window to the AI settings
     await this.buildAuthTab();
     // Build Permissions tab content
     await this.buildPermissionsTab();
+    // Build Grants tab content
+    await this.refreshGrantsTab();
     // Build Skills & MCP tab content
     await this.buildSkillsTab();
     // Build Packages tab content
@@ -1911,6 +2194,13 @@ undo() / redo() take back the last change made in this window to the AI settings
     this.authContainerId = undefined;
     this.skillsContainerId = undefined;
     this.permissionsContainerId = undefined;
+    this.grantsContainerId = undefined;
+    this.grantsRefreshBtnId = undefined;
+    this.grantsStatusId = undefined;
+    this.grantControls.clear();
+    if (this.grantsRefreshTimer) { clearTimeout(this.grantsRefreshTimer); this.grantsRefreshTimer = undefined; }
+    this.grantsStale = false;
+    this.grantsMenuOpen = false;
     this.autonomyStatusId = undefined;
     this.takeWheelBtnId = undefined;
     this.permSubTabBarId = undefined;
@@ -1987,9 +2277,253 @@ undo() / redo() take back the last change made in this window to the AI settings
     await this.request(request(this.id, this.permissionsContainerId, 'update', { style: { visible: this.activeTab === 'permissions' } }));
     await this.request(request(this.id, this.skillsContainerId, 'update', { style: { visible: this.activeTab === 'skills' } }));
     await this.request(request(this.id, this.packagesContainerId, 'update', { style: { visible: this.activeTab === 'packages' } }));
+    if (this.grantsContainerId) {
+      await this.request(request(this.id, this.grantsContainerId, 'update', { style: { visible: this.activeTab === 'grants' } }));
+      if (this.activeTab === 'grants' && this.grantsStale) { this.grantsStale = false; void this.refreshGrantsTab(); }
+    }
     if (this.updatesContainerId) {
       await this.request(request(this.id, this.updatesContainerId, 'update', { style: { visible: this.activeTab === 'updates' } }));
     }
+  }
+
+  /** Every live grant, as PermissionBroker lists it to the Settings window. */
+  private async loadGrants(): Promise<{ grants: GrantRow[]; error?: string }> {
+    const brokerId = await this.discoverDep('PermissionBroker');
+    if (!brokerId) return { grants: [], error: 'no permission broker is running' };
+    await this.subscribeToGrants(brokerId);
+    try {
+      const r = await this.request<unknown>(request(this.id, brokerId, 'listGrants', {}), 10_000);
+      const list = Array.isArray(r) ? r : (r && typeof r === 'object' ? (r as { grants?: unknown }).grants : undefined);
+      if (Array.isArray(list)) return { grants: list as GrantRow[] };
+      const err = r && typeof r === 'object' ? (r as { error?: unknown }).error : undefined;
+      return { grants: [], error: typeof err === 'string' ? err : 'unexpected reply from listGrants' };
+    } catch (err) {
+      return { grants: [], error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Build the Grants tab: the workspace grant editor (design 9.2), what no
+   * grant overrides, and the live grant chains with stored versus effective
+   * mode (design 9.3). Rebuilt on Refresh, after an edit, and whenever the
+   * broker reports grantsChanged (through refreshGrantsTab, never directly,
+   * so two rebuilds cannot interleave).
+   */
+  private async buildGrantsTab(): Promise<void> {
+    const cId = this.grantsContainerId;
+    const windowId = this.windowId;
+    if (!cId || !windowId) return;
+    try { await this.request(request(this.id, cId, 'clearLayoutChildren', {})); } catch { /* gone */ }
+    this.grantControls.clear();
+    this.grantsMenuOpen = false;
+    this.grantsStale = false;
+    this.grantsRefreshBtnId = undefined;
+    this.grantsStatusId = undefined;
+
+    const { grants, error } = await this.loadGrants();
+    const byId = new Map(grants.map(g => [g.id, g]));
+    const roots = grants.filter(g => !g.parent || !byId.has(g.parent));
+    const label = (text: string, color: string, extra: Record<string, unknown> = {}): Record<string, unknown> =>
+      ({ type: 'label', windowId, text, style: { color, fontSize: 12, wordWrap: true, ...extra } });
+    const create = async (specs: Record<string, unknown>[]): Promise<AbjectId[]> =>
+      (await this.request<{ widgetIds: AbjectId[] }>(request(this.id, this.widgetManagerId!, 'create', { specs }))).widgetIds;
+    const addRows = async (layoutId: AbjectId, ids: AbjectId[], heights: number[]): Promise<void> => {
+      await this.request(request(this.id, layoutId, 'addLayoutChildren', {
+        children: ids.map((widgetId, i) => ({ widgetId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: heights[i] } })),
+      }));
+    };
+    const hbox = async (parentLayoutId: AbjectId): Promise<AbjectId> => this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', { parentLayoutId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 8 }));
+
+    // ── 9.2 Workspace grant editor ──
+    const editor = await this.sectionCard(cId, 'Workspace grants',
+      'Change each holder’s default mode, its ceiling, what it covers, how many levels it may pass the grant on, and whether it may change its own mode. Each change is saved as you make it and read back from the permission broker. A chat’s grant derives from its workspace root and never goes past the root’s ceiling.', 50);
+    const note = this.grantsNote && Date.now() - this.grantsNote.at < 15_000 ? this.grantsNote.text : undefined;
+    const statusText = note ?? (error ? `Could not read grants: ${error}`
+      : roots.length === 0 ? 'No root grants yet. ChatManager claims one per workspace when a chat opens.'
+      : `${grants.length} live grant(s) under ${roots.length} root(s).`);
+    const [statusId, refreshId] = await create([
+      label(statusText, this.theme.textSecondary),
+      { type: 'button', windowId, text: 'Refresh', style: { color: this.theme.textSecondary, fontSize: 12 } },
+    ]);
+    this.grantsStatusId = statusId;
+    this.grantsRefreshBtnId = refreshId;
+    await this.request(request(this.id, refreshId, 'addDependent', {}));
+    const topRow = await hbox(editor);
+    await this.request(request(this.id, topRow, 'addLayoutChildren', { children: [
+      { widgetId: statusId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 28 } },
+      { widgetId: refreshId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 90, height: 28 } },
+    ] }));
+    await addRows(editor, [topRow], [30]);
+
+    for (const g of roots) {
+      const current = presetOf(g.mode);
+      const modeOptions = [...GRANT_MODE_SELECT_OPTIONS];
+      let modeIndex = modeOptions.findIndex(o => o.value === current);
+      // A mode no preset names: show it as it is; picking it again changes nothing.
+      if (modeIndex < 0) { modeOptions.unshift({ label: modeLabel(g.mode), value: '' }); modeIndex = 0; }
+      const levels = Math.max(GRANT_MAX_PASS_ON, g.mayDerive ?? 0);
+      const passOnOptions = Array.from({ length: levels + 1 }, (_, n) => ({ label: n === 0 ? 'No' : `${n} level${n === 1 ? '' : 's'}`, value: String(n) }));
+      const covered = new Set<string>(Array.isArray(g.types) ? g.types : DEFAULT_GRANT_TYPES);
+      const small = (text: string): Record<string, unknown> => label(text, this.theme.textSecondary, { fontSize: 11, wordWrap: false });
+      const limitedTo = g.roots && g.roots.length ? ` Limited to ${g.roots.join(', ')}, set when the grant was made (not editable here).` : '';
+      const [holderId, modeSelId, ceilingLblId, reachSelId, beyondSelId, passLblId, passSelId, coversLblId, setModeId, detailId, ...typeIds] = await create([
+        label(`${g.holderLabel ?? 'Holder'}${g.workspaceId ? `  ·  workspace ${g.workspaceId.slice(0, 8)}` : ''}  ·  default mode`, this.theme.textHeading, { fontSize: 13, wordWrap: false }),
+        { type: 'select', windowId, options: modeOptions, selectedIndex: modeIndex },
+        small('Ceiling'),
+        { type: 'select', windowId, options: REACH_ORDER.map(r => ({ label: `reach: ${r}`, value: r })), selectedIndex: Math.max(0, REACH_ORDER.indexOf(g.ceiling.reach)) },
+        { type: 'select', windowId, options: BEYOND_ORDER.map(b => ({ label: `beyond: ${b}`, value: b })), selectedIndex: Math.max(0, BEYOND_ORDER.indexOf(g.ceiling.beyond)) },
+        small('May pass on'),
+        { type: 'select', windowId, options: passOnOptions, selectedIndex: Math.min(levels, Math.max(0, g.mayDerive ?? 0)) },
+        small('Covers'),
+        { type: 'checkbox', windowId, checked: g.maySetMode === true, text: 'May change its own mode' },
+        label(`Effective now: ${g.label}.${limitedTo} Lowering the mode or ceiling narrows existing chats at once; coverage and pass-on apply to grants derived after the change.`,
+          this.theme.textSecondary, { fontSize: 11 }),
+        ...GRANT_TYPES.map(t => ({ type: 'checkbox', windowId, checked: covered.has(t), text: t })),
+      ]);
+      const bind = async (id: AbjectId, toEdit: (value: unknown) => GrantEdit | undefined): Promise<void> => {
+        this.grantControls.set(id, { grant: g, toEdit });
+        await this.request(request(this.id, id, 'addDependent', {}));
+      };
+      await bind(modeSelId, v => { const preset = presetNameFromSelectValue(v); return preset ? { field: 'mode', preset } : undefined; });
+      await bind(reachSelId, v => typeof v === 'string' ? { field: 'ceilingReach', reach: v } : undefined);
+      await bind(beyondSelId, v => typeof v === 'string' ? { field: 'ceilingBeyond', beyond: v } : undefined);
+      await bind(passSelId, v => { const n = Number(v); return typeof v === 'string' && v !== '' && Number.isInteger(n) ? { field: 'mayDerive', levels: n } : undefined; });
+      await bind(setModeId, v => ({ field: 'maySetMode', on: checkboxOn(v) }));
+      for (const [i, typeId] of typeIds.entries()) {
+        const type = GRANT_TYPES[i];
+        await bind(typeId, v => ({ field: 'covers', type, on: checkboxOn(v) }));
+      }
+      const fixed = (widgetId: AbjectId, width: number): Record<string, unknown> =>
+        ({ widgetId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width, height: 30 } });
+      const headRow = await hbox(editor);
+      await this.request(request(this.id, headRow, 'addLayoutChildren', { children: [
+        { widgetId: holderId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 30 } },
+        fixed(modeSelId, 170),
+      ] }));
+      const limitsRow = await hbox(editor);
+      await this.request(request(this.id, limitsRow, 'addLayoutChildren', { children: [
+        fixed(ceilingLblId, 60), fixed(reachSelId, 110), fixed(beyondSelId, 130), fixed(passLblId, 90), fixed(passSelId, 100),
+      ] }));
+      const coversRow = await hbox(editor);
+      await this.request(request(this.id, coversRow, 'addLayoutChildren', { children: [
+        fixed(coversLblId, 60), ...typeIds.map(id => fixed(id, 95)),
+      ] }));
+      await addRows(editor, [headRow, limitsRow, coversRow, setModeId, detailId], [32, 32, 30, 24, 34]);
+    }
+
+    // ── Always enforced ──
+    const floors = await this.sectionCard(cId, 'Always enforced', 'No grant, mode or rule overrides these.', 18);
+    const floorLines = [
+      'Protected paths (the app’s own data, keys and settings) are never written by an agent.',
+      'Deny rules win over any grant, and a revoked or expired grant denies with no fallback.',
+      'Dangerous or opaque shell commands still ask, whatever the mode.',
+      'Outward requests (sending, posting, publishing) and clipboard reads still ask.',
+      'A project’s trust and autonomy and the workspace access ceiling cap every grant.',
+      'Plan mode denies every file write.',
+    ];
+    const floorIds = await create(floorLines.map(t => label(`•  ${t}`, this.theme.textSecondary, { fontSize: 11 })));
+    await addRows(floors, floorIds, floorIds.map(() => 20));
+
+    // ── 9.3 Grant chain inspector ──
+    const inspector = await this.sectionCard(cId, 'Live grant chains',
+      'Root → chat → task. A grant’s effective mode is the meet of every grant above it, so lowering or revoking an ancestor narrows everything under it. This is why a request was or was not allowed. It updates as grants change.', 34);
+    const chainRows = formatGrantChainLines(grants, error);
+    const lineIds = await create(chainRows.map(r => label(r.text, this.theme.textSecondary, { fontSize: 11, fontFamily: 'mono' })));
+    await addRows(inspector, lineIds, chainRows.map(r => r.height));
+
+    // Reserve trailing scroll clearance below the final card so wrapped lines
+    // at the bottom of the inspector scroll fully into view.
+    const [bottomPadId] = await create([label('', this.theme.textSecondary, { fontSize: 1 })]);
+    await addRows(cId, [bottomPadId], [GRANT_TAB_BOTTOM_PADDING]);
+  }
+
+  /**
+   * Apply one edit to a root grant through PermissionBroker.grantMode, then
+   * re-read the grant: a success reply is not proof, so the status line says
+   * the change landed only when listGrants shows every field moved.
+   */
+  private async applyGrantEdit(g: GrantRow, edit: GrantEdit): Promise<void> {
+    const built = grantEditPayload(g, edit);
+    let text: string;
+    // Design §4: Full access only after the person confirms a warning. A
+    // ceiling that lets past-reach requests through is what makes it possible.
+    const unlocksFullAccess = built.ok && built.payload.ceiling.beyond === 'allow' && g.ceiling.beyond !== 'allow';
+    if (unlocksFullAccess && !(await this.confirm({
+      title: 'Allow Full access?',
+      message: `This lets ${g.holderLabel ?? 'this holder'} and the chats under it switch to Full access, where requests past a chat's reach are allowed without asking you. `
+        + 'Protected paths, dangerous commands, deny rules and outward actions still ask or are refused.',
+      confirmLabel: 'Allow Full access',
+      destructive: true,
+    }).catch(() => false))) {
+      this.grantsNote = { text: 'Not changed: Full access was not confirmed.', at: Date.now() };
+      await this.refreshGrantsTab();
+      return;
+    }
+    if (!built.ok) {
+      if (built.unchanged) return;
+      text = `Not changed: ${built.reason}.`;
+    } else {
+      const brokerId = await this.discoverDep('PermissionBroker');
+      if (!brokerId) text = 'Not changed: no permission broker is running.';
+      else {
+        try {
+          const r = await this.request<{ success?: boolean; error?: string } | null>(request(this.id, brokerId, 'grantMode', built.payload), 10_000);
+          if (!r || r.success !== true) text = `Not changed: ${r?.error ?? 'the permission broker gave no answer'}.`;
+          else {
+            const { grants } = await this.loadGrants();
+            const now = grants.find(x => x.id === g.id);
+            const off = now ? grantMismatches(now, built.payload) : ['the grant itself'];
+            text = off.length === 0
+              ? `${g.holderLabel ?? 'Grant'}: ${built.summary}.`
+              : `The broker answered success but the grant does not show it (${off.join(', ')}). Refresh and try again.`;
+          }
+        } catch (err) {
+          text = `Not changed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+    }
+    this.grantsNote = { text, at: Date.now() };
+    await this.refreshGrantsTab();
+  }
+
+  /** Rebuild the Grants tab, one build at a time; a request during a build runs once after it. */
+  private async refreshGrantsTab(): Promise<void> {
+    if (this.grantsBuilding) { this.grantsRebuildQueued = true; return; }
+    this.grantsBuilding = true;
+    try {
+      do {
+        this.grantsRebuildQueued = false;
+        await this.buildGrantsTab();
+      } while (this.grantsRebuildQueued);
+    } finally {
+      this.grantsBuilding = false;
+    }
+  }
+
+  /**
+   * The broker reported grantsChanged. Rebuild soon if the tab is showing and
+   * no menu is open; otherwise remember, and rebuild when that ends. A closed
+   * window builds fresh when it opens.
+   */
+  private scheduleGrantsRefresh(): void {
+    if (!this.grantsContainerId) return;
+    if (this.activeTab !== 'grants' || this.grantsMenuOpen) { this.grantsStale = true; return; }
+    if (this.grantsRefreshTimer) return;
+    this.grantsRefreshTimer = setTimeout(() => {
+      this.grantsRefreshTimer = undefined;
+      void this.refreshGrantsTab();
+    }, 250);
+  }
+
+  /** Become a dependent of PermissionBroker so its grantsChanged events reach this window. */
+  private async subscribeToGrants(knownId?: AbjectId | null): Promise<void> {
+    try {
+      const brokerId = knownId ?? await this.discoverDep('PermissionBroker');
+      if (!brokerId || brokerId === this.permissionBrokerId) return;
+      await this.request(request(this.id, brokerId, 'addDependent', {}));
+      this.permissionBrokerId = brokerId;
+    } catch { /* not running yet: the next loadGrants tries again */ }
   }
 
   /** The tabs this window shows: Updates only where AppUpdater exists. */

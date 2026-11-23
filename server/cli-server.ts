@@ -34,6 +34,7 @@ import { refuseAllOrigins } from '../src/network/origin-policy.js';
 import { authenticateConnection, AuthConfig, SessionStore } from './auth.js';
 import { Log } from '../src/core/timed-log.js';
 import { PRIVATE_GOAL_UNAVAILABLE } from '../src/core/privacy.js';
+import { MODE_PRESETS } from '../src/core/permission-modes.js';
 
 const log = new Log('CliServer');
 
@@ -438,6 +439,9 @@ export class CliServer extends Abject {
         return this.opGoalControl(op, this.str(params, 'workspaceId'), this.str(params, 'conversationId'));
       case 'goalStatus':
         return this.opGoalStatus(this.str(params, 'workspaceId'), this.str(params, 'goalId'));
+      case 'chatMode':
+        return this.opChatMode(session, this.str(params, 'workspaceId'), this.str(params, 'conversationId'),
+          typeof params.mode === 'string' && params.mode.trim() ? params.mode.trim() : undefined);
       case 'respondDialog': {
         // DialogBroker takes answers only from the surfaces registered at
         // boot, this object among them.
@@ -784,6 +788,26 @@ export class CliServer extends Abject {
     if (!sub) throw new Error(`No open chat for conversation ${conversationId}`);
     return this.request<boolean>(
       request(this.id, sub.chatId, 'sendMessage', { message: text }), 15000);
+  }
+
+  /**
+   * `/mode`: read or set a chat's permission mode (design 9.1). The terminal
+   * counts as the person, so Chat lets it raise the mode up to its ceiling.
+   */
+  private async opChatMode(session: CliSession, workspaceId: string, conversationId: string, mode?: string): Promise<unknown> {
+    const key = this.watchKey(workspaceId, conversationId);
+    if (!this.chatSubs.get(key)) await this.opOpenOrCreate(session, workspaceId, conversationId);
+    const sub = this.chatSubs.get(key);
+    if (!sub) throw new Error(`No open chat for conversation ${conversationId}`);
+    if (mode !== undefined) {
+      const norm = mode.toLowerCase().replace(/[\s_-]/g, '');
+      const preset = MODE_PRESETS.find(p => p.name.toLowerCase() === norm || p.label.toLowerCase().replace(/\s/g, '') === norm);
+      if (!preset) throw new Error(`Unknown mode ${mode}. Modes: ${MODE_PRESETS.map(p => p.label).join(', ')}`);
+      const r = await this.request<{ success?: boolean; error?: string } | null>(
+        request(this.id, sub.chatId, 'setMode', { mode: preset.name }), 15000);
+      if (r && r.success === false) throw new Error(r.error ?? 'mode not changed');
+    }
+    return this.request(request(this.id, sub.chatId, 'getMode', {}), 15000);
   }
 
   private async opGoalControl(

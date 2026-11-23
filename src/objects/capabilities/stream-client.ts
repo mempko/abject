@@ -184,7 +184,9 @@ export class StreamClient extends Abject {
         headers?: Record<string, string>;
       };
       const owner = msg.routing.from;
-      this.openConnection(url, kind, headers, owner).then(
+      this.capabilityCaller(msg)
+        .catch((): { callerId: AbjectId; taskId?: string; grantId?: string } => ({ callerId: owner }))
+        .then(who => this.openConnection(url, kind, headers, owner, who)).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'STREAM_ERROR',
@@ -277,6 +279,7 @@ export class StreamClient extends Abject {
     kind: StreamKind | undefined,
     headers: Record<string, string> | undefined,
     owner: AbjectId,
+    who?: { callerId: AbjectId; taskId?: string; grantId?: string },
   ): Promise<{ connectionId: string }> {
     require(typeof url === 'string' && url.length > 0, 'connect requires a url');
     if (this.streamsDisabled) {
@@ -291,7 +294,7 @@ export class StreamClient extends Abject {
     const parsed = new URL(url);
     const resolvedKind = kind ?? (parsed.protocol === 'ws:' || parsed.protocol === 'wss:' ? 'ws' : 'sse');
     this.validateScheme(parsed.protocol, resolvedKind);
-    await this.validateDomain(parsed.hostname, portOf(parsed));
+    await this.validateDomain(parsed.hostname, portOf(parsed), who);
 
     const connectionId = crypto.randomUUID();
     const conn: StreamConnection = {
@@ -496,7 +499,7 @@ export class StreamClient extends Abject {
    * deny / deny_always). Absent an authority, unlisted domains are allowed
    * only when no allow list is configured, matching HttpClient's behavior.
    */
-  private async validateDomain(hostname: string, port: number): Promise<void> {
+  private async validateDomain(hostname: string, port: number, who?: { callerId: AbjectId; taskId?: string; grantId?: string }): Promise<void> {
     if (this.deniedDomains?.has(hostname)) {
       throw new Error(`Domain ${hostname} is denied`);
     }
@@ -512,6 +515,9 @@ export class StreamClient extends Abject {
           request(this.id, this.permissionsAuthorityId, 'requestPermission', {
             type: 'domain',
             resource: hostname,
+            ...(who ? { callerId: who.callerId } : {}),
+            ...(who?.taskId ? { taskId: who.taskId } : {}),
+            ...(who?.grantId ? { grantId: who.grantId } : {}),
             description: `Streaming connection to: ${hostname}`,
           }),
           120000,

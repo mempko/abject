@@ -181,6 +181,9 @@ export class Clipboard extends Abject {
     if (!this.permissionsAuthorityId) {
       throw new PermissionDenied(local('deny', 'unavailable', 'no permission broker is running to ask about the clipboard'));
     }
+    // Who is asking, with the task and grant it runs under (permission-modes §6).
+    const who = await this.capabilityCaller(msg)
+      .catch((): { callerId: typeof msg.routing.from; taskId?: string; grantId?: string } => ({ callerId: msg.routing.from }));
     let response: { decision?: string; receipt?: PermissionReceipt } | undefined;
     try {
       response = await this.request<{ decision?: string; receipt?: PermissionReceipt }>(
@@ -188,7 +191,9 @@ export class Clipboard extends Abject {
           type: 'clipboard',
           operation,
           resource,
-          callerId: msg.routing.from,
+          callerId: who.callerId,
+          ...(who.taskId ? { taskId: who.taskId } : {}),
+          ...(who.grantId ? { grantId: who.grantId } : {}),
         }),
         PERMISSION_WAIT_MS);
     } catch (err) {

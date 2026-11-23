@@ -42,6 +42,8 @@ function helpLines(p: string): string[] {
     '  /delete           delete this conversation and close the tab',
     '  /history          re-fetch this conversation\'s transcript',
     '  /stop /pause /resume   control the running goal',
+    '  /mode [name]      show this chat\'s permission mode, or set it:',
+    '                    plan, manual, accept-edits, auto, unattended (up to its ceiling)',
     '  /ws               list workspaces',
     '  /ws <n|name>      set the active workspace (what the desktop shows)',
     '  /ws new <name>    create a workspace',
@@ -1140,6 +1142,13 @@ class TuiApp {
         case 'history':
           if (tab) await this.loadHistory(tab);
           break;
+        case 'mode':
+          // Design 9.1: read this chat's permission mode, or set it (`/mode auto`).
+          if (tab) {
+            const v = await this.client.chatMode(tab.workspaceId, tab.conversationId, arg || undefined);
+            this.note(this.client.describeMode(v), 'dim');
+          }
+          break;
         case 'stop':
         case 'pause':
         case 'resume':
@@ -1206,17 +1215,6 @@ class TuiApp {
           if (!dialog) { this.note('no such question (try /questions)', 'yellow'); break; }
           const choice = rest.slice(1).join(' ').trim();
           await this.answerDialog(dialog, choice);
-          break;
-        }
-        case 'mode': {
-          if (!arg) {
-            const values = await this.client.request<{ mode: string }>('getSettings', { section: 'permissions' });
-            this.note(`permission prompts: ${values.mode} (ask | allow | deny)`, 'normal');
-            break;
-          }
-          if (!['ask', 'allow', 'deny'].includes(arg)) { this.note('mode is one of ask, allow, deny', 'yellow'); break; }
-          await this.client.request('setSettings', { section: 'permissions', values: { mode: arg } }, 60_000);
-          this.note(`permission prompts: ${arg}`, 'green');
           break;
         }
         case 'projects': {
@@ -1647,6 +1645,9 @@ export async function runPlain(target: BackendTarget): Promise<void> {
             print({ text: `workspace: ${workspace.name}`, color: 'dim' });
             await openLatestOrNew();
           }
+        } else if (text === '/mode' || text.startsWith('/mode ')) {
+          const v = await client.chatMode(workspace!.id, conversationId!, text.slice(5).trim() || undefined);
+          print({ text: client.describeMode(v), color: 'dim' });
         } else if (text === '/stop') {
           await client.goalControl('stopGoal', workspace!.id, conversationId!);
         } else if (text === '/yes' || text === '/no' || text.startsWith('/answer ')) {
@@ -1670,7 +1671,7 @@ export async function runPlain(target: BackendTarget): Promise<void> {
             pendingDialog = null;
           }
         } else if (text === '/help') {
-          print({ text: 'plain mode: /chats /open N /new [title] /private [title] /ws [n|name] /use N /stop /yes /no /answer <text> /quit; anything else is sent to the chat. /ws N sets the active workspace; /use N only retargets this REPL', color: 'dim' });
+          print({ text: 'plain mode: /chats /open N /new [title] /private [title] /ws [n|name] /use N /stop /mode [name] /yes /no /answer <text> /quit; anything else is sent to the chat. /ws N sets the active workspace; /use N only retargets this REPL', color: 'dim' });
           for (const line of SETTINGS_HELP.filter(l => !l.includes('/settings'))) print({ text: line, color: 'dim' });
         } else if (text.startsWith('/') && isSettingsCommand(text.slice(1).split(/\s+/)[0])) {
           const [cmd, ...args] = text.slice(1).split(/\s+/);

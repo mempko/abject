@@ -1141,6 +1141,40 @@ export class Chat extends Abject {
 
     // ── Ticket result/progress/stream handlers ──
 
+    this.on('getMode', async () => {
+      // The chat holds its grant; the composer's mode picker reads and changes it here.
+      const broker = await this.discoverDep('PermissionBroker');
+      if (!broker) return null;
+      return this.request(request(this.id, broker, 'getMyGrant', {}));
+    });
+
+    this.on('setMode', async (msg: AbjectMessage) => {
+      const broker = await this.discoverDep('PermissionBroker');
+      if (!broker) return { success: false, error: 'PermissionBroker unavailable' };
+      const { mode } = (msg.payload ?? {}) as { mode?: unknown };
+      // Raising a mode is the person's choice: this chat's own window or the
+      // terminal (CliServer). Anyone else, agents included, may only lower it.
+      // The window's mode picker (design 9.1) is the person choosing.
+      const person = msg.routing.from === this.id
+        || (this.windowId !== undefined && msg.routing.from === this.windowId)
+        || await this.isBuiltInCaller(msg.routing.from, ['CliServer']);
+      return this.request(request(this.id, broker, 'setMode', { mode, lowerOnly: !person }));
+    });
+
+    // A conversation forked from this one gets its grant from this chat's
+    // (permission-modes §6). Only the holder of a grant may derive from it, so
+    // ChatManager asks here; the conversationId lets the broker re-bind the
+    // same grant when the fork's chat is respawned.
+    this.on('deriveForkGrant', async (msg: AbjectMessage) => {
+      if (!(await this.isBuiltInCaller(msg.routing.from, ['ChatManager']))) return { success: false, error: 'Unauthorized' };
+      const { holder, holderLabel, conversationId } = (msg.payload ?? {}) as { holder?: string; holderLabel?: string; conversationId?: string };
+      if (typeof holder !== 'string' || holder.length === 0) return { success: false, error: 'holder required' };
+      const grantId = await this.deriveFromChatGrant(holder,
+        typeof holderLabel === 'string' ? holderLabel : 'Forked chat', undefined,
+        typeof conversationId === 'string' ? conversationId : undefined);
+      return grantId ? { success: true, grantId } : { success: false, error: 'this chat holds no grant to derive from' };
+    });
+
     this.on('taskResult', async (msg: AbjectMessage) => {
       const payload = msg.payload as { ticketId: string };
       this.retainTaskResult(payload);
@@ -2169,12 +2203,18 @@ export class Chat extends Abject {
           // from workspace files: the context says where, the data follows.
           const shared = this.isPrivate && captured ? await this.privateGoalContext(captured) : undefined;
           const context = shared?.context ?? captured;
+          // The goal's grant: derived from this chat's, held by GoalManager,
+          // which derives one per task for the agent that runs it.
+          const goalGrantId = await this.deriveFromChatGrant(this.goalManagerId, `Goal ${title.slice(0, 40)}`, undefined, undefined, true);
           const created = await this.request<{ goalId: string }>(request(this.id, this.goalManagerId, 'createGoal', {
             title: title.slice(0, 200), description, operationId: `chat:${caller.taskId}`,
+            ...(goalGrantId ? { grantId: goalGrantId } : {}),
             ...(context ? { context } : {}),
             ...(this.isPrivate ? { private: true, ...(this.conversationId ? { conversationId: this.conversationId } : {}) } : {}),
           }));
           if (shared) await this.shareAttachmentsWithGoal(created.goalId, shared.attachments);
+          // The grant travelled in createGoal, so it is bound before any task
+          // of the goal can be admitted.
           this._currentGoalId = created.goalId;
           this.pendingOutcome = undefined;
           this.goalPaused = false;
@@ -2835,6 +2875,39 @@ A single successful creation goal is a complete turn. End it with **done**.
     return parts.length ? parts.join('\n') : undefined;
   }
 
+  /**
+   * Derive a holder-bound grant from this chat's own grant
+   * (docs/design/permission-modes.html §6): one per task the chat starts and
+   * one per goal it creates. Best effort: without a broker or a chat grant
+   * the work runs as before, under whatever the broker finds for its caller.
+   */
+  private async deriveFromChatGrant(holder: string, label: string, taskId?: string, conversationId?: string, inherit = false): Promise<string | undefined> {
+    try {
+      const broker = await this.discoverDep('PermissionBroker');
+      if (!broker) return undefined;
+      const mine = await this.request<{ id?: string; grant?: { id?: string } } | null>(request(this.id, broker, 'getMyGrant', {}), 5000);
+      const parentId = mine?.grant?.id ?? mine?.id;
+      if (!parentId) return undefined;
+      const r = await this.request<{ success: boolean; grant?: { id?: string } }>(request(this.id, broker, 'deriveGrant', {
+        parentId, holder, holderLabel: label, ...(taskId ? { taskId } : {}),
+        ...(conversationId ? { conversationId } : {}),
+        // Work the chat started follows the chat's mode live; a fork keeps its own.
+        ...(inherit ? { inherit: true } : {}),
+      }), 5000);
+      return r?.success ? r.grant?.id : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Drop a task grant when its task ends (revokes it and anything derived from it). */
+  private async dropGrant(grantId: string): Promise<void> {
+    try {
+      const broker = await this.discoverDep('PermissionBroker');
+      if (broker) await this.request(request(this.id, broker, 'revokeGrant', { grantId }), 5000);
+    } catch { /* best effort */ }
+  }
+
   /** Run one Chat OTA turn with a fixed handoff context, including during model latency. */
   private async runTaskTurn(
     userText: string,
@@ -2844,10 +2917,16 @@ A single successful creation goal is a complete turn. End it with **done**.
     this._goalCreatedThisTurn = false;
     this._streamBuffer = '';
     this.turnContext = this.captureGoalContext();
+    let turnGrantId: string | undefined;
     try {
+      // This turn's task runs under a grant derived from the chat's, held by
+      // this chat (the task's agent) and bound to the task id.
+      const turnTaskId = `chat-turn-${String(this.id).slice(0, 8)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      turnGrantId = await this.deriveFromChatGrant(this.id, 'Chat task', turnTaskId, undefined, true);
       const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
           task: userText,
+          ...(turnGrantId ? { taskId: turnTaskId, grantId: turnGrantId } : {}),
           recallQuery: this.recallContextFor(userText),
           systemPrompt: this.buildSystemPrompt(desktop),
           initialMessages: messages,
@@ -2869,6 +2948,8 @@ A single successful creation goal is a complete turn. End it with **done**.
       };
     } finally {
       this.turnContext = undefined;
+      // The turn's grant ends with the turn, however it ended.
+      if (turnGrantId) void this.dropGrant(turnGrantId);
     }
   }
 

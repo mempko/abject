@@ -73,6 +73,8 @@ export interface PersistedConversation {
   lastActiveAt: number;
   /** Made private when created: listed only for views, stored under `private:` keys. */
   private?: boolean;
+  /** The conversation this one was forked from; its chat derives this one's grant (permission-modes §6). */
+  forkOf?: string;
 }
 
 interface ConversationRuntime extends PersistedConversation {
@@ -762,6 +764,41 @@ export class ChatManager extends Abject {
 
   // ─── Chat instance lifecycle ───────────────────────────────────────
 
+  /**
+   * Give a chat its permission-mode grant, derived from this workspace's root
+   * (docs/design/permission-modes.html §3.4). PermissionBroker re-binds a
+   * persisted chat grant by conversationId, so a respawned chat keeps its mode.
+   * Best effort: without a grant the chat behaves as before.
+   */
+  private async bindChatGrant(c: ConversationRuntime): Promise<void> {
+    try {
+      const broker = await this.discoverDep('PermissionBroker');
+      if (!broker || !c.chatId) return;
+      const label = String(c.title ?? '').slice(0, 40) || c.conversationId.slice(0, 8);
+      // A fork's grant is derived from the chat it was forked from: that chat
+      // holds the parent grant, and only a grant's holder may derive from it.
+      // With the source chat not running (or holding no grant) the fork falls
+      // back to the workspace root, as any new chat does.
+      if (c.forkOf) {
+        const sourceChat = this.conversations.get(c.forkOf)?.chatId;
+        if (sourceChat) {
+          const derived = await this.request<{ success?: boolean }>(request(this.id, sourceChat, 'deriveForkGrant', {
+            holder: c.chatId, holderLabel: `Chat ${label}`,
+            ...(c.private ? {} : { conversationId: c.conversationId }),
+          }), 10000).catch(() => undefined);
+          if (derived?.success) return;
+        }
+        log.info(`fork ${c.conversationId.slice(0, 8)}: source chat grant unavailable, deriving from the workspace root`);
+      }
+      const root = await this.request<{ success: boolean; grantId?: string }>(request(this.id, broker, 'claimRootGrant', {}));
+      if (!root?.success || !root.grantId) return;
+      await this.request(request(this.id, broker, 'deriveGrant', {
+        parentId: root.grantId, holder: c.chatId, holderLabel: `Chat ${label}`,
+        ...(c.private ? {} : { conversationId: c.conversationId }),
+      }));
+    } catch { /* best effort */ }
+  }
+
   private async spawnChatFor(c: ConversationRuntime): Promise<AbjectId | undefined> {
     if (c.chatId) return c.chatId;
     if (!this.factoryId || !this.registryId) return undefined;
@@ -792,6 +829,7 @@ export class ChatManager extends Abject {
         })
       );
       c.chatId = result.objectId;
+      await this.bindChatGrant(c);
       this.send(request(this.id, c.chatId, 'addDependent', {}));
       if (this.widgetManagerId && this.workspaceId) {
         try {
@@ -825,7 +863,7 @@ export class ChatManager extends Abject {
     if (!Array.isArray(entries)) throw new Error('Conversation history unavailable');
     const seed = forkConversationEntries(sourceId, entries as ContextMessage[], throughMessageId);
     const isPrivate = source.private === true || makePrivate;
-    if (!isPrivate) return this.createConversation(`${source.title} (fork)`, show, seed);
+    if (!isPrivate) return this.createConversation(`${source.title} (fork)`, show, seed, false, undefined, sourceId);
     // A private fork reads its attachments from its own upload keys, so it
     // keeps them when the original is deleted.
     const conversationId = uuidv4();
@@ -833,7 +871,7 @@ export class ChatManager extends Abject {
     try {
       // A normal chat's title came from its words; a private copy starts neutral.
       const title = source.private === true ? `${source.title} (fork)` : PRIVATE_TITLE;
-      return await this.createConversation(title, show, own, true, conversationId);
+      return await this.createConversation(title, show, own, true, conversationId, sourceId);
     } catch (err) {
       for (const key of keys) await this.storageDelete(key);
       throw err;
@@ -877,6 +915,7 @@ export class ChatManager extends Abject {
   private async createConversation(
     title: string | undefined, show: boolean, seed?: ContextMessage[], isPrivate = false,
     conversationId: string = uuidv4(),
+    forkOf?: string,
   ): Promise<{ conversationId: string; chatId: AbjectId }> {
     await this.ensurePeerId();
     await this.ensureWorkspaceId();
@@ -889,6 +928,7 @@ export class ChatManager extends Abject {
       createdAt: now,
       lastActiveAt: now,
       ...(isPrivate ? { private: true } : {}),
+      ...(forkOf ? { forkOf } : {}),
     };
 
     // A fork's copied transcript must be on disk before its Chat starts: Chat
@@ -1178,6 +1218,7 @@ export class ChatManager extends Abject {
       createdAt: c.createdAt,
       lastActiveAt: c.lastActiveAt,
       ...(c.private ? { private: true } : {}),
+      ...(c.forkOf ? { forkOf: c.forkOf } : {}),
     };
   }
 

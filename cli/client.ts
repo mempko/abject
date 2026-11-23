@@ -358,6 +358,18 @@ export class AbjectClient {
     return this.request(op, { workspaceId, conversationId });
   }
 
+  /** `/mode`: a chat's grant (null when it holds none); with `mode`, set it first. */
+  chatMode(workspaceId: string, conversationId: string, mode?: string): Promise<{ label: string; chain?: { holderLabel?: string }[] } | null> {
+    return this.request('chatMode', mode ? { workspaceId, conversationId, mode } : { workspaceId, conversationId });
+  }
+
+  /** One line for a chat's mode, as `/mode` prints it. */
+  describeMode(v: { label: string; chain?: { holderLabel?: string }[] } | null): string {
+    if (!v) return 'mode: Ask every time (this chat holds no grant)';
+    const from = v.chain && v.chain.length > 1 ? (v.chain[0].holderLabel ?? 'the workspace') : 'this chat';
+    return `mode: ${v.label} · granted by ${from} · change with /mode plan|manual|accept-edits|auto|unattended`;
+  }
+
   goalStatus(workspaceId: string, goalId: string): Promise<GoalStatus | null> {
     return this.request('goalStatus', { workspaceId, goalId });
   }

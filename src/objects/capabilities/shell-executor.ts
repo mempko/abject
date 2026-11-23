@@ -97,6 +97,8 @@ const SHELL_INTERFACE: InterfaceId = 'abjects:shell';
 
 export interface ExecRequest {
   taskId?: string;
+  /** Holder-bound grant id recovered by capabilityCaller; the broker checks the holder. */
+  grantId?: string;
   command: string;
   args?: string[];
   cwd?: string;
@@ -473,7 +475,7 @@ export class ShellExecutor extends Abject {
 
     this.on('start', async (msg: AbjectMessage) => {
       const context = await this.capabilityCaller(msg);
-      const child = await this.startProcess({ ...(msg.payload as ExecRequest), taskId: context.taskId }, context.callerId);
+      const child = await this.startProcess({ ...(msg.payload as ExecRequest), taskId: context.taskId, grantId: context.grantId }, context.callerId);
       return { processId: child.id, permission: this.running.get(child.id)?.permission };
     });
     this.on('stopTaskProcesses', async (msg: AbjectMessage) => {
@@ -489,7 +491,7 @@ export class ShellExecutor extends Abject {
 
     this.on('exec', (msg: AbjectMessage) => {
       const req = msg.payload as ExecRequest;
-      this.capabilityCaller(msg).then(context => this.executeCommand({ ...req, taskId: context.taskId }, context.callerId)).then(
+      this.capabilityCaller(msg).then(context => this.executeCommand({ ...req, taskId: context.taskId, grantId: context.grantId }, context.callerId)).then(
         (result) => {
           log.info(`exec result: exit=${result.exitCode} stdout=${result.stdout.length}b stderr=${result.stderr.length}b`);
           this.sendDeferredReply(msg, result);
@@ -530,14 +532,14 @@ export class ShellExecutor extends Abject {
     const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command;
     // A skill name describes the request; it cannot select a different permission path.
     const { restrictEnv, permission, skillCovered } = await this.validateCommand(fullCommand, {
-      callerId, taskId: req.taskId, usesShell: !!req.shell, cwd, untrusted: req.untrusted === true, skillName: req.skillName,
+      callerId, taskId: req.taskId, grantId: req.grantId, usesShell: !!req.shell, cwd, untrusted: req.untrusted === true, skillName: req.skillName,
     });
     // A command the skill grant already covers still has to start SOMEWHERE.
     // Asking separately about the directory it starts in turns one approval
     // into two questions and leaves the grant unable to do its job, so the
     // same coverage carries to the working directory.
     await this.validatePath(cwd, callerId, req.taskId,
-      skillCovered ? { skillName: req.skillName, skillPreapproved: true } : undefined);
+      skillCovered ? { skillName: req.skillName, skillPreapproved: true } : undefined, req.grantId);
 
     // Build environment: process env + skill env + per-request env.
     //
@@ -564,7 +566,7 @@ export class ShellExecutor extends Abject {
 
   private async validateCommand(
     fullCommand: string,
-    opts: { callerId?: AbjectId; taskId?: string; usesShell: boolean; cwd?: string; untrusted?: boolean; skillName?: string },
+    opts: { callerId?: AbjectId; taskId?: string; grantId?: string; usesShell: boolean; cwd?: string; untrusted?: boolean; skillName?: string },
   ): Promise<{ restrictEnv: boolean; permission?: PermissionReceipt; skillCovered?: boolean }> {
     const trimmed = fullCommand.trim();
 
@@ -635,6 +637,7 @@ export class ShellExecutor extends Abject {
           commandName: analysis.principalProgram,
           callerId: opts.callerId,
           taskId: opts.taskId,
+          grantId: opts.grantId,
           cwd: opts.cwd,
           usesShell: opts.usesShell,
           // Granting a program is only meaningful when the line reduces to a
@@ -672,6 +675,7 @@ export class ShellExecutor extends Abject {
     callerId?: AbjectId,
     taskId?: string,
     skill?: { skillName?: string; skillPreapproved: boolean },
+    grantId?: string,
   ): Promise<void> {
     const roots = await physicalGrantRoots(this.allowedPaths ?? []);
     const preapproved = isInsideAny(roots, cwd);
@@ -679,6 +683,7 @@ export class ShellExecutor extends Abject {
       const response = await this.request<{ decision: string; receipt?: PermissionReceipt }>(
         request(this.id, this.permissionsAuthorityId, 'requestPermission', {
           type: 'directory', operation: 'read', resource: cwd, callerId, taskId, preapproved,
+          ...(grantId ? { grantId } : {}),
           ...(skill ?? {}),
           description: `Shell working directory: ${cwd}`,
         }), PERMISSION_WAIT_MS);

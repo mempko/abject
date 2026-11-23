@@ -292,6 +292,20 @@ notices show `shown(text, isPrivate)`, which is `[private]` for private text.
 - **result-contract.ts**: `ResultContract` (`successField`, `errorField`) and
   `domainFailure()`. A method declares how its own result signals failure;
   callers learn it through the built-in `getResultContract` request.
+- **permission-modes.ts**: the permission-mode vocabulary. A mode has a
+  `reach` (`ask` < `read` < `edit` < `full`: how far the holder's tools go
+  without asking), a `beyond` (`deny` < `ask` < `allow`: what happens past
+  reach) and `readOnly` (plan mode). `MODE_PRESETS`: Plan (read/ask,
+  read-only), Manual (read/ask), Accept edits (edit/ask), Auto (full/ask),
+  Unattended (edit/deny, or the reach it is given), Full access (full/allow);
+  `ASK_EVERY_TIME` is the grant-less default. `DEFAULT_ROOT_MODE` (Auto,
+  full/ask: new chats run what each project's autonomy allows, as before
+  modes) and `DEFAULT_ROOT_CEILING` (full/ask) are a workspace root's starting point;
+  `DEFAULT_APP_MODE` and `DEFAULT_APP_CEILING` (read/ask) are defined beside
+  them. A `Grant` with `inherit` follows its parent's effective mode live
+  (goal and task grants). The meet of two modes, `ceilingMode`, `modeWithin`, `modeAtMost`, `parseMode` /
+  `parseCeiling` (a preset name or a `{ reach, beyond, readOnly }` object) and
+  `modeLabel`. Used by GrantStore, PermissionBroker and the mode pickers.
 - **permission-outcome.ts**: `PermissionReceipt` (evidence produced by the
   object that owns an operation), `PermissionDenied` (code
   `PERMISSION_DENIED`, receipt in `details`, optional caller-facing message),

@@ -146,6 +146,8 @@ export interface Goal {
   creatorName: string;
   /** Peer that created this goal. Stamped at createGoal; preserved across sync. Drives single-owner execution. */
   creatorPeerId?: string;
+  /** The goal's grant (derived from its chat's), kept on the goal so it outlives a restart. */
+  grantId?: string;
   progress: ProgressEntry[];
   childIds: GoalId[];
   result?: unknown;
@@ -318,6 +320,16 @@ export class GoalManager extends Abject {
   private storageId?: AbjectId;
   private agentAbjectId?: AbjectId;
   private localPeerId = '';
+  /**
+   * Permission grant each goal runs under, by goal id: derived from the
+   * creating chat's grant and held by this object (permission-modes §6).
+   * admitTask derives one per task from it for the agent that runs the task.
+   */
+  private goalGrants = new Map<string, string>();
+  /** Grant derived for each goal task, by runtime task id; revoked when the task ends (releaseTaskGrant). */
+  private taskGrants = new Map<string, string>();
+  /** Whether this instance has re-bound the workspace's persisted goal grants (claimGoalGrants). */
+  private goalGrantsClaimed = false;
   /** Track taskIds for which we already emitted terminal events (idempotency guard). */
   private emittedTerminalTasks: Set<string> = new Set();
   /** Scrums for which `goalReadyForCompletion` has been emitted. Key is `${goalId}#${scrumNumber}` so each scrum
@@ -439,6 +451,65 @@ export class GoalManager extends Abject {
   }
 
   /** True when a goal id names a private goal the sender may not see (it reads as absent). */
+  /** Derive a task grant from the goal's (or nearest ancestor goal's) grant for the agent running the task. */
+  private async deriveTaskGrant(goalId: GoalId, agentId?: string, runtimeTaskId?: string): Promise<string | undefined> {
+    if (!agentId || !runtimeTaskId) return undefined;
+    let parentId: string | undefined;
+    let id: GoalId | undefined = goalId;
+    for (let hops = 0; id && !parentId && hops < 32; hops++) {
+      parentId = this.goalGrants.get(id) ?? this.goals.get(id)?.grantId;
+      id = this.goals.get(id)?.parentId as GoalId | undefined;
+    }
+    if (!parentId) return undefined;
+    try {
+      const broker = await this.discoverDep('PermissionBroker');
+      if (!broker) return undefined;
+      await this.claimGoalGrants(broker);
+      const r = await this.request<{ success: boolean; grant?: { id?: string } }>(request(this.id, broker, 'deriveGrant', {
+        parentId, holder: agentId, holderLabel: `Task ${runtimeTaskId.slice(0, 16)}`, taskId: runtimeTaskId,
+        // The task follows its goal's grant, which follows the chat's.
+        inherit: true,
+      }), 5000);
+      const derived = r?.success ? r.grant?.id : undefined;
+      if (derived) this.taskGrants.set(runtimeTaskId, derived);
+      return derived;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Goal grants are persisted with their goals, but this object's id changes
+   * on every start: ask PermissionBroker, once per start, to re-bind this
+   * workspace's goal grants to this instance so it can derive from them and
+   * release them.
+   */
+  private async claimGoalGrants(broker: AbjectId): Promise<void> {
+    if (this.goalGrantsClaimed) return;
+    this.goalGrantsClaimed = true;
+    try {
+      await this.request(request(this.id, broker, 'claimGoalGrants', {}), 5000);
+    } catch { /* best effort: tasks then run without the goal's grant */ }
+  }
+
+  /**
+   * A goal's grant ends with the goal (permission-modes §5.3). Only a goal
+   * that holds its own grant releases it; a subgoal borrows its parent's.
+   */
+  private releaseGoalGrant(goalId: GoalId): void {
+    const goal = this.goals.get(goalId);
+    const grantId = this.goalGrants.get(goalId) ?? goal?.grantId;
+    if (!grantId) return;
+    this.goalGrants.delete(goalId);
+    if (goal) delete goal.grantId;
+    void (async () => {
+      const broker = await this.discoverDep('PermissionBroker');
+      if (!broker) return;
+      await this.claimGoalGrants(broker);
+      await this.request(request(this.id, broker, 'revokeGrant', { grantId }), 5000);
+    })().catch(() => { /* best effort */ });
+  }
+
   private async hiddenFrom(msg: AbjectMessage, goalId: GoalId | undefined): Promise<boolean> {
     if (!goalId || !this.isPrivateGoal(goalId)) return false;
     return !(await this.goalFor(msg, goalId));
@@ -754,6 +825,7 @@ export class GoalManager extends Abject {
     goal.status = 'failed';
     goal.error = error;
     goal.updatedAt = Date.now();
+    this.releaseGoalGrant(goalId);
 
     const isPrivate = this.isPrivateGoal(goalId);
     if (!isPrivate) {
@@ -2708,6 +2780,10 @@ hear assumptionResolved and goalReaction.
           currentScrumNumber: goal.currentScrumNumber,
           interjections: goal.interjections,
           ...(goal.pendingQuestion ? { pendingQuestion: goal.pendingQuestion } : {}),
+          // The goal's grant survives a restart with the goal (loadIndexedGoal
+          // spreads meta back), so tasks admitted after a restart still get one.
+          // A grant id is holder-bound: a peer reading it gains nothing.
+          ...(goal.grantId ? { grantId: goal.grantId } : {}),
           ...(isPrivate ? { private: true, ownerId: goal.ownerId, conversationId: goal.conversationId } : {}),
         },
         persist: !isPrivate,
@@ -3250,6 +3326,7 @@ hear assumptionResolved and goalReaction.
           root.status = 'failed';
           root.error = 'Conversation deleted';
           root.updatedAt = Date.now();
+          this.releaseGoalGrant(root.id);
           this.notifyGoal(root.id, 'goalFailed', { goalId: root.id, error: 'Conversation deleted' });
         }
         await this.purgePrivateGoal(root.id);
@@ -3487,13 +3564,14 @@ hear assumptionResolved and goalReaction.
 
     this.on('createGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
-      const { title, parentId, description, operationId, context: suppliedContext, conversationId } = msg.payload as {
+      const { title, parentId, description, operationId, context: suppliedContext, conversationId, grantId } = msg.payload as {
         title: string;
         parentId?: GoalId;
         description: string;
         operationId?: string;
         context?: ConversationContext;
         conversationId?: string;
+        grantId?: string;
       };
       requireNonEmpty(title, 'title');
       requireNonEmpty(description, 'description');
@@ -3555,6 +3633,12 @@ hear assumptionResolved and goalReaction.
           goal.ownerId = privateRoot?.ownerId ?? callerId;
           const conversation = privateRoot?.conversationId ?? (typeof conversationId === 'string' && conversationId ? conversationId : context?.conversationId);
           if (conversation) goal.conversationId = conversation;
+        }
+        // The goal's grant arrives with the goal, so no task can be admitted
+        // before it is bound (binding it afterwards raced the first dispatch).
+        if (typeof grantId === 'string' && grantId && await this.isBuiltInCaller(callerId, ['Chat'])) {
+          goal.grantId = grantId;
+          this.goalGrants.set(goalId, grantId);
         }
 
         this.goals.set(goalId, goal);
@@ -3649,6 +3733,7 @@ hear assumptionResolved and goalReaction.
       goal.status = 'completed';
       goal.result = result;
       goal.updatedAt = Date.now();
+      this.releaseGoalGrant(goalId);
 
       const isPrivate = this.isPrivateGoal(goalId);
       if (!isPrivate) {
@@ -3773,6 +3858,7 @@ hear assumptionResolved and goalReaction.
       goal.status = 'failed';
       goal.error = 'Stopped by user';
       goal.updatedAt = Date.now();
+      this.releaseGoalGrant(goalId);
 
       const isPrivate = this.isPrivateGoal(goalId);
       log.info(`Goal stopped by user: "${shown(goal.title, isPrivate)}" (${goalId}) — ${cancelled} tasks cancelled`);
@@ -4269,8 +4355,34 @@ hear assumptionResolved and goalReaction.
       if (!goal || goal.status!=='active' || !this.tupleSpaceId) return { accepted:false, reason:'Goal is not active' };
       const tasks=await this.request<Array<{id:string;fields:Record<string,unknown>}>>(request(this.id,this.tupleSpaceId,'scan',{namespace:this.getTupleNamespace(goalId as GoalId),pattern:{goalId}}));
       const task=tasks.find(t=>t.id===taskId);
-      return task && !['done','failed','permanently_failed','cancelled','superseded'].includes(String(task.fields.status))
-        ? {accepted:true} : {accepted:false,reason:'Task was removed, settled or superseded'};
+      if (!task || ['done','failed','permanently_failed','cancelled','superseded'].includes(String(task.fields.status))) {
+        return {accepted:false,reason:'Task was removed, settled or superseded'};
+      }
+      // Copy the goal's grant onto the task: a grant held by the agent that runs
+      // it, bound to the runtime task id, so its tool calls run under the chat's mode.
+      // GoalManager spawns before AgentAbject, so onInit's lookup can miss it;
+      // resolve it on use, or every goal task silently runs without a grant.
+      if (msg.routing.from !== await this.taskRuntime()) return {accepted:true};
+      const { agentId, runtimeTaskId } = msg.payload as { agentId?: string; runtimeTaskId?: string };
+      const grantId = await this.deriveTaskGrant(goalId as GoalId, agentId, runtimeTaskId);
+      return grantId ? {accepted:true,grantId} : {accepted:true};
+    });
+
+    // A goal task's grant ends with the task (permission-modes §6). This object
+    // holds the goal grant it was derived from, so only it may revoke it;
+    // AgentAbject says when the task finished.
+    this.on('releaseTaskGrant', async msg => {
+      if (msg.routing.from !== await this.taskRuntime()) return { success: false, error: 'Unauthorized' };
+      const { runtimeTaskId } = (msg.payload ?? {}) as { runtimeTaskId?: string };
+      if (typeof runtimeTaskId !== 'string') return { success: false, error: 'runtimeTaskId required' };
+      const grantId = this.taskGrants.get(runtimeTaskId);
+      if (!grantId) return { success: true, revoked: 0 };
+      this.taskGrants.delete(runtimeTaskId);
+      try {
+        const broker = await this.discoverDep('PermissionBroker');
+        if (broker) return await this.request(request(this.id, broker, 'revokeGrant', { grantId }), 5000);
+      } catch { /* best effort: the broker also refuses a grant whose task is gone */ }
+      return { success: false, error: 'PermissionBroker unavailable' };
     });
 
     this.on('assessTask', async (msg: AbjectMessage) => {

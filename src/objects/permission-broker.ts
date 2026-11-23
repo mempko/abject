@@ -66,6 +66,13 @@ import {
   type CommandAnalysis, type EffectClass, type Segment, type TouchedPath,
 } from '../core/command-analysis.js';
 import { isInside } from '../core/path-scope.js';
+import { GrantStore, type DeriveSpec } from './grant-store.js';
+import { packageNameOf, packageOwner } from '../core/packages.js';
+import {
+  DEFAULT_APP_CEILING, DEFAULT_APP_MODE, meetMode, minBeyond, minReach,
+  DEFAULT_ROOT_CEILING, DEFAULT_ROOT_MODE, modeAtMost, modeLabel, modeWithin, parseCeiling, parseMode,
+  type DecisionBasis, type Grant,
+} from '../core/permission-modes.js';
 import {
   ALWAYS_PROTECTED, minAutonomy, autonomyRank,
   type AutonomyLevel, type ExternalProject,
@@ -251,11 +258,19 @@ export interface DecisionRecord {
   project?: string;
   workspace?: string;
   effectiveLevel?: AutonomyLevel;
+  /** What decided (docs/design/permission-modes.html §6.3). */
+  basis?: DecisionBasis;
+  /** The grant the request ran under, if any. */
+  grantId?: string;
 }
 
 /** Everything the broker needs to know about who is calling. */
 interface CallerContext {
   callerId?: AbjectId;
+  /** The permission-mode grant this request runs under; set per request in decide(). */
+  grant?: Grant;
+  /** A held Unattended grant that does not cover this request type: still never ask. */
+  quietGrant?: Grant;
   name: string;
   workspaceId?: string;
   workspaceName?: string;
@@ -329,6 +344,35 @@ export class PermissionBroker extends Abject {
           name: 'PermissionBroker',
           description: 'Permission policy and decision log',
           methods: [
+            { name: 'claimRootGrant', description: 'ChatManager only: claim (or create, at Manual with ceiling Auto) the root permission-mode grant for its workspace.', parameters: [], returns: { kind: 'object', properties: {} } },
+            { name: 'grantMode', description: 'Settings authorities only: set the root grant a holder (default ChatManager) has in a workspace. An app row (any other holderLabel) may leave out mode, ceiling and mayDerive: it defaults to Manual, ceiling Manual, mayDerive 0 (design §8). An app row is labelled package:<name> (or the package name) or the app type id; the first live, non-built-in object in that workspace whose Factory-set package owner or type id matches claims it when it first asks.', parameters: [
+              { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace' },
+              { name: 'mode', type: { kind: 'object', properties: {} }, description: 'Preset name (plan, manual, acceptEdits, auto, unattended, fullAccess) or {reach, beyond, readOnly}' },
+              { name: 'ceiling', type: { kind: 'object', properties: {} }, description: 'Preset name or {reach, beyond}' },
+              { name: 'holderLabel', type: { kind: 'primitive', primitive: 'string' }, description: 'Holder (default ChatManager)', optional: true },
+            ], returns: { kind: 'object', properties: {} } },
+            { name: 'claimGoalGrants', description: 'GoalManager only: re-bind its workspace\'s persisted goal grants to the running GoalManager.', parameters: [], returns: { kind: 'object', properties: {} } },
+            { name: 'deriveGrant', description: 'Holder of parentId only: derive a narrower grant for another object (a chat, a task). Never wider than the parent on any axis. A holder that is not built-in (an app or package) defaults to Manual, ceiling Manual and mayDerive 0, met with the parent (design §8).', parameters: [
+              { name: 'parentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Grant the caller holds' },
+              { name: 'holder', type: { kind: 'primitive', primitive: 'string' }, description: 'Object that will hold the new grant' },
+              { name: 'mode', type: { kind: 'object', properties: {} }, description: 'Preset name or {reach, beyond, readOnly}; default the parent effective mode', optional: true },
+              { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Bind the grant to one task', optional: true },
+              { name: 'inherit', type: { kind: 'primitive', primitive: 'boolean' }, description: 'With no mode: follow the parent effective mode live (a goal or task grant)', optional: true },
+              { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Chat grants: re-bound to the respawned chat by this key', optional: true },
+            ], returns: { kind: 'object', properties: {} } },
+            { name: 'setMode', description: 'Holder only: change the mode of its grant, up to its ceiling. Task grants may only lower.', parameters: [
+              { name: 'mode', type: { kind: 'object', properties: {} }, description: 'Preset name or {reach, beyond, readOnly}' },
+              { name: 'grantId', type: { kind: 'primitive', primitive: 'string' }, description: 'Default: the caller own grant', optional: true },
+              { name: 'lowerOnly', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Refuse anything but a lower mode', optional: true },
+            ], returns: { kind: 'object', properties: {} } },
+            { name: 'getMyGrant', description: 'The caller own grant with its effective mode and chain, or null.', parameters: [], returns: { kind: 'object', properties: {} } },
+            { name: 'revokeGrant', description: 'Holder of the grant or an ancestor, or a settings authority: revoke it and everything derived from it.', parameters: [
+              { name: 'grantId', type: { kind: 'primitive', primitive: 'string' }, description: 'Grant to revoke' },
+            ], returns: { kind: 'object', properties: {} } },
+            { name: 'listGrants', description: 'Grants visible to the caller (all of them for settings authorities). Emits grantsChanged when any change.', parameters: [], returns: { kind: 'array', elementType: { kind: 'object', properties: {} } } },
+            { name: 'describeGrant', description: 'One grant with its chain from the root, for the grant chain inspector.', parameters: [
+              { name: 'grantId', type: { kind: 'primitive', primitive: 'string' }, description: 'Grant' },
+            ], returns: { kind: 'object', properties: {} } },
             {
               name: 'requestPermission',
               description: 'Called by capability objects. Returns a decision, asking the user only when policy cannot answer.',
@@ -338,6 +382,7 @@ export class PermissionBroker extends Abject {
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Human-readable request; for web_action the action itself (click button "Send")', optional: true },
                 { name: 'cwd', type: { kind: 'primitive', primitive: 'string' }, description: 'Where a command would run', optional: true },
                 { name: 'callerId', type: { kind: 'primitive', primitive: 'string' }, description: 'The object that wants to act', optional: true },
+                { name: 'grantId', type: { kind: 'primitive', primitive: 'string' }, description: 'Holder-bound grant the request runs under; honoured only from its holder', optional: true },
                 { name: 'scope', type: { kind: 'primitive', primitive: 'string' }, description: 'web_action and mcp_tool: what a remembered answer covers (the site origin, or "server/tool")', optional: true },
                 { name: 'detail', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'web_action and mcp_tool: a few lines shown under the request', optional: true },
               ],
@@ -448,6 +493,9 @@ export class PermissionBroker extends Abject {
     this.setupHandlers();
   }
 
+  /** Permission-mode grants (docs/design/permission-modes.html). Only this broker mints or looks them up. */
+  private modeGrants = new GrantStore();
+
   protected override async onInit(): Promise<void> {
     this.storageId = await this.discoverDep('Storage') ?? undefined;
     await this.loadRules();
@@ -504,6 +552,139 @@ export class PermissionBroker extends Abject {
       } catch (err) {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
       }
+    });
+
+    this.on('claimRootGrant', async (msg: AbjectMessage) => {
+      const from = msg.routing.from;
+      if (!(await this.isBuiltInCaller(from, ['ChatManager']))) return { success: false, error: 'Unauthorized' };
+      const ctx = await this.callerContext(from);
+      if (!ctx.workspaceId) return { success: false, error: 'the caller has no workspace' };
+      let root = this.rootGrantFor('ChatManager', ctx.workspaceId);
+      if (root) this.modeGrants.rebind(root.id, from);
+      else root = this.modeGrants.mintRoot({ holder: from, holderLabel: 'ChatManager', workspaceId: ctx.workspaceId, mode: { ...DEFAULT_ROOT_MODE }, ceiling: { ...DEFAULT_ROOT_CEILING } });
+      await this.grantsChanged();
+      return { success: true, grantId: root.id };
+    });
+
+    // GoalManager holds each goal's grant (derived from the goal's chat) and
+    // its id changes on every start: the workspace's own GoalManager re-binds
+    // that workspace's goal grants to itself, as ChatManager does its root.
+    this.on('claimGoalGrants', async (msg: AbjectMessage) => {
+      const from = msg.routing.from;
+      if (!(await this.isBuiltInCaller(from, ['GoalManager']))) return { success: false, error: 'Unauthorized' };
+      const ctx = await this.callerContext(from);
+      if (!ctx.workspaceId) return { success: false, error: 'the caller has no workspace' };
+      let claimed = 0;
+      for (const g of this.modeGrants.all()) {
+        if (g.workspaceId !== ctx.workspaceId || g.taskId !== undefined || !g.parent || g.holder === from) continue;
+        if (!g.holderLabel.startsWith('Goal ') || !this.modeGrants.live(g)) continue;
+        this.modeGrants.rebind(g.id, from);
+        claimed++;
+      }
+      if (claimed > 0) await this.grantsChanged();
+      return { success: true, claimed };
+    });
+
+    this.on('grantMode', async (msg: AbjectMessage) => {
+      if (!(await this.isSettingsCaller(msg))) return { success: false, error: 'Unauthorized' };
+      const p = (msg.payload ?? {}) as { workspaceId?: string; holderLabel?: string; mode?: unknown; ceiling?: unknown; types?: string[]; mayDerive?: number; maySetMode?: boolean };
+      if (typeof p.workspaceId !== 'string' || !p.workspaceId) return { success: false, error: 'workspaceId required' };
+      const label = p.holderLabel ?? 'ChatManager';
+      const existing = this.rootGrantFor(label, p.workspaceId);
+      // §8: an app's row defaults to Manual with ceiling Manual and mayDerive 0;
+      // fields the person leaves out keep the row's current value.
+      const app = label !== 'ChatManager';
+      const mode = p.mode === undefined && app ? { ...(existing?.mode ?? DEFAULT_APP_MODE) } : parseMode(p.mode);
+      const ceiling = p.ceiling === undefined && app ? { ...(existing?.ceiling ?? DEFAULT_APP_CEILING) } : parseCeiling(p.ceiling);
+      if (!mode || !ceiling) return { success: false, error: 'bad mode or ceiling' };
+      if (!modeWithin(mode, ceiling)) return { success: false, error: 'mode exceeds the ceiling' };
+      const g = this.modeGrants.mintRoot({
+        holder: existing?.holder ?? `unclaimed:${label}:${p.workspaceId}`, holderLabel: label, workspaceId: p.workspaceId,
+        mode, ceiling, types: Array.isArray(p.types) ? p.types : existing?.types,
+        mayDerive: typeof p.mayDerive === 'number' ? p.mayDerive : (existing?.mayDerive ?? (app ? 0 : undefined)),
+        maySetMode: typeof p.maySetMode === 'boolean' ? p.maySetMode : existing?.maySetMode,
+      });
+      await this.grantsChanged();
+      return { success: true, grant: this.grantView(g) };
+    });
+
+    this.on('deriveGrant', async (msg: AbjectMessage) => {
+      const from = msg.routing.from;
+      const p = (msg.payload ?? {}) as DeriveSpec & { parentId?: string };
+      if (typeof p.parentId !== 'string' || typeof p.holder !== 'string' || !p.holder) return { success: false, error: 'parentId and holder required' };
+      if (p.conversationId) {
+        // A respawned chat gets its persisted grant back, mode and all.
+        const prior = this.modeGrants.forConversation(p.conversationId);
+        if (prior && prior.parent === p.parentId && this.modeGrants.get(p.parentId)?.holder === from) {
+          this.modeGrants.rebind(prior.id, p.holder, p.holderLabel);
+          await this.grantsChanged();
+          return { success: true, grant: this.grantView(prior) };
+        }
+      }
+      const spec = { ...p };
+      if (!(await this.isBuiltInCaller(p.holder as AbjectId))) {
+        // §8: an app or package holds Manual, ceiling Manual and may not derive,
+        // unless the deriving holder names those fields; never above the parent.
+        const parent = this.modeGrants.get(p.parentId);
+        if (parent) {
+          if (spec.ceiling === undefined) {
+            spec.ceiling = { reach: minReach(DEFAULT_APP_CEILING.reach, parent.ceiling.reach), beyond: minBeyond(DEFAULT_APP_CEILING.beyond, parent.ceiling.beyond) };
+          }
+          if (spec.mode === undefined) spec.mode = meetMode(this.modeGrants.effective(parent), DEFAULT_APP_MODE);
+          if (spec.mayDerive === undefined) spec.mayDerive = 0;
+        }
+      }
+      const r = this.modeGrants.derive(p.parentId, from, spec);
+      if (!r.ok) return { success: false, error: r.error };
+      await this.grantsChanged();
+      return { success: true, grant: this.grantView(r.value) };
+    });
+
+    this.on('setMode', async (msg: AbjectMessage) => {
+      const from = msg.routing.from;
+      const p = (msg.payload ?? {}) as { grantId?: string; mode?: unknown; lowerOnly?: boolean };
+      const g = typeof p.grantId === 'string' ? this.modeGrants.get(p.grantId) : this.modeGrants.findFor(from);
+      if (!g) return { success: false, error: 'no grant held by caller' };
+      if (p.lowerOnly === true) {
+        const next = parseMode(p.mode);
+        if (!next || !modeAtMost(next, g.mode)) return { success: false, error: 'only a lower mode may be set from here' };
+      }
+      const r = this.modeGrants.setMode(g.id, from, p.mode);
+      if (!r.ok) return { success: false, error: r.error };
+      await this.grantsChanged();
+      return { success: true, grant: this.grantView(r.value) };
+    });
+
+    this.on('getMyGrant', async (msg: AbjectMessage) => {
+      await this.claimAppRow(msg.routing.from, (await this.callerContext(msg.routing.from)).workspaceId);
+      const g = this.modeGrants.findFor(msg.routing.from);
+      return g ? this.grantView(g) : null;
+    });
+
+    this.on('revokeGrant', async (msg: AbjectMessage) => {
+      const { grantId } = (msg.payload ?? {}) as { grantId?: string };
+      if (typeof grantId !== 'string') return { success: false, error: 'grantId required' };
+      if (!this.modeGrants.holdsChainOf(grantId, msg.routing.from) && !(await this.isSettingsCaller(msg))) {
+        return { success: false, error: 'Unauthorized' };
+      }
+      const revoked = this.modeGrants.revokeTree(grantId);
+      await this.grantsChanged();
+      return { success: true, revoked };
+    });
+
+    this.on('listGrants', async (msg: AbjectMessage) => {
+      const all = await this.isSettingsCaller(msg);
+      return this.modeGrants.all()
+        .filter(g => all || this.modeGrants.holdsChainOf(g.id, msg.routing.from))
+        .map(g => this.grantView(g));
+    });
+
+    this.on('describeGrant', async (msg: AbjectMessage) => {
+      const { grantId } = (msg.payload ?? {}) as { grantId?: string };
+      const g = typeof grantId === 'string' ? this.modeGrants.get(grantId) : undefined;
+      if (!g) return null;
+      if (!this.modeGrants.holdsChainOf(g.id, msg.routing.from) && !(await this.isSettingsCaller(msg))) return null;
+      return this.grantView(g);
     });
 
     this.on('getPromptMode', () => this.promptMode);
@@ -722,10 +903,153 @@ export class PermissionBroker extends Abject {
     return req;
   }
 
+  /**
+   * §8: bind a root row the person made for an app or package (grantMode with
+   * a holderLabel other than ChatManager, held by `unclaimed:<label>:<ws>`) to
+   * the live app, the way claimRootGrant binds ChatManager's row. The match
+   * rests only on what the app cannot choose: the `package:<name>` owner the
+   * Factory reserves for an installed package's abjects, or its type id. A
+   * registered name is not used (a free name can be taken by any object). A
+   * row already bound to a live object stays with it; one whose holder is gone
+   * (the app respawned) moves to the new instance. Built-in objects never
+   * claim app rows.
+   */
+  private async claimAppRow(callerId: AbjectId | undefined, workspaceId: string | undefined): Promise<Grant | undefined> {
+    if (!callerId || !workspaceId) return undefined;
+    if (this.modeGrants.findFor(callerId)) return undefined;
+    const rows = this.modeGrants.all().filter(g => !g.parent && this.modeGrants.live(g) && g.workspaceId === workspaceId
+      && g.holderLabel !== 'ChatManager' && g.holder !== callerId);
+    if (rows.length === 0) return undefined;
+    if (await this.isBuiltInCaller(callerId)) return undefined;
+    const reg = await this.registrationIn(workspaceId, callerId);
+    if (!reg) return undefined;
+    const names = new Set<string>();
+    const pkg = packageNameOf(reg.owner);
+    if (pkg) { names.add(pkg); names.add(packageOwner(pkg)); }
+    if (typeof reg.typeId === 'string' && reg.typeId) names.add(reg.typeId);
+    for (const row of rows.filter(g => names.has(g.holderLabel))) {
+      if (!row.holder.startsWith('unclaimed:') && await this.registrationIn(workspaceId, row.holder as AbjectId)) continue;
+      this.modeGrants.rebind(row.id, callerId);
+      await this.grantsChanged();
+      log.info(`claimAppRow: ${row.holderLabel} row ${row.id.slice(0, 8)} bound to ${String(callerId).slice(0, 8)}`);
+      return row;
+    }
+    return undefined;
+  }
+
+  /** An object's registration in a workspace's registry, or null when it is not registered there. */
+  private async registrationIn(workspaceId: string, objectId: AbjectId): Promise<{ owner?: string; typeId?: string } | null> {
+    const row = (await this.workspaceRows()).find(r => r.workspaceId === workspaceId);
+    if (!row) return null;
+    try {
+      return (await this.request<{ owner?: string; typeId?: string } | null>(
+        request(this.id, row.registryId, 'lookup', { objectId }), 5_000)) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private rootGrantFor(label: string, workspaceId: string): Grant | undefined {
+    return this.modeGrants.all().find(g => !g.parent && !g.revoked && g.holderLabel === label && g.workspaceId === workspaceId);
+  }
+
+  private async isSettingsCaller(msg: AbjectMessage): Promise<boolean> {
+    if (this.settingsAuthorityId && msg.routing.from === this.settingsAuthorityId) return true;
+    return this.isBuiltInCaller(msg.routing.from, ['GlobalSettings', 'CliServer']);
+  }
+
+  private async grantsChanged(): Promise<void> {
+    await this.persistRules();
+    this.changed('grantsChanged', {});
+  }
+
+  private grantView(g: Grant): Record<string, unknown> {
+    const effective = this.modeGrants.effective(g);
+    return {
+      id: g.id, parent: g.parent, holder: g.holder, holderLabel: g.holderLabel, taskId: g.taskId, workspaceId: g.workspaceId,
+      conversationId: g.conversationId, mode: g.mode, ...(g.inherit ? { inherit: true } : {}), ceiling: g.ceiling, effective, label: modeLabel(effective),
+      types: g.types, roots: g.roots, mayDerive: g.mayDerive, maySetMode: g.maySetMode, expiresAt: g.expiresAt,
+      live: this.modeGrants.live(g),
+      chain: this.modeGrants.chain(g).map(x => ({ id: x.id, holderLabel: x.holderLabel, mode: x.mode, ceiling: x.ceiling })),
+    };
+  }
+
+  /** §6.2 step 2: the grant a request runs under. A named grant must be held by the caller. */
+  private resolveGrant(req: PermissionRequest): { grant?: Grant; error?: string } {
+    const callerId = req.callerId;
+    if (typeof req.grantId === 'string') {
+      const g = this.modeGrants.get(req.grantId);
+      if (!g || !callerId || g.holder !== callerId || (g.taskId !== undefined && g.taskId !== req.taskId)) {
+        return { error: 'grant not held by caller' };
+      }
+      if (!this.modeGrants.live(g)) return { error: 'grant revoked or expired' };
+      return { grant: g };
+    }
+    if (!callerId) return {};
+    if (req.taskId) {
+      // A task whose grant was revoked (Deny and stop) or expired stays denied
+      // even when it does not present the grant id: findFor sees only live
+      // grants, and ended tasks' grants are dropped, so a lingering non-live
+      // one is a revocation, not an absence.
+      const forTask = this.modeGrants.all().filter(x => x.holder === callerId && x.taskId === req.taskId);
+      if (forTask.length > 0 && !forTask.some(x => this.modeGrants.live(x))) return { error: 'grant revoked or expired' };
+    }
+    const g = this.modeGrants.findFor(callerId, req.taskId);
+    return g ? { grant: g } : {};
+  }
+
+  private grantCovers(g: Grant, type: string): boolean {
+    return g.types.some(t => type === t || type.startsWith(`${t}:`) || type.startsWith(`${t}_`));
+  }
+
+  /** For a grant holder the beyond axis replaces the global prompt mode; the floors are the same. */
+  private grantBeyond(req: PermissionRequest, analysis: CommandAnalysis | undefined, grant: Grant): PermissionDecision | undefined {
+    const m = this.modeGrants.effective(grant);
+    if (m.beyond === 'deny') return 'deny';
+    if (m.beyond === 'allow' && !m.readOnly && !isOutward(req.type) && req.type !== 'clipboard'
+      && !(analysis && (analysis.effect === 'dangerous' || analysis.opaque))) {
+      return 'accept_once';
+    }
+    return undefined;
+  }
+
+  /** §6.3: what decided, read from how the decision was reached. */
+  private basisOf(req: PermissionRequest, ctx: CallerContext, asked: boolean, reason: string): DecisionBasis {
+    if (asked) return 'person';
+    const r = reason.toLowerCase();
+    if (r.includes('prompt mode')) return 'promptMode';
+    if (r.includes('grant g-') || r.startsWith('plan mode') || r.startsWith('grant')) return 'grant';
+    if (r.includes('session')) return 'session';
+    if (r.startsWith('rule') || r.includes('standing')) return 'rule';
+    if (req.preapproved) return 'preapproved';
+    return ctx.grant ? 'grant' : 'floor';
+  }
+
   private async decide(req: PermissionRequest): Promise<Outcome> {
     contractRequire(typeof req?.resource === 'string', 'resource must be a string');
 
-    const ctx = await this.callerContext(req.callerId);
+    const ctx: CallerContext = { ...(await this.callerContext(req.callerId)) };
+    if (typeof req.grantId !== 'string') await this.claimAppRow(req.callerId, ctx.workspaceId);
+    const held = this.resolveGrant(req);
+    if (held.error) {
+      this.record(req, ctx, 'deny', false, held.error);
+      return { decision: 'deny', asked: false };
+    }
+    if (held.grant && this.grantCovers(held.grant, req.type)) ctx.grant = held.grant;
+    // Unattended never interrupts the person, whatever the request type: a
+    // grant that does not cover this type still says nobody is to be asked.
+    else if (held.grant && this.modeGrants.effective(held.grant).beyond === 'deny') ctx.quietGrant = held.grant;
+    if (ctx.grant && this.modeGrants.effective(ctx.grant).readOnly) {
+      // Plan mode: writes are refused before any rule is consulted, whether
+      // they arrive as a filesystem call or as a command.
+      const writes = req.type === 'directory'
+        ? req.operation === 'write'
+        : req.type === 'shell' && analyzeCommand(req.resource, { cwd: req.cwd }).effect !== 'read';
+      if (writes) {
+        this.record(req, ctx, 'deny', false, 'plan mode: nothing may write until the plan is approved');
+        return { decision: 'deny', asked: false };
+      }
+    }
     const checkStep = req.taskId ? await this.checkStepRefusal(req, ctx) : undefined;
     if (checkStep) return checkStep;
     if (req.type === 'shell') return this.decideShell(req, ctx);
@@ -994,7 +1318,11 @@ export class PermissionBroker extends Abject {
     // An object a remote peer can address directly needs no laundering at all,
     // so it never auto-approves whatever its workspace mode says.
     if (ctx.exposed) return 'ask';
-    return minAutonomy(project.autonomy, ceilingFor(ctx.accessMode));
+    const level = minAutonomy(project.autonomy, ceilingFor(ctx.accessMode));
+    if (!ctx.grant) return level;
+    // §6.2 step 4: the grant's reach is one more cap; plan mode caps it at read.
+    const m = this.modeGrants.effective(ctx.grant);
+    return minAutonomy(level, m.readOnly ? minAutonomy(m.reach, 'read') : m.reach);
   }
 
   /**
@@ -1289,6 +1617,7 @@ export class PermissionBroker extends Abject {
       const data = await this.request<{ rules?: Rule[] } | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_RULES }));
       if (data?.rules) this.rules = data.rules;
+      this.modeGrants.load((data as { grants?: unknown } | null)?.grants);
       if (this.rules.length > 0) log.info(`loaded ${this.rules.length} permission rule(s)`);
     } catch (err) {
       log.warn(`could not load rules: ${err instanceof Error ? err.message : String(err)}`);
@@ -1299,7 +1628,7 @@ export class PermissionBroker extends Abject {
     if (!this.storageId) return;
     try {
       await this.request(request(this.id, this.storageId, 'set',
-        { key: STORAGE_KEY_RULES, value: { rules: this.rules } }));
+        { key: STORAGE_KEY_RULES, value: { rules: this.rules, grants: this.modeGrants.serialize() } }));
     } catch (err) {
       log.warn(`could not persist rules: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1325,9 +1654,11 @@ export class PermissionBroker extends Abject {
     project?: ExternalProject,
     effective?: AutonomyLevel,
   ): Promise<Outcome> {
-    const unattended = this.unattendedDecision(req, analysis);
+    const unattended = ctx.grant ? this.grantBeyond(req, analysis, ctx.grant)
+      : ctx.quietGrant ? 'deny' : this.unattendedDecision(req, analysis);
     if (unattended) {
-      this.record(req, ctx, unattended, false, `${why}; prompt mode ${this.promptMode}`, project, effective);
+      const by = ctx.grant ?? ctx.quietGrant;
+      this.record(req, ctx, unattended, false, `${why}; ${by ? `grant ${by.id} (${modeLabel(this.modeGrants.effective(by))})` : `prompt mode ${this.promptMode}`}`, project, effective);
       // Nobody saw this command: an allow runs without the host's credentials.
       return { decision: unattended, asked: false, restrictEnv: unattended === 'accept_once' };
     }
@@ -1392,6 +1723,23 @@ export class PermissionBroker extends Abject {
     // the command analysis, not in a log line the person never reads.
     if (req.description) detail.unshift(`Scope      ${req.description}`);
 
+    // Design 9.4: name the grant chain behind the question, and offer to raise
+    // this chat's mode or to stop the task the request came from.
+    const chatGrant = ctx.grant
+      ? this.modeGrants.chain(ctx.grant).find(x => x.conversationId !== undefined && x.taskId === undefined)
+      : undefined;
+    if (ctx.grant) {
+      const chain = this.modeGrants.chain(ctx.grant);
+      detail.unshift(
+        `Authorized by   ${chain.map(x => `${x.holderLabel ?? x.id} (${modeLabel(x.mode)})`).join(' → ')}`,
+        `Effective mode  ${modeLabel(this.modeGrants.effective(ctx.grant))}`,
+      );
+      const grantOptions: PromptGroup['options'] = [];
+      if (chatGrant && this.modeGrants.live(chatGrant)) grantOptions.push({ id: 'grant_switch_auto', label: 'Switch this chat to Auto', tone: 'good' });
+      if (ctx.grant.taskId !== undefined) grantOptions.push({ id: 'grant_deny_stop', label: 'Deny and stop this task', tone: 'bad' });
+      if (grantOptions.length > 0) groups.push({ label: 'This chat’s grant', options: grantOptions });
+    }
+
     const answer = await this.askPerson({
       kind: 'options',
       topic: 'permission',
@@ -1410,7 +1758,99 @@ export class PermissionBroker extends Abject {
     });
     const offered = groups.flatMap(g => g.options.map(o => o.id));
     if (!answer.answered || !answer.confirmed || !answer.option || !offered.includes(answer.option)) return 'deny';
+    if (answer.option === 'grant_switch_auto' && chatGrant) {
+      // The person raised the chat's mode; the store still holds it to the ceiling.
+      const r = this.modeGrants.setMode(chatGrant.id, chatGrant.holder, 'auto');
+      if (r.ok) await this.grantsChanged();
+      else {
+        // Told to the person, not only logged: they picked an option that did not happen.
+        log.warn(`could not switch the chat to Auto: ${r.error}`);
+        this.notifyPerson('Chat mode not changed',
+          `This chat could not be switched to Auto: ${r.error}. Only this one request was allowed; the chat stays at ${modeLabel(this.modeGrants.effective(chatGrant))}.`,
+          req.taskId);
+      }
+      return 'accept_once';
+    }
+    if (answer.option === 'grant_deny_stop' && ctx.grant) {
+      // Revoking the task's grant denies every later request made under it;
+      // then the work itself is stopped by the objects that own it. That runs
+      // after this deny is answered: the task is waiting on the answer, and
+      // stopping a goal waits on its tasks.
+      const grant = ctx.grant;
+      this.modeGrants.revokeTree(grant.id);
+      await this.grantsChanged();
+      void this.stopGrantTask(grant, ctx).then(r => {
+        if (r.stopped !== 'none') {
+          log.info(`deny and stop: stopped ${r.stopped === 'goal' ? `goal ${r.goalId}` : `task ${grant.taskId}`}`);
+          return;
+        }
+        log.warn(`deny and stop: could not stop task ${grant.taskId}: ${r.error}`);
+        this.notifyPerson('Task not stopped',
+          `The task could not be stopped (${r.error}). Its permission was withdrawn, so every further request it makes is denied.`,
+          grant.taskId);
+      }).catch(err => log.warn(`deny and stop failed: ${err instanceof Error ? err.message : String(err)}`));
+      return 'deny';
+    }
     return answer.option as PermissionDecision;
+  }
+
+  /**
+   * Tell the person something that needs no decision: a one-button dialog.
+   * Not awaited, so a request never waits on the person reading it.
+   */
+  private notifyPerson(title: string, message: string, taskId?: string): void {
+    void this.askPerson({
+      kind: 'options', topic: 'permission', title, message,
+      groups: [{ label: 'Noted', options: [{ id: 'ok', label: 'OK' }] }],
+      ...(taskId ? { taskId } : {}),
+    }).catch(err => log.warn(`could not tell the person "${title}": ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  /** An object by name in a workspace's registry, or the broker's own when no workspace is named. */
+  private async workspaceDep(name: string, workspaceId?: string): Promise<AbjectId | undefined> {
+    const row = workspaceId ? (await this.workspaceRows()).find(r => r.workspaceId === workspaceId) : undefined;
+    if (row) {
+      return (await this.request<Array<{ id: AbjectId }>>(request(this.id, row.registryId, 'discover', { name }), 5_000))[0]?.id;
+    }
+    return (await this.discoverDep(name)) ?? undefined;
+  }
+
+  /**
+   * "Deny and stop this task": stop the work a task grant served. A task that
+   * serves a goal stops the goal (GoalManager.stopGoal), since a cancelled goal
+   * task would only be planned again; any other task is cancelled where it
+   * runs (AgentAbject.cancelTask). The owners' replies say whether it stopped.
+   */
+  private async stopGrantTask(grant: Grant, ctx: CallerContext): Promise<{ stopped: 'goal' | 'task' | 'none'; goalId?: string; error?: string }> {
+    const taskId = grant.taskId;
+    if (!taskId) return { stopped: 'none', error: 'the grant is not bound to a task' };
+    const workspaceId = grant.workspaceId ?? ctx.workspaceId;
+    const runtimeId = await this.workspaceDep('AgentAbject', workspaceId).catch(() => undefined);
+    if (!runtimeId) return { stopped: 'none', error: 'no agent runner was found' };
+    let goalId: string | undefined;
+    let agentId: AbjectId | undefined;
+    try {
+      const status = await this.request<{ agentId?: AbjectId; goalId?: string } | null>(
+        request(this.id, runtimeId, 'getTaskStatus', { taskId }), 5_000);
+      agentId = status?.agentId;
+      goalId = status?.goalId;
+      if (!goalId) {
+        const rows = await this.request<Array<{ id: string; goalId?: string | null }>>(
+          request(this.id, runtimeId, 'listTasks', agentId ? { agentId } : {}), 5_000);
+        goalId = rows.find(row => row.id === taskId)?.goalId ?? undefined;
+      }
+    } catch { /* no goal known: the task alone is cancelled */ }
+    if (goalId) {
+      const goalManager = await this.workspaceDep('GoalManager', workspaceId).catch(() => undefined);
+      if (goalManager) {
+        const ok = await this.request<boolean>(request(this.id, goalManager, 'stopGoal', { goalId }), 60_000).catch(() => false);
+        if (ok === true) return { stopped: 'goal', goalId };
+      }
+    }
+    const r = await this.request<{ success?: boolean }>(
+      request(this.id, runtimeId, 'cancelTask', { taskId, ...(agentId ? { agentId } : {}) }), 10_000).catch(() => undefined);
+    if (r?.success) return { stopped: 'task', ...(goalId ? { goalId } : {}) };
+    return { stopped: 'none', error: goalId ? `goal ${goalId} would not stop and the task was not found` : 'the task was not found' };
   }
 
   /**
@@ -1793,10 +2233,13 @@ export class PermissionBroker extends Abject {
       project: project?.name,
       workspace: ctx.workspaceName,
       effectiveLevel,
+      basis: this.basisOf(req, ctx, asked, reason),
+      grantId: ctx.grant?.id,
     };
     req.receipt = { authority: this.id, callerId: req.callerId, taskId: req.taskId,
       operation: req.operation ?? req.type, resource: req.type === 'directory' ? req.resource : redactCommand(req.resource), decision,
-      source: asked ? 'user' : 'policy', reason, project: project?.name };
+      source: asked ? 'user' : 'policy', reason, project: project?.name,
+      basis: entry.basis, grant: ctx.grant ? this.modeGrants.receipt(ctx.grant) : undefined };
     this.decisions.push(entry);
     if (this.decisions.length > 500) this.decisions.splice(0, this.decisions.length - 500);
     log.info(asked
@@ -1929,6 +2372,8 @@ export class PermissionBroker extends Abject {
   protected override checkInvariants(): void {
     super.checkInvariants();
     invariant(PROMPT_MODES.includes(this.promptMode), 'PermissionBroker: unknown prompt mode');
+    // Rule 3 (attenuation) holds for every stored grant.
+    if (this.modeGrants) this.modeGrants.check();
     for (const r of this.rules) {
       invariant(typeof r.caller === 'string' && r.caller.length > 0, 'a rule must name a caller');
       invariant(r.kind === 'exact' || r.scope.kind !== 'path' || r.scope.root.length > 0,
@@ -1971,6 +2416,8 @@ interface Outcome {
 
 interface PermissionRequest {
   operation?: 'read' | 'write';
+  /** Holder-bound grant id; honoured only when callerId is its holder. */
+  grantId?: string;
   requestedResource?: string;
   /** Attested only by the capability owner, for an existing user-configured grant. */
   preapproved?: boolean;
