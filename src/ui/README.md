@@ -100,12 +100,22 @@ values. `setSurfaceTransform` tilts or floats a slab;
 
 **Picking.** `surfaceAt` / `surfaceLocalAt` cast a camera ray, intersect each
 slab's plane in its local space (correct under lift, tilt and attachment),
-and alpha-test the surface canvas so transparent pixels click through.
+and alpha-test the surface canvas so transparent pixels click through. The
+alpha test skips the canvas readback for a surface known to be opaque
+(`Surface.opaque`: a redraw that opens with an opaque fill over the whole
+surface, as every window background does, until a command that can lower
+alpha), because reading a pixel from a canvas with drawing in flight stalls
+the GPU (2.7 ms on a discrete card, 8.9 ms on an integrated one, after every
+hover repaint). Other surfaces are read, once per point per task.
 `nodeAt` finds interactive scene nodes; their input goes to the Abject that
 contributed them.
 
 **Render loop.** `requestAnimationFrame`, rendering only when `needsRender` is
-set or an animation, effect or video region wants the next frame.
+set or an animation, effect or video region wants the next frame. When the
+only thing moving is ambient loops (`isAmbientAnim`: a looping pulse, glow,
+slow bob or orbit of at least 1.5 s and under 60 px/s, like the eye sigils),
+frames come at 30 fps instead of 60; spins, fast or keyframed motion and
+anything else that wants a frame keep 60.
 
 **Exposé and the phone.** `enterExpose` spreads the active workspace's windows
 into a grid to pick one (desktop and phone). In mobile mode

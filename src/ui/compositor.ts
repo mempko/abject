@@ -13,7 +13,7 @@ import { AbjectId } from '../core/types.js';
 import { require, ensure } from '../core/contracts.js';
 import { Tween, DECELERATE, ACCELERATE } from './motion.js';
 import type { DrawCommandType } from '../objects/widgets/widget-types.js';
-import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES, TITLE_BAR_HEIGHT } from '../objects/widgets/widget-types.js';
+import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES, DRAW_COMMAND_TYPES, TITLE_BAR_HEIGHT } from '../objects/widgets/widget-types.js';
 import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh, InstancedMesh, MeshInstance, FogOpts, DrawMode, ShadowOpts } from './gl/renderer.js';
 import { srgbToLinear, linearToSrgb } from './gl/renderer.js';
 import { MAX_MESH_LIGHTS } from './gl/shaders.js';
@@ -336,6 +336,56 @@ function backingPx(css: number, dpr: number): number {
 /** How far (CSS px) a window's glow may extend past its own edge. */
 const BLOOM_SPILL_PX = 24;
 
+/** Every draw command type; anything else is unknown to the opacity tracker. */
+const KNOWN_DRAW_COMMANDS: ReadonlySet<string> = new Set(DRAW_COMMAND_TYPES);
+
+/**
+ * Commands that can lower a pixel's alpha. Everything else in the vocabulary
+ * draws source-over (the context's composite op unless a command changes
+ * it), which never makes a pixel less opaque than it was.
+ */
+const ALPHA_LOWERING_COMMANDS: ReadonlySet<string> = new Set(['clearRect', 'putImageData', 'clear', 'reset']);
+
+/** Whether a draw command may leave a pixel less opaque than it found it. */
+function lowersAlpha(command: DrawCommand): boolean {
+  if (!KNOWN_DRAW_COMMANDS.has(command.type) || ALPHA_LOWERING_COMMANDS.has(command.type)) return true;
+  if (command.type === 'globalCompositeOperation') {
+    return (command.params as { value?: unknown } | undefined)?.value !== 'source-over';
+  }
+  return false;
+}
+
+/** Results of isOpaqueCssColor, by color string (theme colors repeat endlessly). */
+const opaqueColorCache = new Map<string, boolean>();
+let colorProbe: OffscreenCanvasRenderingContext2D | null | undefined;
+
+/**
+ * Whether a CSS color paints fully opaque pixels. The browser's own parser
+ * decides (a 1x1 CPU canvas), so every color syntax is understood and an
+ * invalid or translucent color reads as not opaque.
+ */
+function isOpaqueCssColor(color: unknown): boolean {
+  if (typeof color !== 'string') return false;
+  const known = opaqueColorCache.get(color);
+  if (known !== undefined) return known;
+  if (colorProbe === undefined) {
+    colorProbe = typeof OffscreenCanvas === 'undefined'
+      ? null
+      : new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true });
+  }
+  let opaque = false;
+  if (colorProbe) {
+    colorProbe.clearRect(0, 0, 1, 1);
+    colorProbe.fillStyle = 'transparent';
+    colorProbe.fillStyle = color;
+    colorProbe.fillRect(0, 0, 1, 1);
+    opaque = colorProbe.getImageData(0, 0, 1, 1).data[3] === 255;
+  }
+  if (opaqueColorCache.size > 256) opaqueColorCache.clear();
+  opaqueColorCache.set(color, opaque);
+  return opaque;
+}
+
 export interface Surface {
   id: string;
   objectId: AbjectId;
@@ -349,6 +399,14 @@ export interface Surface {
   dpr: number;
   ctx: OffscreenCanvasRenderingContext2D;
   dirty: boolean;
+  /**
+   * Every pixel of the canvas is known to be fully opaque, so hit tests take
+   * the window without reading a pixel back (see trackOpacity). False means
+   * unknown, not transparent: the hit test then reads the pixel.
+   */
+  opaque: boolean;
+  /** No command has run since the last clear/reset, so the context is in its default state. */
+  pristine: boolean;
   tainted: boolean;      // canvas tainted by a cross-origin image; texture upload is unsafe, render the last-good texture
   drawn: boolean;        // false until first draw batch; prevents rendering empty surfaces
   transparent: boolean;  // window paints no background; skip the focus-glow halo (it would bleed through)
@@ -714,6 +772,39 @@ interface NodeAnim {
   spring?: Spring;
   /** performance.now() of the spring's last step. */
   lastT?: number;
+  /** Cached isAmbientAnim result (the fields it reads never change). */
+  ambient?: boolean;
+}
+
+/** Ambient loops (see isAmbientAnim) redraw at most this often: 30 fps, with slack for rAF jitter. */
+const AMBIENT_FRAME_MS = 30;
+/** The shortest loop period treated as ambient. */
+const AMBIENT_MIN_PERIOD_MS = 1500;
+/** The fastest motion, in node px per ms, treated as ambient (60 px/s: 2 px per ambient frame). */
+const AMBIENT_MAX_SPEED = 0.06;
+
+/**
+ * Whether a looping animation is slow enough to redraw at the ambient 30 fps
+ * when nothing else moves: a pulse, a glow, a slow bob or orbit. Spins and
+ * fast or keyframed motion keep 60 fps, where steps would show. A one-shot
+ * animation is never ambient: it ends, and it is usually the response to
+ * something the person just did.
+ */
+function isAmbientAnim(a: NodeAnim): boolean {
+  if (!a.loop || a.spring || a.duration < AMBIENT_MIN_PERIOD_MS) return false;
+  switch (a.channel) {
+    case 'scale': case 'color': case 'emissive': case 'opacity':
+      return true;
+    case 'orbit':
+      return (2 * Math.PI * (a.radius ?? 100)) / a.duration <= AMBIENT_MAX_SPEED;
+    case 'position': {
+      if (a.track || a.path) return false;
+      const d = Math.hypot(...a.to.map((t, i) => t - (a.from[i] ?? 0)));
+      return d / a.duration <= AMBIENT_MAX_SPEED;
+    }
+    default:
+      return false;
+  }
 }
 
 export class Compositor {
@@ -1113,6 +1204,8 @@ export class Compositor {
       dpr,
       ctx: ctx!,
       dirty: true,
+      opaque: false,
+      pristine: true,
       tainted: false,
       drawn: false,
       transparent,
@@ -1401,6 +1494,10 @@ export class Compositor {
   private lastParticleCount = 0;
   /** Whether the previous rendered frame asked for another (the loop was running, not resting). */
   private frameWantedNext = false;
+  /** Only ambient loops are running: the next frame is due AMBIENT_FRAME_MS after the last one. */
+  private ambientNext = false;
+  /** performance.now() when the render loop last drew a frame. */
+  private lastFrameAt = 0;
 
   /** Record one rendered frame for sceneInfo (runs before the particle prune). */
   private noteFrame(start: number): void {
@@ -1410,7 +1507,7 @@ export class Compositor {
     // wanted no successor is the loop resting.
     const running = this.frameWantedNext && prev > 0 && now - prev < 5000;
     this.frameLog.push([now, now - start, running ? now - prev : 0]);
-    this.frameWantedNext = this.needsRender;
+    this.frameWantedNext = this.needsRender || this.ambientNext;
     while (this.frameLog.length > 0 && (now - this.frameLog[0][0] > 2000 || this.frameLog.length > 720)) this.frameLog.shift();
     let particles = 0;
     for (const id of this.touchedParticles) {
@@ -1578,6 +1675,10 @@ export class Compositor {
       surface.canvas = offscreen;
       surface.ctx = ctx!;
       surface.dirty = true;
+      // The copied bitmap leaves new area transparent until the next redraw.
+      surface.opaque = false;
+      surface.pristine = false;
+      this.alphaMemo.clear();
       this.needsRender = true;
     }
   }
@@ -2226,6 +2327,7 @@ export class Compositor {
    * Execute a draw command on a surface.
    */
   draw(command: DrawCommand): void {
+    if (this.alphaMemo.size > 0) this.alphaMemo.clear();
     if (command.nodeId) {
       this.drawToLayer(command.surfaceId, command.nodeId, command);
       return;
@@ -2258,6 +2360,8 @@ export class Compositor {
           ctx.fillStyle = p.color;
           ctx.fillRect(0, 0, surface.rect.width, surface.rect.height);
         }
+        surface.opaque = !!p?.color && isOpaqueCssColor(p.color);
+        surface.pristine = true;
         break;
       }
 
@@ -2280,9 +2384,12 @@ export class Compositor {
       case 'reset':
         // ctx.reset() semantics: wipe the bitmap and all context state.
         this.resetSurfaceState(surface);
+        surface.opaque = false;
+        surface.pristine = true;
         break;
 
       default:
+        this.trackOpacity(surface, command);
         this.execShapeCommand(ctx, command.surfaceId, command, surface.dpr);
         break;
     }
@@ -2290,6 +2397,29 @@ export class Compositor {
     surface.dirty = true;
     surface.drawn = true;
     this.needsRender = true;
+  }
+
+  /**
+   * Keep `surface.opaque` true only while every pixel is known to be fully
+   * opaque. It becomes true when a redraw opens (context in its default
+   * state, right after a clear) with an opaque fill over the whole surface,
+   * the background a window paints, and false at the first command that can
+   * lower a pixel's alpha. Unknown stays false, so hit tests fall back to
+   * reading the pixel and never take a click a transparent pixel should pass.
+   */
+  private trackOpacity(surface: Surface, command: DrawCommand): void {
+    if (surface.pristine && command.type === 'rect') {
+      const p = command.params as RectParams;
+      if (!p.radius && p.x <= 0 && p.y <= 0
+          && p.x + p.width >= surface.rect.width && p.y + p.height >= surface.rect.height
+          && isOpaqueCssColor(p.fill)) {
+        surface.opaque = true;
+      }
+    }
+    // save/restore leave a default state default (restore cannot bring back
+    // anything a pristine context had not); every other command may not.
+    if (command.type !== 'save' && command.type !== 'restore') surface.pristine = false;
+    if (surface.opaque && lowersAlpha(command)) surface.opaque = false;
   }
 
   /**
@@ -2965,9 +3095,17 @@ export class Compositor {
         // Composite playing videos into their surfaces before the render check,
         // so a fresh frame both updates the canvas and schedules the upload.
         if (this.blitVideoFrames()) this.needsRender = true;
-        if (this.needsRender) {
+        // When only ambient loops run (a pulsing eye, a slow orbit), the
+        // desktop redraws at 30 fps instead of 60; anything else that wants
+        // a frame (input, a draw, a one-shot or fast animation) gets the
+        // next one as before.
+        const now = performance.now();
+        const ambientDue = this.ambientNext && now - this.lastFrameAt >= AMBIENT_FRAME_MS;
+        if (this.needsRender || ambientDue) {
           // Clear BEFORE rendering so an animating frame can re-request.
           this.needsRender = false;
+          this.ambientNext = false;
+          this.lastFrameAt = now;
           this.render();
         }
       } catch (err) {
@@ -3200,7 +3338,9 @@ export class Compositor {
     const frameStart = performance.now();
     this.postFxInstance?.newFrame(performance.now());
     // Advance declarative animations; keep the loop alive while any run.
-    if (this.stepAnimations(performance.now())) this.needsRender = true;
+    const anims = this.stepAnimations(performance.now());
+    if (anims === 'motion') this.needsRender = true;
+    else if (anims === 'ambient') this.ambientNext = true;
     // A released node gliding on inertia moves here, off the render loop.
     if (this.stepNodeDragInertia(performance.now())) this.needsRender = true;
     // Constraints (follow, lookAt) see this frame's positions; released
@@ -5985,9 +6125,15 @@ export class Compositor {
    * params. Returns true while any animation is still running so the render
    * loop keeps requesting frames. Drops animations whose node is gone.
    */
-  private stepAnimations(now: number): boolean {
-    if (this.nodeAnims.size === 0) return false;
+  /**
+   * Step every node animation to `now`. Returns what the next frame needs:
+   * 'motion' when an animation needs 60 fps, 'ambient' when only ambient
+   * loops run (isAmbientAnim), 'none' when nothing animates.
+   */
+  private stepAnimations(now: number): 'none' | 'ambient' | 'motion' {
+    if (this.nodeAnims.size === 0) return 'none';
     let active = false;
+    let motion = false;
     for (const [key, entry] of this.nodeAnims) {
       const node = this.sceneStore.getNode(entry.surfaceKey, entry.id);
       if (!node) { this.nodeAnims.delete(key); continue; }
@@ -5998,12 +6144,16 @@ export class Compositor {
       const live: NodeAnim[] = [];
       for (const a of entry.anims) {
         const done = this.applyAnim(node, a, now);
-        if (!done) { live.push(a); active = true; }
+        if (!done) {
+          live.push(a);
+          active = true;
+          if (!(a.ambient ??= isAmbientAnim(a))) motion = true;
+        }
       }
       if (live.length === 0) this.nodeAnims.delete(key);
       else entry.anims = live;
     }
-    return active;
+    return motion ? 'motion' : active ? 'ambient' : 'none';
   }
 
   /** Apply one animation channel to a node at time `now`. Returns true if finished. */
@@ -7741,14 +7891,7 @@ void main() { fragColor = vec4(0.0); }`));
       // The slab renders through the window camera — pick it the same way.
       const slabHit = raySurfaceHit(nodeRay, v.slab, rect.width, rect.height);
       if (!slabHit) continue;
-      try {
-        const pixel = surface.ctx.getImageData(
-          Math.max(0, Math.min(surface.canvas.width - 1, Math.floor(slabHit.x * surface.dpr))),
-          Math.max(0, Math.min(surface.canvas.height - 1, Math.floor(slabHit.y * surface.dpr))),
-          1, 1
-        ).data;
-        if (pixel[3] === 0) continue;
-      } catch { /* tainted — opaque */ }
+      if (!this.pixelDrawnAt(surface, slabHit.x, slabHit.y)) continue;
       // Opaque slab occludes everything beneath; the click belongs to it.
       return undefined;
     }
@@ -7900,6 +8043,39 @@ void main() { fragColor = vec4(0.0); }`));
     );
   }
 
+  /**
+   * Readbacks made during the current task, by `surfaceId px py`. One
+   * mousemove hit-tests the same point up to three times (cursor, node pick,
+   * input target); this makes that one read. Cleared at the end of the task
+   * and on any draw, so it never outlives the pixels it describes.
+   */
+  private alphaMemo = new Map<string, boolean>();
+
+  /**
+   * Whether the surface has paint (alpha above zero) at a surface-local CSS
+   * point; transparent pixels pass input to whatever is beneath. A surface
+   * known to be opaque answers without a readback: reading a pixel back from
+   * a canvas with drawing in flight stalls the GPU (measured 2.7 ms on a
+   * discrete card and 8.9 ms on an integrated one), and every hover that
+   * repaints a window leaves drawing in flight. A tainted canvas (a
+   * cross-origin image without CORS) cannot be read and counts as opaque.
+   */
+  private pixelDrawnAt(surface: Surface, x: number, y: number): boolean {
+    if (surface.opaque) return true;
+    const px = Math.max(0, Math.min(surface.canvas.width - 1, Math.floor(x * surface.dpr)));
+    const py = Math.max(0, Math.min(surface.canvas.height - 1, Math.floor(y * surface.dpr)));
+    const key = `${surface.id} ${px} ${py}`;
+    const memo = this.alphaMemo.get(key);
+    if (memo !== undefined) return memo;
+    let drawn = true;
+    try {
+      drawn = surface.ctx.getImageData(px, py, 1, 1).data[3] !== 0;
+    } catch { /* tainted: opaque */ }
+    if (this.alphaMemo.size === 0) queueMicrotask(() => this.alphaMemo.clear());
+    this.alphaMemo.set(key, drawn);
+    return drawn;
+  }
+
   private desktopHitTest(viewportX: number, viewportY: number): Surface | undefined {
     // The camera follows scroll; make sure matrices reflect the current state
     // even if no frame has rendered since the last scroll.
@@ -7924,18 +8100,7 @@ void main() { fragColor = vec4(0.0); }`));
       if (!hit) continue;
 
       // Transparent pixels pass input through to surfaces below.
-      // getImageData throws on tainted canvases (cross-origin images
-      // loaded without CORS); treat those surfaces as fully opaque.
-      try {
-        const pixel = surface.ctx.getImageData(
-          Math.max(0, Math.min(surface.canvas.width - 1, Math.floor(hit.x * surface.dpr))),
-          Math.max(0, Math.min(surface.canvas.height - 1, Math.floor(hit.y * surface.dpr))),
-          1, 1
-        ).data;
-        if (pixel[3] === 0) continue;
-      } catch {
-        // Canvas tainted by cross-origin image — treat as opaque
-      }
+      if (!this.pixelDrawnAt(surface, hit.x, hit.y)) continue;
 
       return surface;
     }
