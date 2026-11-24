@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.16.16",
+    "date": "2026-11-24",
+    "title": "A Lighter, Quieter Desktop",
+    "summary": "This release makes the desktop do less work for the same result: clicks and pointer moves no longer stall the display, idle animations stop keeping the machine busy, and a desktop running on the same machine as its backend gets its screen updates faster.",
+    "highlights": [
+      "Pointer moves and clicks are cheaper: the desktop no longer reads pixels back from the graphics card to check what is under the cursor when the window there is fully opaque, which removes a stall that could make dragging and hovering feel sticky",
+      "Ambient animations (the gentle motion that plays while nothing else is happening) now run at a lower frame rate, so an idle desktop uses less CPU and GPU and laptop batteries last longer",
+      "When the desktop runs on the same machine as its backend, screen updates are no longer compressed before they are sent; compressing them cost more time than it saved over a local connection, so redraws arrive sooner. Remote and phone connections still compress as before"
+    ],
+    "fixes": [
+      "Fixed an idle desktop that kept redrawing at full speed because looping ambient animations never let it rest",
+      "Fixed brief hitches on hover and click caused by a pixel readback during hit-testing"
+    ]
+  },
+  {
     "version": "0.16.15",
     "date": "2026-11-24",
     "title": "Antigravity Can See Your Images",
