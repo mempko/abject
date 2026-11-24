@@ -56,7 +56,9 @@ reaches a desktop over WebRTC.
 
 - **Wire format.** After auth every frame is binary (`src/network/wire-codec.ts`):
   a compact self-describing encoding with per-connection string interning,
-  deflated on the WebSocket path when it helps. Before auth, JSON text. Both
+  deflated on the WebSocket path when it helps, except for a browser on the
+  same machine (loopback, no proxy headers), where compressing costs about a
+  millisecond a frame and saves nothing. Before auth, JSON text. Both
   sides create a fresh encoder/decoder pair per connection.
 - **Flow control.** The client acks processed frames cumulatively, at most once
   per animation frame (`frameAck`). The backend stops flushing to a client

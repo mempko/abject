@@ -238,7 +238,9 @@ interface ClientConnection {
   dec: WireDecoder;
   /**
    * Whether encodeFrame should deflate large frames. WebRTC transports
-   * already deflate inside PeerTransport, so only WebSocket clients opt in.
+   * already deflate inside PeerTransport, and a WebSocket client on this
+   * machine gains nothing from it (ClientMeta.deflate), so only WebSocket
+   * clients reached through a proxy opt in.
    */
   deflate: boolean;
   /** Wire frames sent on this connection (flushes + immediate sends). */
@@ -326,6 +328,13 @@ export interface ClientMeta {
   kind?: 'websocket' | 'webrtc';
   peerId?: string;
   name?: string;
+  /**
+   * Deflate large frames. Defaults to true for WebSocket clients; a client on
+   * this machine's loopback sets it false, since compressing a frame that
+   * never leaves the machine costs about a millisecond per frame (deflate
+   * here, inflate in the browser) and saves nothing.
+   */
+  deflate?: boolean;
 }
 
 export class BackendUI extends Abject {
@@ -2298,8 +2307,8 @@ IMPORTANT:
   /**
    * Add a WebSocket connection as a new client (convenience wrapper).
    */
-  addWebSocket(ws: WebSocket): string {
-    return this.addTransport(new WebSocketUITransport(ws), { kind: 'websocket' });
+  addWebSocket(ws: WebSocket, meta?: ClientMeta): string {
+    return this.addTransport(new WebSocketUITransport(ws), { ...meta, kind: 'websocket' });
   }
 
   /**
@@ -2321,7 +2330,7 @@ IMPORTANT:
       connectedAt: Date.now(),
       enc: new WireEncoder(),
       dec: new WireDecoder(),
-      deflate: kind === 'websocket',
+      deflate: kind === 'websocket' && meta?.deflate !== false,
       framesSent: 0,
       framesAcked: 0,
       queuedDrawIndex: new Map(),

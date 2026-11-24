@@ -160,9 +160,10 @@ export class NodeWebSocketServer {
   }
 
   /**
-   * Register a handler for new connections.
+   * Register a handler for new connections. The handler also gets the
+   * upgrade request (remote address, headers).
    */
-  onConnection(handler: (ws: WebSocket) => void): void {
+  onConnection(handler: (ws: WebSocket, req: http.IncomingMessage) => void): void {
     this.wss.on('connection', handler);
   }
 

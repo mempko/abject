@@ -14,7 +14,8 @@ import { randomUUID } from 'node:crypto';
 import { MessageChannel, type MessagePort } from 'node:worker_threads';
 import { AbjectId } from '../src/core/types.js';
 import type { Runtime } from '../src/runtime/runtime.js';
-import { BackendUI } from './backend-ui.js';
+import { BackendUI, type ClientMeta } from './backend-ui.js';
+import type { IncomingMessage } from 'node:http';
 import { authenticateConnection } from './auth.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { allowOrigins, clientOriginsFromEnv } from '../src/network/origin-policy.js';
@@ -68,6 +69,20 @@ import { WorkspaceCollaboratorInspector } from '../src/objects/workspace-collabo
 import { WebGatewayBrowser } from '../src/objects/web-gateway-browser.js';
 import { AppUpdater } from '../src/objects/app-updater.js';
 
+/**
+ * Whether a UI socket connection comes from a browser on this machine: a
+ * loopback peer with no proxy headers. The socket binds 127.0.0.1, but a
+ * reverse proxy on this machine (serving the desktop at wss://host/ws) also
+ * connects from loopback while the browser is elsewhere; it names the real
+ * client in a forwarding header, and that client still gets deflated frames.
+ */
+function isLocalClient(req: IncomingMessage): boolean {
+  const h = req.headers;
+  if (h['x-forwarded-for'] || h['forwarded'] || h['x-real-ip']) return false;
+  const addr = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+  return addr === '::1' || /^127(\.\d{1,3}){3}$/.test(addr);
+}
+
 /** The desktop's display layer, ready to hand to bootServer. */
 export function createDesktopUi(): UiLayer {
   let backendUI: BackendUI | null = null;          // main-thread display server (no dedicated workers)
@@ -82,8 +97,10 @@ export function createDesktopUi(): UiLayer {
    * Connect an authenticated WebSocket to BackendUI.
    * In worker mode: create MessageChannel, relay ws ↔ port, transfer port to UI worker.
    * In non-worker mode: pass WebSocket directly to BackendUI.
+   * A client on this machine gets its frames uncompressed (ClientMeta.deflate).
    */
-  function connectFrontend(ctx: BootContext, ws: import('ws').WebSocket): void {
+  function connectFrontend(ctx: BootContext, ws: import('ws').WebSocket, local: boolean): void {
+    const meta: ClientMeta = { kind: 'websocket', deflate: !local };
     if (dedicated && uiBridge) {
       // Worker mode: relay via MessageChannel
       const { port1, port2 } = new MessageChannel();
@@ -110,12 +127,14 @@ export function createDesktopUi(): UiLayer {
         }
       });
 
+      // Metadata first: the worker pairs it with the next ws-relay port.
+      uiBridge.sendCustom({ type: 'frontend-client-meta', portName: 'ws-relay', meta });
       // Transfer port2 to UI worker for BackendUI to use as transport
       uiBridge.transferPort('ws-relay', port2);
       ctx.alog.info('Frontend WebSocket relayed to UI worker via MessagePort');
     } else if (backendUI) {
       // Non-worker mode: direct WebSocket
-      backendUI.addWebSocket(ws);
+      backendUI.addWebSocket(ws, meta);
     }
   }
 
@@ -229,14 +248,15 @@ export function createDesktopUi(): UiLayer {
       });
 
       const { authConfig, sessionStore } = ctx;
-      wsServer.onConnection((ws) => {
+      wsServer.onConnection((ws, req) => {
         ctx.alog.info('Frontend connection received');
+        const local = isLocalClient(req);
         if (authConfig.enabled) {
           ctx.alog.info('Frontend connected (auth required)');
           authenticateConnection(ws, authConfig, sessionStore).then(({ result }) => {
             if (result === 'authenticated') {
               ctx.alog.info('Frontend authenticated');
-              connectFrontend(ctx, ws);
+              connectFrontend(ctx, ws, local);
             } else {
               ctx.alog.info(`Frontend auth ${result}, closing`);
               ws.close(1008, `Authentication ${result}`);
@@ -245,7 +265,7 @@ export function createDesktopUi(): UiLayer {
         } else {
           ctx.alog.info('Frontend connected');
           ws.send(JSON.stringify({ type: 'authNotRequired' }));
-          connectFrontend(ctx, ws);
+          connectFrontend(ctx, ws, local);
         }
       });
 
