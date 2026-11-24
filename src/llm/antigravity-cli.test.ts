@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { AntigravityCliProvider, AGY_TIER_MODELS } from './antigravity-cli.js';
+import { AntigravityCliProvider, AGY_TIER_MODELS, agyModelSupportsVision } from './antigravity-cli.js';
 import { peekCachedModels, resetModelDiscoveryCache } from './cli-model-discovery.js';
-import { NativeToolAbandonedError } from './provider.js';
+import { NativeToolAbandonedError, type LLMMessage } from './provider.js';
 import { LLMObject } from '../objects/llm-object.js';
 
 /** A stand-in agy: records the prompt it was given, then reports a denied native tool and no answer. */
@@ -100,4 +100,137 @@ test('tripwire (AGY_LIVE=1): the installed agy accepts every catalog id, tier de
     assert.ok(live.has(id), `${id} (${why}) is not in \`agy models\` — update AGY_MODELS / AGY_TIER_MODELS / modelMigrations`);
   }
   resetModelDiscoveryCache();
+});
+
+/** Stand-in agy supporting `models`, `acp --stdio`, and `--print` so routing and metadata can be verified offline. */
+async function fakeVisionAgy(root: string, logPath: string): Promise<string> {
+  const bin = path.join(root, 'fake-vision-agy');
+  await fs.writeFile(bin, `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const args = process.argv.slice(2);
+
+if (args[0] === 'models') {
+  process.stdout.write([
+    'gemini-4-neon-high\\tGemini 4 Neon (High)',
+    'gemini-4-argon-medium\\tGemini 4 Argon (Medium)',
+    'claude-sonnet-5-5-high\\tClaude Sonnet 5.5 (High)',
+    'gpt-oss-120b-medium\\tGPT-OSS 120B (Medium)',
+  ].join('\\n') + '\\n');
+  process.exit(0);
+}
+
+if (args[0] === 'acp') {
+  const record = { mode: 'acp', args, methods: [], modelId: null, prompt: null };
+  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  rl.on('line', (line) => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    record.methods.push(msg.method);
+    if (msg.method === 'initialize') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } } } }) + '\\n');
+    } else if (msg.method === 'session/new') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-1' } }) + '\\n');
+    } else if (msg.method === 'session/set_model') {
+      record.modelId = msg.params?.modelId ?? null;
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+    } else if (msg.method === 'session/prompt') {
+      record.prompt = msg.params?.prompt ?? null;
+      fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(record) + '\\n');
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'I see a test image.' } } } }) + '\\n');
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn', usage: { inputTokens: 12, outputTokens: 5 } } }) + '\\n');
+    }
+  });
+  return;
+}
+
+let input = '';
+process.stdin.on('data', c => { input += c; }).on('end', () => {
+  fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ mode: 'print', args, input }) + '\\n');
+  process.stdout.write(JSON.stringify({ event: 'result', result: { status: 'SUCCESS', response: 'plain text reply', usage: { input_tokens: 3, output_tokens: 4 } } }) + '\\n');
+  process.exit(0);
+});
+`);
+  await fs.chmod(bin, 0o755);
+  return bin;
+}
+
+test('vision metadata: auto, Gemini, and Claude models advertise vision: true while gpt-oss stays vision: false', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'abject-agy-vision-meta-'));
+  const logPath = path.join(root, 'calls.ndjson');
+  resetModelDiscoveryCache();
+  try {
+    const provider = new AntigravityCliProvider({ bin: await fakeVisionAgy(root, logPath), idleTimeoutMs: 5000 });
+
+    // Fallback catalog (describe before discovery)
+    const fallback = new Map(provider.describe().models.map(m => [m.id, m.vision]));
+    assert.equal(fallback.get('auto'), true);
+    assert.equal(fallback.get('gemini-4-argon-high'), true);
+    assert.equal(fallback.get('claude-sonnet-5-5-high'), true);
+    assert.equal(fallback.get('gpt-oss-120b-medium'), false);
+
+    // Live `agy models` discovery
+    const discovered = new Map((await provider.listModels()).map(m => [m.id, m.vision]));
+    assert.equal(discovered.get('auto'), true);
+    assert.equal(discovered.get('gemini-4-neon-high'), true);
+    assert.equal(discovered.get('gemini-4-argon-medium'), true);
+    assert.equal(discovered.get('claude-sonnet-5-5-high'), true);
+    assert.equal(discovered.get('gpt-oss-120b-medium'), false);
+
+    assert.equal(agyModelSupportsVision('gemini-4-neon-high'), true);
+    assert.equal(agyModelSupportsVision('gpt-oss-120b-medium'), false);
+  } finally {
+    resetModelDiscoveryCache();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('routing: image requests use agy acp --stdio in complete() and stream() while text-only stays on print', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'abject-agy-vision-route-'));
+  const logPath = path.join(root, 'calls.ndjson');
+  try {
+    const provider = new AntigravityCliProvider({ bin: await fakeVisionAgy(root, logPath), idleTimeoutMs: 5000 });
+
+    // 1. Text-only complete stays on --print
+    const textRes = await provider.complete([{ role: 'user', content: 'Hello text' }], { model: 'gemini-4-argon-high' });
+    assert.equal(textRes.content, 'plain text reply');
+
+    // 2. Image complete routes through ACP with explicit model and inline base64 image block
+    const imgMessages: LLMMessage[] = [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Describe this image' },
+        { type: 'image', mediaType: 'image/png', data: 'iVBORw0KGgo=' },
+      ],
+    }];
+    const imgRes = await provider.complete(imgMessages, { model: 'gemini-4-neon-high' });
+    assert.equal(imgRes.content, 'I see a test image.');
+    assert.equal(imgRes.finishReason, 'stop');
+    assert.deepEqual(imgRes.usage, { inputTokens: 12, outputTokens: 5 });
+
+    // 3. Image stream routes through ACP and omits session/set_model when model is auto
+    const chunks: Array<{ content: string; done: boolean; stopReason?: string; usage?: unknown }> = [];
+    for await (const chunk of provider.stream(imgMessages, { model: 'auto' })) chunks.push(chunk);
+    assert.equal(chunks.filter(c => !c.done).map(c => c.content).join(''), 'I see a test image.');
+    const terminal = chunks.at(-1)!;
+    assert.equal(terminal.done, true);
+    assert.equal(terminal.stopReason, 'stop');
+
+    const records = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+    assert.equal(records.length, 3);
+    assert.equal(records[0].mode, 'print');
+    assert.ok(!records[0].args.includes('acp'));
+    assert.ok(records[0].args.some((a: string) => a === '-p' || a === '--print' || a.includes('stream-json')));
+
+    assert.equal(records[1].mode, 'acp');
+    assert.deepEqual(records[1].args, ['acp', '--stdio']);
+    assert.equal(records[1].modelId, 'gemini-4-neon-high');
+    assert.ok(records[1].prompt.some((b: any) => b.type === 'image' && b.mimeType === 'image/png' && b.data === 'iVBORw0KGgo='));
+
+    assert.equal(records[2].mode, 'acp');
+    assert.deepEqual(records[2].args, ['acp', '--stdio']);
+    assert.ok(!records[2].methods.includes('session/set_model'), 'auto model must omit session/set_model');
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

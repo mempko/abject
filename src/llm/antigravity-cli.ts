@@ -53,10 +53,12 @@ import { spawn } from 'node:child_process';
 import {
   formatCliError,
   flattenConversation,
+  hasImages,
   killProc,
   runCliIdle,
   runCliIdleStreaming,
 } from './cli-process.js';
+import { completeAgyAcp, streamAgyAcp } from './antigravity-acp.js';
 import { sessionSandboxDir } from './pty-session.js';
 import { trackChild, untrackChild } from '../runtime/child-processes.js';
 import type { PromptGuidance } from './execution-context.js';
@@ -83,29 +85,41 @@ import {
 const AUTO_MODEL = 'auto';
 
 /**
+ * Whether an Antigravity model accepts image inputs over `agy acp --stdio`.
+ * Vision-capable families (Gemini, Claude, and the `auto` sentinel) return true;
+ * known text-only models such as `gpt-oss-*` return false.
+ */
+export function agyModelSupportsVision(id: string): boolean {
+  const lower = id.trim().toLowerCase();
+  if (lower.startsWith('gpt-oss')) return false;
+  return true;
+}
+
+/**
  * Mirrors `agy models` (agy 1.3.4). IDs carry the reasoning effort suffix.
  * Older agy versions rejected bare names without a separate `--effort`, and
  * rejected `--effort` outright for pro/claude models; agy 1.3.4 accepts both
  * forms, but the suffixed ID alone is the one form every version accepts.
  *
- * vision is false throughout: agy rejects an image content block outright
- * (exit 1, result status ERROR), so image requests must be routed away from
- * this provider rather than degraded.
+ * Vision-capable models advertise `vision: true`: requests containing images
+ * are routed over `agy acp --stdio` (`src/llm/antigravity-acp.ts`) because
+ * `agy --print` (`stream-json`) rejects inline image blocks, while text-only
+ * models such as `gpt-oss-*` keep `vision: false`.
  */
 const AGY_MODELS = [
-  { id: AUTO_MODEL,                 name: 'Auto (recommended)', vision: false },
-  { id: 'gemini-4-argon-high',      name: 'Gemini 4 Argon (High)', vision: false },
-  { id: 'gemini-4-argon-medium',    name: 'Gemini 4 Argon (Medium)', vision: false },
-  { id: 'gemini-4-argon-low',       name: 'Gemini 4 Argon (Low)', vision: false },
-  { id: 'gemini-3.8-flash-high',    name: 'Gemini 3.8 Flash (High)', vision: false },
-  { id: 'gemini-3.8-flash-medium',  name: 'Gemini 3.8 Flash (Medium)', vision: false },
-  { id: 'gemini-3.8-flash-low',     name: 'Gemini 3.8 Flash (Low)', vision: false },
-  { id: 'claude-opus-5-5-high',     name: 'Claude Opus 5.5 (High)', vision: false },
-  { id: 'claude-opus-5-5-medium',   name: 'Claude Opus 5.5 (Medium)', vision: false },
-  { id: 'claude-opus-5-5-low',      name: 'Claude Opus 5.5 (Low)', vision: false },
-  { id: 'claude-sonnet-5-5-high',   name: 'Claude Sonnet 5.5 (High)', vision: false },
-  { id: 'claude-sonnet-5-5-medium', name: 'Claude Sonnet 5.5 (Medium)', vision: false },
-  { id: 'claude-sonnet-5-5-low',    name: 'Claude Sonnet 5.5 (Low)', vision: false },
+  { id: AUTO_MODEL,                 name: 'Auto (recommended)', vision: true },
+  { id: 'gemini-4-argon-high',      name: 'Gemini 4 Argon (High)', vision: true },
+  { id: 'gemini-4-argon-medium',    name: 'Gemini 4 Argon (Medium)', vision: true },
+  { id: 'gemini-4-argon-low',       name: 'Gemini 4 Argon (Low)', vision: true },
+  { id: 'gemini-3.8-flash-high',    name: 'Gemini 3.8 Flash (High)', vision: true },
+  { id: 'gemini-3.8-flash-medium',  name: 'Gemini 3.8 Flash (Medium)', vision: true },
+  { id: 'gemini-3.8-flash-low',     name: 'Gemini 3.8 Flash (Low)', vision: true },
+  { id: 'claude-opus-5-5-high',     name: 'Claude Opus 5.5 (High)', vision: true },
+  { id: 'claude-opus-5-5-medium',   name: 'Claude Opus 5.5 (Medium)', vision: true },
+  { id: 'claude-opus-5-5-low',      name: 'Claude Opus 5.5 (Low)', vision: true },
+  { id: 'claude-sonnet-5-5-high',   name: 'Claude Sonnet 5.5 (High)', vision: true },
+  { id: 'claude-sonnet-5-5-medium', name: 'Claude Sonnet 5.5 (Medium)', vision: true },
+  { id: 'claude-sonnet-5-5-low',    name: 'Claude Sonnet 5.5 (Low)', vision: true },
   { id: 'gpt-oss-120b-medium',      name: 'GPT-OSS 120B (Medium)', vision: false },
 ] as const satisfies readonly ModelInfo[];
 
@@ -151,7 +165,7 @@ async function agyModels(bin: string): Promise<ModelInfo[]> {
     if (id.length === 0 || /\s/.test(id) || seen.has(id)) continue;
     seen.add(id);
     const label = (rawLabel ?? '').trim();
-    live.push({ id, name: label.length > 0 ? label : id, vision: false });
+    live.push({ id, name: label.length > 0 ? label : id, vision: agyModelSupportsVision(id) });
   }
   return live.length > 0 ? [AGY_AUTO_ENTRY, ...live] : [];
 }
@@ -297,7 +311,25 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     return AUTO_MODEL;
   }
 
+  private buildAcpOptions(options?: LLMCompletionOptions) {
+    const model = this.resolveModel(options);
+    return {
+      bin: this.bin,
+      model: shouldOmitModelFlag(model) ? undefined : model,
+      idleTimeoutMs: this.idleTimeoutMs,
+      cwd: this.sandboxDir(),
+      errorHint: AGY_HINT,
+    };
+  }
+
   async complete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
+    if (hasImages(messages)) {
+      const acpOpts = this.buildAcpOptions(options);
+      return this.withRetries(
+        () => completeAgyAcp(messages, acpOpts),
+        { isRetryable: agyIsRetryable, delayMs: agyRetryDelayMs, label: 'antigravity-cli.complete' },
+      );
+    }
     const args = this.buildArgs(messages, options);
     return this.withRetries(async () => {
       let textSoFar = '';
@@ -346,7 +378,9 @@ export class AntigravityCliProvider extends BaseLLMProvider {
   }
 
   async *stream(messages: LLMMessage[], options?: LLMCompletionOptions): AsyncIterable<LLMStreamChunk> {
-    const args = this.buildArgs(messages, options);
+    const useAcp = hasImages(messages);
+    const acpOpts = useAcp ? this.buildAcpOptions(options) : undefined;
+    const args = useAcp ? undefined : this.buildArgs(messages, options);
     const maxAttempts = 3;
     const initialDelayMs = 1000;
     const backoffFactor = 2;
@@ -356,7 +390,10 @@ export class AntigravityCliProvider extends BaseLLMProvider {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        for await (const chunk of this.streamOnce(args.argv, args.stdin)) {
+        const iter = useAcp
+          ? streamAgyAcp(messages, acpOpts!)
+          : this.streamOnce(args!.argv, args!.stdin);
+        for await (const chunk of iter) {
           if (chunk.content.length > 0) yielded = true;
           yield chunk;
         }
@@ -611,12 +648,12 @@ export class AntigravityCliProvider extends BaseLLMProvider {
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /**
- * Flatten a conversation into the single turn agy runs per NDJSON message.
+ * Flatten a text-only conversation into the single turn agy runs per NDJSON
+ * message in `--print` / `stream-json` mode.
  *
- * Image parts are deliberately dropped rather than passed through: agy
- * rejects an image content block outright, which is why every entry in
- * AGY_MODELS reports `vision: false` and image requests are routed to
- * another provider before they reach here.
+ * Image-bearing requests bypass this path and are routed through
+ * `antigravity-acp.ts` (`agy acp --stdio`), because `--print` stream-json
+ * rejects inline image content blocks.
  */
 function buildPrompt(messages: LLMMessage[]): string {
   // The provider's guidance is already in these messages: LLMObject applies
