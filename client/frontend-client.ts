@@ -28,6 +28,7 @@ import { Compositor, DrawCommand, MobileViewState } from '../src/ui/compositor.j
 import type { NodeDragEvent, NodeHit, CameraChangeEvent } from '../src/ui/compositor.js';
 import type { SceneOp, SceneTheme } from '../src/ui/gl/scene-types.js';
 import { isScreenAnchor } from '../src/ui/gl/scene-types.js';
+import { shouldDeferToBrowserClipboard } from './clipboard-shortcuts.js';
 import type { AbjectId } from '../src/core/types.js';
 import type {
   BackendToFrontendMsg,
@@ -125,7 +126,16 @@ export class FrontendClient {
   private static readonly IMAGE_BLOB_CACHE_MAX = 300;
   /** Draw commands waiting on a blob that wasn't cached (evicted or raced). */
   private pendingBlobDraws: Map<string, DrawCommand[]> = new Map();
-  private focusedSurface?: string;
+  private _focusedSurface?: string;
+  private get focusedSurface(): string | undefined {
+    return this._focusedSurface;
+  }
+  private set focusedSurface(value: string | undefined) {
+    if (value !== this._focusedSurface) {
+      this._focusedSurface = value;
+      this.currentSelectedText = '';
+    }
+  }
   /**
    * P1: set when the focused surface is destroyed by churn, with the owning
    * object id of the destroyed surface. The next createSurface for the same
@@ -4001,7 +4011,7 @@ export class FrontendClient {
     // A focusable scene node holds the keyboard: keys go to the backend,
     // which routes them to the node's owner only, window or no window.
     if (this.nodeKeyFocus && !(this.mobileKeyboardProxy && e.target === this.mobileKeyboardProxy)) {
-      if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'c' || e.key === 'x')) return;
+      if (this.shouldDeferToBrowserClipboard(e)) return;
       e.preventDefault();
       this.sendToBackend({
         type: 'input',
@@ -4030,8 +4040,9 @@ export class FrontendClient {
       return;
     }
 
-    // Let clipboard shortcuts through so browser fires paste/copy/cut events
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'c' || e.key === 'x')) {
+    // Let clipboard shortcuts through so browser fires paste/copy/cut events,
+    // while still forwarding Ctrl+C / Ctrl+X when nothing is selected (e.g. TerminalView).
+    if (this.shouldDeferToBrowserClipboard(e)) {
       return;
     }
 
@@ -4050,6 +4061,10 @@ export class FrontendClient {
         meta: e.metaKey,
       },
     });
+  }
+
+  private shouldDeferToBrowserClipboard(e: KeyboardEvent): boolean {
+    return shouldDeferToBrowserClipboard(e, this.currentSelectedText.length > 0);
   }
 
   private handlePasteEvent(e: ClipboardEvent): void {

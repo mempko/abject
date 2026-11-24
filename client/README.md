@@ -106,6 +106,13 @@ reaches a desktop over WebRTC.
   Ctrl/Cmd+K (command palette), Ctrl/Cmd+` (window switcher), F3 or Ctrl+Up
   (Exposé). Phone mode: touch gestures, pinch zoom, Exposé, and a hidden input
   as the keyboard proxy.
+- **`clipboard-shortcuts.ts`**: `shouldDeferToBrowserClipboard()` and
+  `isApplePlatform()`. Decides whether a keydown event should be left to the
+  browser's native clipboard events (`paste`/`copy`/`cut`) instead of being
+  forwarded to the focused surface: defers plain paste (`Ctrl/Cmd+V`) and
+  defers `Ctrl/Cmd+C` / `Ctrl/Cmd+X` only when a widget has an active text
+  selection, so `Ctrl+C` reaches terminals as interrupt (`\x03`) when nothing
+  is selected.
 - **`transport.ts`**: the `ClientTransport` interface (`connect`, `send`,
   `onMessage`, `onOpen` on every (re)open, `onClose`, `close`, `ready`, `kind`).
 - **`ws-transport.ts`**: `WebSocketClientTransport`, with backoff that

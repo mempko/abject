@@ -342,8 +342,12 @@ app.whenReady().then(async () => {
         { label: 'Undo', accelerator: 'CmdOrCtrl+Z', registerAccelerator: false, click: (_item, win) => sendUndoKey(win, false) },
         { label: 'Redo', accelerator: 'CmdOrCtrl+Shift+Z', registerAccelerator: false, click: (_item, win) => sendUndoKey(win, true) },
         { type: 'separator' },
-        { role: 'cut' },
-        { role: 'copy' },
+        // On non-macOS, Cut/Copy share Ctrl+X / Ctrl+C with terminal control
+        // keys (e.g. SIGINT). Keep the menu items functional, but don't
+        // register their accelerators globally so keydown reaches the page
+        // first; the client defers to the browser only when text is selected.
+        { role: 'cut', registerAccelerator: process.platform === 'darwin' },
+        { role: 'copy', registerAccelerator: process.platform === 'darwin' },
         { role: 'paste' },
         { role: 'delete' },
         { type: 'separator' },
