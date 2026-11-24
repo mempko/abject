@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.16.15",
+    "date": "2026-11-24",
+    "title": "Antigravity Can See Your Images",
+    "summary": "If you use the Antigravity CLI as your AI provider, you can now attach images to a chat and its Gemini and Claude models will see them; text-only chats work exactly as before.",
+    "highlights": [
+      "Antigravity CLI provider accepts image input: messages with images go through agy's ACP mode (agy acp), so Gemini and Claude models served by Antigravity can read screenshots, photos and diagrams",
+      "Antigravity models now report whether they handle images (auto, Gemini and Claude models do; gpt-oss models do not), so Abject sends images only to models that can use them",
+      "Text-only requests keep using the existing streaming path, so nothing changes for conversations without images"
+    ],
+    "fixes": [
+      "Image requests to Antigravity run in their own temporary working directory, time out if the CLI goes quiet, and shut the subprocess down cleanly when finished",
+      "Permission prompts raised by the Antigravity CLI during an image request are declined automatically instead of leaving the request stuck"
+    ]
+  },
+  {
     "version": "0.16.14",
     "date": "2026-11-24",
     "title": "Permission Modes You Can See and Set",
