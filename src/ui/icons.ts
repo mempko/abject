@@ -55,7 +55,12 @@ export type IconName =
   | 'star'
   | 'starFilled'
   // A window with a filled left pane: the dock's collapse / expand toggle.
-  | 'sidebar';
+  | 'sidebar'
+  // Permission mode picker and link icons.
+  | 'shield'
+  | 'bolt'
+  | 'sliders'
+  | 'externalLink';
 
 export interface IconDrawOpts {
   surfaceId: string;
@@ -631,6 +636,73 @@ const sidebarIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
   ];
 };
 
+const shieldIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  return [
+    polyline(surfaceId, [
+      { x: x + size * 0.5,  y: y + size * 0.12 },
+      { x: x + size * 0.84, y: y + size * 0.24 },
+      { x: x + size * 0.82, y: y + size * 0.52 },
+      { x: x + size * 0.7,  y: y + size * 0.74 },
+      { x: x + size * 0.5,  y: y + size * 0.88 },
+      { x: x + size * 0.3,  y: y + size * 0.74 },
+      { x: x + size * 0.18, y: y + size * 0.52 },
+      { x: x + size * 0.16, y: y + size * 0.24 },
+    ], color, lw, true),
+  ];
+};
+
+const boltIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  return [
+    polyline(surfaceId, [
+      { x: x + size * 0.56, y: y + size * 0.12 },
+      { x: x + size * 0.22, y: y + size * 0.54 },
+      { x: x + size * 0.48, y: y + size * 0.54 },
+      { x: x + size * 0.44, y: y + size * 0.88 },
+      { x: x + size * 0.78, y: y + size * 0.46 },
+      { x: x + size * 0.52, y: y + size * 0.46 },
+    ], color, lw, true),
+  ];
+};
+
+const slidersIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const left = x + size * 0.16;
+  const right = x + size * 0.84;
+  const y1 = y + size * 0.25;
+  const y2 = y + size * 0.5;
+  const y3 = y + size * 0.75;
+  const r = Math.max(lw * 1.1, size * 0.085);
+  return [
+    line(surfaceId, left, y1, right, y1, color, lw),
+    line(surfaceId, left, y2, right, y2, color, lw),
+    line(surfaceId, left, y3, right, y3, color, lw),
+    circle(surfaceId, x + size * 0.34, y1, r, color),
+    circle(surfaceId, x + size * 0.66, y2, r, color),
+    circle(surfaceId, x + size * 0.44, y3, r, color),
+  ];
+};
+
+const externalLinkIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  return [
+    polyline(surfaceId, [
+      { x: x + size * 0.48, y: y + size * 0.22 },
+      { x: x + size * 0.2,  y: y + size * 0.22 },
+      { x: x + size * 0.2,  y: y + size * 0.8 },
+      { x: x + size * 0.78, y: y + size * 0.8 },
+      { x: x + size * 0.78, y: y + size * 0.52 },
+    ], color, lw, false),
+    line(surfaceId, x + size * 0.48, y + size * 0.52, x + size * 0.82, y + size * 0.18, color, lw),
+    polyline(surfaceId, [
+      { x: x + size * 0.58, y: y + size * 0.18 },
+      { x: x + size * 0.82, y: y + size * 0.18 },
+      { x: x + size * 0.82, y: y + size * 0.42 },
+    ], color, lw, false),
+  ];
+};
+
 const ICONS: Record<IconName, Renderer> = {
   close: closeIcon,
   minimize: minimizeIcon,
@@ -673,6 +745,10 @@ const ICONS: Record<IconName, Renderer> = {
   star: starIcon,
   starFilled: starFilledIcon,
   sidebar: sidebarIcon,
+  shield: shieldIcon,
+  bolt: boltIcon,
+  sliders: slidersIcon,
+  externalLink: externalLinkIcon,
 };
 
 /** True when `name` is a built-in icon (for validating caller-supplied names). */

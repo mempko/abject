@@ -58,7 +58,7 @@ export interface WidgetStyle {
   enter?: 'rise';  // any widget: fade in and rise a few pixels the first time it is drawn
 }
 
-export type WidgetType = 'label' | 'markdown' | 'contentBlock' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress' | 'list' | 'tree' | 'splitPane' | 'table' | 'form' | 'chart' | 'video' | 'nodeGraph' | 'slot';
+export type WidgetType = 'label' | 'markdown' | 'contentBlock' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress' | 'list' | 'tree' | 'splitPane' | 'table' | 'form' | 'chart' | 'video' | 'nodeGraph' | 'slot' | 'modePicker';
 
 // ── Size/rect input normalization ───────────────────────────────────────────
 // Across the UI, `w`/`h` are the canonical size fields (the canvas draw schema

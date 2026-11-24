@@ -221,6 +221,10 @@ which lists it in `listLayoutIssues`.
   `change` with the value as a string.
 - **`select-widget.ts`**: `SelectWidget`. Dropdown whose list opens as a
   pop-out, scrolls when long, and gets a filter box past one page; `change`.
+- **`mode-picker-widget.ts`**: `ModePickerWidget` (`modePicker`). Icon-only
+  permission mode trigger button opening an upward floating pop-out menu
+  grouped into Interactive and Autonomous modes with a ceiling badge and
+  Grants footer link; `change`, `openGrants`, `expanded`.
 - **`tabbar-widget.ts`**: `TabBarWidget`. Slanted tabs, active one an accent
   slab, arrow keys, double-click to rename; `change`, `close`, `rename`.
 - **`form-widget.ts`**: `FormWidget`. Builds labelled inputs from a JSON-schema
@@ -321,6 +325,8 @@ which lists it in `listLayoutIssues`.
 
 - **`layout-overflow.test.ts`**: box-layout overflow reporting, run by
   `pnpm test`.
+- **`mode-picker-widget.test.ts`**: `ModePickerWidget` pop-out, ceiling lock,
+  keyboard navigation, and event emission tests, run by `pnpm test`.
 
 ## Adding a Widget
 

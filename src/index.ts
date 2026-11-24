@@ -141,6 +141,8 @@ export { CheckboxWidget } from './objects/widgets/checkbox-widget.js';
 export { ProgressWidget } from './objects/widgets/progress-widget.js';
 export { DividerWidget } from './objects/widgets/divider-widget.js';
 export { SelectWidget } from './objects/widgets/select-widget.js';
+export { ModePickerWidget } from './objects/widgets/mode-picker-widget.js';
+export type { ModePickerWidgetConfig, ModePickerChainEntry } from './objects/widgets/mode-picker-widget.js';
 export { CanvasWidget } from './objects/widgets/canvas-widget.js';
 export type { CanvasWidgetConfig } from './objects/widgets/canvas-widget.js';
 export { TabBarWidget } from './objects/widgets/tabbar-widget.js';

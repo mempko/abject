@@ -59,7 +59,9 @@ import { CheckboxWidget, CheckboxWidgetConfig } from './widgets/checkbox-widget.
 import { ProgressWidget, ProgressWidgetConfig } from './widgets/progress-widget.js';
 import { DividerWidget } from './widgets/divider-widget.js';
 import { SelectWidget, SelectWidgetConfig } from './widgets/select-widget.js';
+import { ModePickerWidget, ModePickerWidgetConfig, ModePickerChainEntry } from './widgets/mode-picker-widget.js';
 import { CanvasWidget, CanvasWidgetConfig } from './widgets/canvas-widget.js';
+import type { PermissionMode, ModeCeiling } from '../core/permission-modes.js';
 import { TabBarWidget, TabBarConfig } from './widgets/tabbar-widget.js';
 import { SliderWidget, SliderWidgetConfig } from './widgets/slider-widget.js';
 import { ImageWidget, ImageWidgetConfig } from './widgets/image-widget.js';
@@ -117,7 +119,7 @@ const PRIVATE_WINDOW_VIEWS = ['ChatManager', 'Chat', 'ChatWindow', 'ChatBrowser'
 /** Canonical `create({specs})` widget types, kept in sync with the dispatch in createWidgetFromSpec. */
 const VALID_WIDGET_TYPES = [
   'label', 'markdown', 'contentBlock', 'button', 'textInput', 'textArea',
-  'checkbox', 'progress', 'divider', 'select', 'tabBar', 'slider', 'image',
+  'checkbox', 'progress', 'divider', 'select', 'modePicker', 'tabBar', 'slider', 'image',
   'themeSwatch', 'list', 'tree', 'goalProgress', 'table', 'form', 'chart',
   'video', 'splitPane', 'nodeGraph', 'slot',
 ] as const;
@@ -959,6 +961,10 @@ export class WidgetManager extends Abject {
           value?: number;
           options?: string[];
           selectedIndex?: number;
+          mode?: PermissionMode;
+          ceiling?: ModeCeiling;
+          maySetMode?: boolean;
+          chain?: ModePickerChainEntry[];
           tabs?: string[];
           closable?: boolean;
           min?: number;
@@ -1212,6 +1218,10 @@ export class WidgetManager extends Abject {
         value?: number;
         options?: string[];
         selectedIndex?: number;
+        mode?: PermissionMode;
+        ceiling?: ModeCeiling;
+        maySetMode?: boolean;
+        chain?: ModePickerChainEntry[];
         placeholder?: string;
         monospace?: boolean;
         readOnly?: boolean;
@@ -2879,6 +2889,7 @@ checkbox - Toggle checkbox (aspect: 'change', value: the STRING 'true' or 'false
 progress - Progress bar (update with { value: 0-100 }, or a 0..1 fraction; value -1 = indeterminate: a sweep of light runs along the track, animated by the browser, until you set a value)
 divider - Horizontal divider line
 select - Dropdown select (options: string[], selectedIndex, searchable?). Fires 'change' with the selected option's string. Keyboard: Enter/Space to open, ArrowUp/Down to navigate, Enter to select, Escape to close. Long lists scroll (mouse wheel) and automatically get a type-to-filter box atop the dropdown; searchable overrides that default. The list opens as a pop-out, so a select near a window's bottom edge works: the list may extend past the window and opens upward when the screen has more room above.
+modePicker - Icon-only permission mode picker (mode?, ceiling?, maySetMode?, chain?: Array<{ id?, holderLabel, mode?, ceiling? }>). Opens an upward floating pop-out menu grouped into Interactive and Autonomous modes with a ceiling badge and Grants footer link. Fires 'change' with the chosen preset name, 'openGrants' when the footer Grants link is clicked, and 'expanded' when opened/closed.
 tabBar - Tab bar (tabs: string[] of labels, selectedIndex). Fires 'change' with the selected index as a NUMBER. Keyboard: ArrowLeft/Right to switch tabs.
 slider - Numeric range slider (spec fields: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
 image - Image display (spec fields: url, fit 'contain'|'cover'|'fill', alt). Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, clicking opens the URL in the user's browser. Update URL via this.call(imgId, 'update', { url: '...' }).
@@ -3975,6 +3986,10 @@ async timerFired(msg) {
     value?: number;
     options?: string[];
     selectedIndex?: number;
+    mode?: PermissionMode;
+    ceiling?: ModeCeiling;
+    maySetMode?: boolean;
+    chain?: ModePickerChainEntry[];
     tabs?: string[];
     closable?: boolean;
     min?: number;
@@ -4097,6 +4112,12 @@ async timerFired(msg) {
           type: 'select', rect, text: spec.text, style: spec.style,
           options: spec.options, selectedIndex: spec.selectedIndex,
           searchable: spec.searchable, ...base,
+        }), rect);
+      case 'modePicker':
+        return this.createTypedWidget(spec.windowId, new ModePickerWidget({
+          type: 'modePicker', rect, text: spec.text, style: spec.style,
+          mode: spec.mode, ceiling: spec.ceiling,
+          maySetMode: spec.maySetMode, chain: spec.chain, ...base,
         }), rect);
       case 'tabBar':
         return this.createTypedWidget(spec.windowId, new TabBarWidget({
@@ -4321,6 +4342,10 @@ async timerFired(msg) {
       value?: number;
       options?: string[];
       selectedIndex?: number;
+      mode?: PermissionMode;
+      ceiling?: ModeCeiling;
+      maySetMode?: boolean;
+      chain?: ModePickerChainEntry[];
       placeholder?: string;
       monospace?: boolean;
       readOnly?: boolean;
@@ -4401,6 +4426,15 @@ async timerFired(msg) {
           options: config.options,
           selectedIndex: config.selectedIndex,
         } as SelectWidgetConfig);
+        break;
+      case 'modePicker':
+        widget = new ModePickerWidget({
+          ...baseConfig,
+          mode: config.mode,
+          ceiling: config.ceiling,
+          maySetMode: config.maySetMode,
+          chain: config.chain,
+        } as ModePickerWidgetConfig);
         break;
       case 'tabBar':
         widget = new TabBarWidget({
