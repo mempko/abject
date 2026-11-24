@@ -557,8 +557,15 @@ export class GlobalSettings extends Abject {
             methods: [
               {
                 name: 'show',
-                description: 'Show the global settings window',
-                parameters: [],
+                description: 'Show the global settings window, optionally opening or switching to a specific tab',
+                parameters: [
+                  {
+                    name: 'tab',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Optional tab to open or switch to (ai, auth, permissions, grants, skills, packages, updates)',
+                    optional: true,
+                  },
+                ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
@@ -583,12 +590,13 @@ export class GlobalSettings extends Abject {
 Interface: abjects:global-settings
 
 GlobalSettings is the Settings window: tabs for AI (model keys, tier routing, presets), Auth (a login for the UI and CLI),
-Permissions (filesystem, shell, web, and what happens to a request no rule decides), Skills & MCP, Packages, and Updates in the packaged app.
+Permissions (filesystem, shell, web, and what happens to a request no rule decides), Grants (workspace permission ceilings and live grant chains), Skills & MCP, Packages, and Updates in the packaged app.
 The settings themselves live in SettingsManager, which this window loads from and saves through; ask SettingsManager to read them.
 
 ### Show or hide the window
 
   await this.call(this.dep('GlobalSettings'), 'show', {});
+  await this.call(this.dep('GlobalSettings'), 'show', { tab: 'grants' });
   await this.call(this.dep('GlobalSettings'), 'hide', {});
 
 ### Undo
@@ -688,8 +696,9 @@ undo() / redo() take back the last change made in this window to the AI settings
   }
 
   private setupHandlers(): void {
-    this.on('show', async () => {
-      return this.show();
+    this.on('show', async (msg: AbjectMessage) => {
+      const payload = (msg.payload ?? {}) as { tab?: SettingsTab };
+      return this.show(typeof payload.tab === 'string' ? { tab: payload.tab } : undefined);
     });
 
     this.on('hide', async () => {
@@ -1072,12 +1081,58 @@ undo() / redo() take back the last change made in this window to the AI settings
    * build in progress: two builds made two windows, and the one this object
    * stopped tracking stayed on screen with every tab and button dead.
    */
-  async show(): Promise<boolean> {
-    if (this.windowId && !this.showInFlight) return true;
+  async show(opts?: { tab?: SettingsTab }): Promise<boolean> {
+    const visible = this.visibleTabs();
+    const requestedTab = opts?.tab && visible.includes(opts.tab) ? opts.tab : undefined;
+    if (requestedTab) {
+      this.activeTab = requestedTab;
+    }
+
+    if (this.windowId && !this.showInFlight) {
+      if (requestedTab) {
+        await this.applyRequestedTab(requestedTab);
+      }
+      await this.raiseSettingsWindow();
+      return true;
+    }
+
+    const joinedInFlight = this.showInFlight !== undefined;
     this.showInFlight ??= this.openWindow().finally(() => { this.showInFlight = undefined; });
     const shown = await this.showInFlight;
     ensure(!shown || this.windowId !== undefined, 'GlobalSettings: a shown window has an id');
+    if (shown && this.windowId && joinedInFlight) {
+      if (requestedTab) {
+        await this.applyRequestedTab(requestedTab);
+      }
+      await this.raiseSettingsWindow();
+    }
     return shown;
+  }
+
+  private async applyRequestedTab(tab: SettingsTab): Promise<void> {
+    this.activeTab = tab;
+    if (this.tabBarId) {
+      const idx = this.visibleTabs().indexOf(tab);
+      if (idx >= 0) {
+        await this.request(request(this.id, this.tabBarId, 'update', { selectedIndex: idx }));
+      }
+    }
+    if (tab === 'grants') {
+      this.grantsStale = false;
+    }
+    await this.switchTab();
+    if (tab === 'grants') {
+      await this.refreshGrantsTab();
+    } else if (tab === 'updates') {
+      await this.refreshUpdatesTab();
+    }
+  }
+
+  private async raiseSettingsWindow(): Promise<void> {
+    if (!this.widgetManagerId || !this.windowId) return;
+    try {
+      await this.request(request(this.id, this.widgetManagerId, 'raiseWindow', { windowId: this.windowId }));
+    } catch { /* best effort */ }
   }
 
   private async openWindow(): Promise<boolean> {

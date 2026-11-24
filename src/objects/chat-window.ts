@@ -25,7 +25,7 @@ import { livingStyle, eyeSigilOps, removeSigilOps, type SceneOp, sigilStreamOps 
 import type { ChatActivity, ChatControls, ChatImage, ChatMessageView } from './chat.js';
 import { Log } from '../core/timed-log.js';
 import { PRIVATE_BANNER, PRIVATE_TITLE } from '../core/privacy.js';
-import { MODE_PRESETS, modeLabel, modeWithin, sameMode, type ModeCeiling, type PermissionMode } from '../core/permission-modes.js';
+import type { ModeCeiling, PermissionMode } from '../core/permission-modes.js';
 
 const log = new Log('ChatWindow');
 const CHAT_WINDOW_INTERFACE: InterfaceId = 'abjects:chat-window';
@@ -75,13 +75,8 @@ interface ChatGrantView {
   effective: PermissionMode;
   label: string;
   maySetMode?: boolean;
-  chain?: { id: string; holderLabel?: string; mode: PermissionMode }[];
+  chain?: { id: string; holderLabel?: string; mode: PermissionMode; ceiling?: ModeCeiling }[];
 }
-
-/** The composer's mode pill and the rows of the picker it opens (design 9.1). */
-const MODE_PILL_WIDTH = 118;
-const MODE_ROW_HEIGHT = 24;
-const MODE_NOTE_HEIGHT = 18;
 
 const COMPOSER_HINT_DEFAULT = '\u21B5  Send   \u00B7   \u21E7\u21B5  Newline';
 const COMPOSER_HINT_GOAL = `\u21B5  Queue a note for the goal   \u00B7   ${PAUSE_GLYPH}  Pause   \u00B7   ${STOP_GLYPH}  Stop`;
@@ -165,13 +160,8 @@ export class ChatWindow extends Abject {
   private textInputId?: AbjectId;
   private sendBtnId?: AbjectId;
   private uploadBtnId?: AbjectId;
-  /** The composer's mode pill (design 9.1) and the picker it opens above the composer. */
-  private modeBtnId?: AbjectId;
-  private modePopoverId?: AbjectId;
-  private modePopoverOpen = false;
-  private modePopoverHeight = 0;
-  private modePopoverWidgetIds: AbjectId[] = [];
-  private modeOptionButtons = new Map<AbjectId, string>();
+  /** The composer's icon-only permission mode picker (opens a floating PopoutSurface above). */
+  private modePickerId?: AbjectId;
   /** The input row's last preferred height (it grows as the person types). */
   private composerInputHeight = INPUT_MIN_HEIGHT;
   /**
@@ -467,13 +457,12 @@ export class ChatWindow extends Abject {
         return;
       }
 
-      if (fromId === this.modeBtnId && aspect === 'click') {
-        await this.toggleModePopover();
-        return;
-      }
-      const modeChoice = aspect === 'click' ? this.modeOptionButtons.get(fromId) : undefined;
-      if (modeChoice) {
-        await this.chooseMode(modeChoice);
+      if (fromId === this.modePickerId) {
+        if (aspect === 'change' && value !== undefined && value !== null) {
+          await this.chooseMode(String(value));
+        } else if (aspect === 'openGrants') {
+          await this.openGrantsSettings();
+        }
         return;
       }
 
@@ -744,18 +733,7 @@ export class ChatWindow extends Abject {
       })
     );
 
-    // Mode picker: the composer column's first row, hidden until the mode pill
-    // opens it, so it opens upward just above the message box. Created before
-    // the input row: a nested layout joins its parent in creation order.
-    this.modePopoverId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
-        parentLayoutId: this.composerColumnId,
-        margins: { top: this.theme.tokens.space.xs, right: this.theme.tokens.space.md, bottom: this.theme.tokens.space.xs, left: this.theme.tokens.space.md },
-        spacing: 2,
-      })
-    );
-
-    // Input row (HBox: attach + TextInput + Send button).
+    // Input row (HBox: mode picker + attach + TextInput + Send button).
     this.composerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.composerColumnId,
@@ -818,29 +796,28 @@ export class ChatWindow extends Abject {
             },
           },
           {
-            // The chat's permission mode (design 9.1); opens the picker above.
-            type: 'button', windowId: this.windowId, text: 'Mode ▾',
+            // The chat's permission mode: icon-only square trigger matching attach button, opening a floating picker above.
+            type: 'modePicker', windowId: this.windowId,
             style: {
               color: this.theme.textSecondary,
-              fontSize: 12,
             },
           },
         ],
       })
     );
     this.textInputId = widgetIds[0];
-    this.modeBtnId = widgetIds[4];
+    this.modePickerId = widgetIds[4];
     this.uploadBtnId = widgetIds[1];
     this.sendBtnId = widgetIds[2];
     this.composerHintLabelId = widgetIds[3];
 
-    // Add attach button + input + send button to the composer row. The buttons
-    // are fixed-size and bottom-aligned (alignment 'right' = bottom on the HBox
-    // cross-axis) so they stay pinned to the bottom as the input grows taller;
-    // the input expands to fill the row height.
+    // Add mode picker + attach button + input + send button to the composer row.
+    // The square buttons are fixed-size and bottom-aligned (alignment 'right' =
+    // bottom on the HBox cross-axis) so they stay pinned to the bottom as the
+    // input grows taller; the input expands to fill the row height.
     await this.request(request(this.id, this.composerRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.modeBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: MODE_PILL_WIDTH, height: SEND_BTN_SIZE }, alignment: 'right' as const },
+        { widgetId: this.modePickerId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE }, alignment: 'right' as const },
         { widgetId: this.uploadBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE }, alignment: 'right' as const },
         { widgetId: this.textInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT } },
         { widgetId: this.sendBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE }, alignment: 'right' as const },
@@ -850,7 +827,6 @@ export class ChatWindow extends Abject {
     // Add hint label below the input row.
     await this.request(request(this.id, this.composerColumnId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.modePopoverId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 0 } },
         { widgetId: this.composerRowId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT } },
         { widgetId: this.composerHintLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: this.theme.tokens.space.xl } },
       ],
@@ -860,8 +836,7 @@ export class ChatWindow extends Abject {
     this.send(request(this.id, this.sendBtnId, 'addDependent', {}));
     this.send(request(this.id, this.uploadBtnId, 'addDependent', {}));
     this.send(request(this.id, this.textInputId, 'addDependent', {}));
-    if (this.modeBtnId) this.send(request(this.id, this.modeBtnId, 'addDependent', {}));
-    if (this.modePopoverId) this.send(request(this.id, this.modePopoverId, 'update', { style: { visible: false } }));
+    if (this.modePickerId) this.send(request(this.id, this.modePickerId, 'addDependent', {}));
     void this.watchGrants();
     void this.refreshModePill();
 
@@ -917,12 +892,7 @@ export class ChatWindow extends Abject {
     this.messageLogId = undefined;
     this.composerRowId = undefined;
     this.composerColumnId = undefined;
-    this.modeBtnId = undefined;
-    this.modePopoverId = undefined;
-    this.modePopoverOpen = false;
-    this.modePopoverHeight = 0;
-    this.modePopoverWidgetIds = [];
-    this.modeOptionButtons.clear();
+    this.modePickerId = undefined;
     this.composerInputHeight = INPUT_MIN_HEIGHT;
     this.composerHintLabelId = undefined;
     this.textInputId = undefined;
@@ -1217,10 +1187,10 @@ export class ChatWindow extends Abject {
     }
   }
 
-  /** The composer column's height: input row, hint, and the mode picker when open. */
+  /** The composer column's height: input row plus the hint strip below it. */
   private composerColumnHeight(): number {
     const s = this.theme.tokens.space;
-    return this.composerInputHeight + s.xs * 2 + s.xl + (this.modePopoverOpen ? this.modePopoverHeight + s.xs : 0);
+    return this.composerInputHeight + s.xs * 2 + s.xl;
   }
 
   private async applyComposerColumnHeight(): Promise<void> {
@@ -1261,100 +1231,43 @@ export class ChatWindow extends Abject {
     }, 250);
   }
 
-  /** The pill shows the chat's effective mode. */
+  /** Sync the composer's ModePickerWidget with the chat's live grant state. */
   private async refreshModePill(grant?: ChatGrantView | null): Promise<void> {
-    if (!this.modeBtnId) return;
+    if (!this.modePickerId) return;
     const g = grant === undefined ? await this.readChatGrant() : grant;
-    const text = `${g ? g.label : 'Ask every time'} ▾`;
-    try { await this.request(request(this.id, this.modeBtnId, 'update', { text })); } catch { /* widget gone */ }
+    const payload = g
+      ? {
+          mode: g.mode,
+          ceiling: g.ceiling,
+          maySetMode: g.maySetMode !== false,
+          chain: (g.chain ?? []).map((entry, idx, arr) => ({
+            id: entry.id,
+            holderLabel: entry.holderLabel?.trim() || (idx === 0 && arr.length > 1 ? 'Workspace' : 'This chat'),
+            mode: entry.mode,
+            ...(entry.ceiling ? { ceiling: entry.ceiling } : {}),
+          })),
+        }
+      : {
+          mode: { reach: 'ask' as const, beyond: 'ask' as const, readOnly: false },
+          ceiling: { reach: 'ask' as const, beyond: 'ask' as const },
+          maySetMode: false,
+          chain: [],
+        };
+    try { await this.request(request(this.id, this.modePickerId, 'update', payload)); } catch { /* widget gone */ }
   }
 
-  /** Open the 'Mode for this chat' picker above the composer, or close it. */
-  private async toggleModePopover(): Promise<void> {
-    if (this.modePopoverOpen) { await this.closeModePopover(); return; }
-    const windowId = this.windowId;
-    if (!this.modePopoverId || !windowId || !this.widgetManagerId || !this.composerColumnId) return;
-    const grant = await this.readChatGrant();
-    const specs: Record<string, unknown>[] = [];
-    const choices: (string | undefined)[] = [];
-    const note = (text: string, color: string) => {
-      specs.push({ type: 'label', windowId, text, style: { color, fontSize: 11, wordWrap: false, selectable: false } });
-      choices.push(undefined);
-    };
-    note('MODE FOR THIS CHAT', this.theme.textTertiary);
-    for (const p of MODE_PRESETS) {
-      if (p.name === 'ask') continue;
-      const current = !!grant && sameMode(grant.mode, p.mode);
-      // Anything past the chat's ceiling (Full access, unless the person raised
-      // it in Settings → Grants) is shown but unavailable, with the reason.
-      const withinCeiling = !!grant && modeWithin(p.mode, grant.ceiling);
-      const allowed = !!grant && grant.maySetMode !== false && withinCeiling;
-      const why = !grant || withinCeiling ? p.description
-        : `Above this chat's ceiling. Change it in Settings → Grants.`;
-      specs.push({
-        type: 'button', windowId,
-        text: `${current ? '●' : '○'}  ${p.label}  ·  ${why}`,
-        style: { color: current ? this.theme.textHeading : this.theme.textSecondary, fontSize: 12, disabled: !allowed },
-      });
-      choices.push(allowed ? p.name : undefined);
+  /** Open Global Settings directly to the Grants tab. */
+  private async openGrantsSettings(): Promise<void> {
+    const settingsId = await this.discoverDep('GlobalSettings');
+    if (!settingsId) {
+      log.warn('openGrantsSettings: no GlobalSettings to open');
+      return;
     }
-    if (grant) {
-      const chain = grant.chain ?? [];
-      const from = chain.length > 1 ? (chain[0].holderLabel ?? 'the workspace') : 'this chat';
-      const capped = !sameMode(grant.effective, grant.mode);
-      note(`Granted by ${from} → this chat  ·  ceiling ${modeLabel({ ...grant.ceiling, readOnly: false })}`
-        + (capped ? `  ·  capped to ${grant.label} by the workspace` : ''), this.theme.textSecondary);
-    } else {
-      note('This chat holds no grant, so every request asks.', this.theme.textSecondary);
-    }
-
-    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId, 'create', { specs }));
-    this.modePopoverWidgetIds = widgetIds;
-    this.modeOptionButtons.clear();
-    const heights = specs.map(s => s.type === 'button' ? MODE_ROW_HEIGHT : MODE_NOTE_HEIGHT);
-    widgetIds.forEach((id, i) => {
-      const choice = choices[i];
-      if (!choice) return;
-      this.modeOptionButtons.set(id, choice);
-      this.send(request(this.id, id, 'addDependent', {}));
-    });
-    await this.request(request(this.id, this.modePopoverId, 'addLayoutChildren', {
-      children: widgetIds.map((widgetId, i) => ({
-        widgetId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: heights[i] },
-      })),
-    }));
-    this.modePopoverHeight = heights.reduce((a, b) => a + b, 0) + 2 * Math.max(0, widgetIds.length - 1)
-      + this.theme.tokens.space.xs * 2;
-    this.modePopoverOpen = true;
-    try { await this.request(request(this.id, this.modePopoverId, 'update', { style: { visible: true } })); } catch { /* gone */ }
     try {
-      await this.request(request(this.id, this.composerColumnId, 'updateLayoutChild', {
-        widgetId: this.modePopoverId, preferredSize: { height: this.modePopoverHeight },
-      }));
-    } catch { /* gone */ }
-    await this.applyComposerColumnHeight();
-    await this.refreshModePill(grant);
-  }
-
-  private async closeModePopover(): Promise<void> {
-    const ids = this.modePopoverWidgetIds;
-    this.modePopoverWidgetIds = [];
-    this.modeOptionButtons.clear();
-    this.modePopoverOpen = false;
-    if (this.modePopoverId) {
-      try { await this.request(request(this.id, this.modePopoverId, 'clearLayoutChildren', {})); } catch { /* gone */ }
-      try { await this.request(request(this.id, this.modePopoverId, 'update', { style: { visible: false } })); } catch { /* gone */ }
-      if (this.composerColumnId) {
-        try {
-          await this.request(request(this.id, this.composerColumnId, 'updateLayoutChild', {
-            widgetId: this.modePopoverId, preferredSize: { height: 0 },
-          }));
-        } catch { /* gone */ }
-      }
+      await this.request(request(this.id, settingsId, 'show', { tab: 'grants' }));
+    } catch (err) {
+      log.warn('openGrantsSettings failed', err);
     }
-    for (const id of ids) this.send(request(this.id, id, 'destroy', {}));
-    await this.applyComposerColumnHeight();
   }
 
   /** Set this chat's mode through Chat, which asks PermissionBroker. */
@@ -1366,10 +1279,10 @@ export class ChatWindow extends Abject {
     } catch (err) {
       result = { success: false, error: err instanceof Error ? err.message : String(err) };
     }
-    await this.closeModePopover();
     if (result && result.success === false) {
       this.playEffect('shake');
       await this.setComposerHint(`Mode not changed: ${result.error ?? 'refused'}`);
+      await this.refreshModePill();
       return;
     }
     await this.refreshModePill();
