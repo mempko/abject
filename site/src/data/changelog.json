@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.16.17",
+    "date": "2026-11-24",
+    "title": "Ctrl+C Reaches the Terminal Again",
+    "summary": "A small fix release: Ctrl+C in a terminal window now interrupts the running program when no text is selected, and still copies when text is selected.",
+    "highlights": [
+      "Ctrl+C in terminal windows behaves the way it does in a regular terminal: with no text selected it goes to the running program (stopping a command, for example); with text selected it copies."
+    ],
+    "fixes": [
+      "Terminal windows no longer catch Ctrl+C as a copy shortcut when nothing is selected, so the keystroke reaches the shell or program running in the terminal."
+    ]
+  },
+  {
     "version": "0.16.16",
     "date": "2026-11-24",
     "title": "A Lighter, Quieter Desktop",
