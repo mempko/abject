@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.16.14",
+    "date": "2026-11-24",
+    "title": "Permission Modes You Can See and Set",
+    "summary": "Each chat now runs in a permission mode you choose: plan, ask, edit or auto. Whatever you grant a chat passes along to the goals, tasks, jobs and tools it starts. A ceiling caps how far any chat can go, and a new Grants tab in Settings shows what has been allowed and lets you change it.",
+    "highlights": [
+      "Permission modes (plan, ask, edit and auto): each chat runs in one mode, and a ceiling sets the most any chat may do. The permission broker enforces them for every capability, including the shell, files, the network and MCP tools.",
+      "Grants follow the work: when a chat starts a goal, task, job or tool call, that work runs under the chat's grant, so what you allowed in a conversation stays tied to that conversation.",
+      "A new Grants tab in Settings lists what has been granted and where each grant came from, and lets you manage them.",
+      "The chat window has a new mode picker beside the attach button: a small icon that opens a menu of interactive and autonomous modes. Each mode shows how much risk it carries, modes above the ceiling show as locked, and a link opens the Grants tab directly.",
+      "The abject command line has a /mode command, so you can see and change a chat's mode from the terminal too."
+    ],
+    "fixes": [
+      "Fixed a crash at startup on instances with a long goal history: the GoalManager now checks saved learning checkpoints one at a time while it reads them, instead of loading all of them into memory at once and running out."
+    ]
+  },
+  {
     "version": "0.16.13",
     "date": "2026-11-20",
     "title": "Agents keep what they know in view",
