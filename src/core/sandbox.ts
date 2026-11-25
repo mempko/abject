@@ -744,6 +744,101 @@ interface Invocation {
 
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 
+const WRAP_CACHE_MAX = 256;
+const WRAP_CACHE_MAX_LEN = 65_536;
+const wrappedSourceCache = new Map<string, string>();
+const compiledScriptCache = new Map<string, vm.Script>();
+
+function cacheGet<V>(cache: Map<string, V>, key: string): V | undefined {
+  const val = cache.get(key);
+  if (val !== undefined) {
+    cache.delete(key);
+    cache.set(key, val);
+  }
+  return val;
+}
+
+function cacheSet<V>(cache: Map<string, V>, key: string, value: V): void {
+  if (cache.has(key)) cache.delete(key);
+  else if (cache.size >= WRAP_CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+}
+
+function cachedWrapSource(
+  source: string,
+  id: number,
+  kind: SourceKind,
+  params: readonly string[],
+  guidance: boolean,
+): string {
+  if (source.length > WRAP_CACHE_MAX_LEN) {
+    return wrapSource(source, id, kind, params, guidance);
+  }
+  const key = `${kind}\0${id}\0${guidance ? 1 : 0}\0${params.join(',')}\0${source}`;
+  const cached = cacheGet(wrappedSourceCache, key);
+  if (cached !== undefined) return cached;
+  const text = wrapSource(source, id, kind, params, guidance);
+  cacheSet(wrappedSourceCache, key, text);
+  return text;
+}
+
+function cachedCompileScript(text: string, filename: string): vm.Script {
+  if (text.length > WRAP_CACHE_MAX_LEN) {
+    return new vm.Script(text, { filename, lineOffset: -1 });
+  }
+  const key = `${filename}\0${text}`;
+  const cached = cacheGet(compiledScriptCache, key);
+  if (cached !== undefined) return cached;
+  const script = new vm.Script(text, { filename, lineOffset: -1 });
+  cacheSet(compiledScriptCache, key, script);
+  return script;
+}
+
+interface PrewarmedContext {
+  ctx: vm.Context;
+  boot: Boot;
+}
+
+const PREWARM_POOL_SIZE = 4;
+const prewarmedContexts: PrewarmedContext[] = [];
+let prewarmScheduled = false;
+
+function createBootstrappedContext(name: string): PrewarmedContext {
+  const ctx = vm.createContext(vm.constants.DONT_CONTEXTIFY, {
+    name,
+    microtaskMode: 'afterEvaluate',
+    codeGeneration: { strings: false, wasm: false },
+  });
+  const boot = BOOTSTRAP.runInContext(ctx, { timeout: BOOT_MS }) as Boot;
+  return { ctx, boot };
+}
+
+function schedulePrewarm(): void {
+  if (prewarmScheduled || prewarmedContexts.length >= PREWARM_POOL_SIZE) return;
+  prewarmScheduled = true;
+  const timer = setTimeout(() => {
+    prewarmScheduled = false;
+    if (prewarmedContexts.length < PREWARM_POOL_SIZE) {
+      try {
+        prewarmedContexts.push(createBootstrappedContext('sandbox:prewarmed'));
+      } catch {
+        // Ignore background prewarm failures; foreground creation will surface any real error.
+      }
+      if (prewarmedContexts.length < PREWARM_POOL_SIZE) schedulePrewarm();
+    }
+  }, 0);
+  (timer as unknown as { unref?: () => void })?.unref?.();
+}
+
+function takePrewarmedContext(name: string): PrewarmedContext {
+  const ready = prewarmedContexts.pop();
+  schedulePrewarm();
+  return ready ?? createBootstrappedContext(name);
+}
+
 export class Sandbox {
   private ctx: vm.Context | undefined;
   private readonly api: BootstrapApi;
@@ -780,13 +875,9 @@ export class Sandbox {
       reserved: [...(options.reservedNames ?? [])],
       inherited: Object.keys(this.inherited),
     };
-    this.ctx = vm.createContext(vm.constants.DONT_CONTEXTIFY, {
-      name: options.filename,
-      microtaskMode: 'afterEvaluate',
-      codeGeneration: { strings: false, wasm: false },
-    });
+    const { ctx, boot } = takePrewarmedContext(options.filename);
+    this.ctx = ctx;
     trackSandbox(this.ctx, this);
-    const boot = BOOTSTRAP.runInContext(this.ctx, { timeout: BOOT_MS }) as Boot;
     // Read once, before any untrusted code has run.
     const api = boot(this.hostEntry, JSON.stringify(config));
     this.api = { post: api.post, take: api.take, expect: api.expect };
@@ -845,7 +936,7 @@ export class Sandbox {
 
   /** Static check only: does this source parse, stay in its wrapper, and use nothing refused? */
   static checkSource(source: string, kind: SourceKind, params: readonly string[] = []): void {
-    wrapSource(source, 1, kind, params, kind !== 'handlers');
+    cachedWrapSource(source, 1, kind, params, kind !== 'handlers');
   }
 
   /** Compile a handler map in a throwaway sandbox; returns the names of its functions. */
@@ -926,10 +1017,10 @@ export class Sandbox {
   private compile(source: string, kind: SourceKind, params: readonly string[], guidance: boolean): { id: number; value: unknown } {
     this.requireLive();
     const id = ++this.seq;
-    const text = wrapSource(source, id, kind, params, guidance);
+    const text = cachedWrapSource(source, id, kind, params, guidance);
     let script: vm.Script;
     try {
-      script = new vm.Script(text, { filename: this.options.filename, lineOffset: -1 });
+      script = cachedCompileScript(text, this.options.filename);
     } catch (err) {
       // V8 found an early error acorn did not; the error is the host's own.
       const e = err as Error;
