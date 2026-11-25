@@ -3313,17 +3313,27 @@ The registered object must implement these handlers to participate in the agent 
         entry.acceptanceEvidence = decision.evidence;
         // The owning receiver may attach verification limitations to the report.
         if (decision.result !== undefined && !entry.responseSchema) entry.state.result = decision.result;
-      } else if (this.registeredAgents.get(entry.agentId)?.canExecute !== false) {
-        // No receiver-owned check: a decision model judges whether the result
-        // completes the task (site agent.completion; rejects only when acting).
-        const judged = await this.completionJudgment(entry);
+        if (entry.dispatchTupleId && this.goalManagerId) {
+          const taskDecision = await this.request<{ accepted: boolean; reason?: string }>(request(this.id, this.goalManagerId, 'assessTask', {
+            taskId: entry.dispatchTupleId, goalId: entry.goalId ?? entry.incomingGoalId,
+          }));
+          if (taskDecision?.accepted !== true) return taskDecision?.reason ?? 'Required task outputs are not ready';
+        }
+      } else {
+        // No receiver-owned check: run completionJudgment and GoalManager.assessTask
+        // concurrently so independent completion and produces checks do not serialize.
+        const runCompletion = this.registeredAgents.get(entry.agentId)?.canExecute !== false;
+        const runAssess = Boolean(entry.dispatchTupleId && this.goalManagerId);
+        const [judged, taskDecision] = await Promise.all([
+          runCompletion ? this.completionJudgment(entry) : Promise.resolve(undefined),
+          runAssess
+            ? this.request<{ accepted: boolean; reason?: string }>(request(this.id, this.goalManagerId!, 'assessTask', {
+                taskId: entry.dispatchTupleId, goalId: entry.goalId ?? entry.incomingGoalId,
+              }))
+            : Promise.resolve(undefined),
+        ]);
         if (judged) return judged;
-      }
-      if (entry.dispatchTupleId && this.goalManagerId) {
-        const decision = await this.request<{ accepted: boolean; reason?: string }>(request(this.id, this.goalManagerId, 'assessTask', {
-          taskId: entry.dispatchTupleId, goalId: entry.goalId ?? entry.incomingGoalId,
-        }));
-        if (decision?.accepted !== true) return decision?.reason ?? 'Required task outputs are not ready';
+        if (runAssess && taskDecision?.accepted !== true) return taskDecision?.reason ?? 'Required task outputs are not ready';
       }
       entry.candidateAccepted = true;
       return;
@@ -4874,7 +4884,13 @@ The registered object must implement these handlers to participate in the agent 
     if (pending) {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const timeout = new Promise<string[]>(resolve => { timer = setTimeout(() => resolve([]), AgentAbject.JUDGMENT_WAIT_MS); });
+      // Only block up to JUDGMENT_WAIT_MS when failure classification, transient
+      // retry, or fail-streak stop conditions apply; on routine successful steps,
+      // consume already-settled / fast judgments opportunistically and let slower
+      // verdicts arrive via entry.lateJudgment.
+      const needsFullWait = entry.state.lastResult?.success === false || (entry.state.failStreak?.count ?? 0) >= 3;
+      const waitMs = needsFullWait ? AgentAbject.JUDGMENT_WAIT_MS : 50;
+      const timeout = new Promise<string[]>(resolve => { timer = setTimeout(() => resolve([]), waitMs); });
       try { lines = await Promise.race([pending.then(l => { settled = true; return l; }), timeout]); } finally { clearTimeout(timer); }
       // A slow (emulated) judgment still lands: it joins the following think.
       if (!settled) void pending.then(l => { if (l.length && !entry.finished) (entry.lateJudgment ??= []).push(...l); });
@@ -5128,7 +5144,48 @@ The registered object must implement these handlers to participate in the agent 
   private tierCapsCache?: { caps: TierCapabilities; at: number };
   /** LLM's getContextBudget answers, by what was asked. */
   private contextBudgets = new Map<string, { budget: { soft: number; hard: number; windowTokens?: number }; at: number }>();
+  /** Cached LLM.negotiateOutput answers, keyed by LLM id + tier/provider/model. */
+  private outputAgreements = new Map<string, { agreement: { selected?: string }; at: number }>();
+  private llmEventSourceId?: string;
+  private llmChangedHandlerRegistered = false;
   private static readonly TIER_CAPS_TTL_MS = 60_000;
+
+  private invalidateLlmCaches(): void {
+    this.outputAgreements.clear();
+    this.contextBudgets.clear();
+    this.tierCapsCache = undefined;
+  }
+
+  private async negotiateOutput(
+    llmId: NonNullable<typeof this.llmId>,
+    route: { tier: 'smart' | 'balanced' | 'code'; provider?: string; model?: string },
+  ): Promise<{ selected?: string }> {
+    if (this.llmEventSourceId !== llmId) {
+      this.invalidateLlmCaches();
+      this.llmEventSourceId = llmId;
+      if (!this.llmChangedHandlerRegistered) {
+        this.llmChangedHandlerRegistered = true;
+        this.on('changed', (msg) => {
+          const payload = msg.payload as { aspect?: string } | undefined;
+          if (payload?.aspect === 'providersChanged' || payload?.aspect === 'settingsChanged') {
+            this.invalidateLlmCaches();
+          }
+        });
+      }
+      void this.request(request(this.id, llmId, 'addDependent', {}), 2000).catch(() => {});
+    }
+    const key = `${llmId}|${route.tier}|${route.provider ?? ''}|${route.model ?? ''}`;
+    const now = Date.now();
+    const cached = this.outputAgreements.get(key);
+    if (cached && now - cached.at < AgentAbject.TIER_CAPS_TTL_MS) {
+      return cached.agreement;
+    }
+    const agreement = await this.request<{ selected?: string }>(
+      request(this.id, llmId, 'negotiateOutput', { tier: route.tier, provider: route.provider, model: route.model }),
+    );
+    this.outputAgreements.set(key, { agreement, at: now });
+    return agreement;
+  }
 
   /**
    * Per-tier model capabilities from the LLM service, cached briefly so the
@@ -5238,15 +5295,28 @@ The registered object must implement these handlers to participate in the agent 
     // The user's notes that arrived since the last step, read last
     this.addGoalNotesToConversation(entry);
 
+    // Overlap tier selection with step judgment under a bounded timeout so two
+    // independent decision waits do not stack serially before the next think().
+    const tierFallback = this.resolveThinkTier(entry.observeTier);
+    const tierPromise = this.chooseThinkTier(entry).catch(() => tierFallback);
+
     // Runtime checks on the step just taken (decision sites): hints the model
     // reads before choosing, or, where a site is promoted to act, a stop or
     // an unchanged retry after a transient failure.
     const judged = await this.applyStepJudgment(entry);
     if (judged) return judged;
 
+    let tierTimer: ReturnType<typeof setTimeout> | undefined;
+    const chosenTier = await Promise.race([
+      tierPromise,
+      new Promise<'smart' | 'balanced' | 'code'>(resolve => {
+        tierTimer = setTimeout(() => resolve(tierFallback), 1500);
+      }),
+    ]).finally(() => { if (tierTimer !== undefined) clearTimeout(tierTimer); });
+
     // Vision-aware tiering runs before trim so a text-only path never
     // carries image bytes into compression either
-    const route = await this.applyVisionTiering(entry, await this.chooseThinkTier(entry));
+    const route = await this.applyVisionTiering(entry, chosenTier);
 
     // Trim against the window of the model this step will actually run on,
     // which vision tiering may just have changed.
@@ -5256,7 +5326,7 @@ The registered object must implement these handlers to participate in the agent 
     this.appendVocabularyReminder(entry);
 
     this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
-    const outputAgreement = await this.request<{selected?:string}>(request(this.id,this.llmId,'negotiateOutput',{tier:route.tier,provider:route.provider,model:route.model}));
+    const outputAgreement = await this.negotiateOutput(this.llmId, route);
     // Build the request first: its message id is the correlation id the
     // chunk events come back with, which is how a chunk finds its own task.
     const streamRequest = request(this.id, this.llmId, 'stream', {
@@ -6158,16 +6228,28 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   }
 
   private async archivePayloads(entry: TaskEntry): Promise<void> {
-    if (!this.sessionStoreId) return;
-    while ((entry.payloads?.length ?? 0) > AgentAbject.MAX_STORED_PAYLOADS) {
-      const payload = entry.payloads![0];
+    if (!this.sessionStoreId || !entry.payloads) return;
+    const excess = entry.payloads.length - AgentAbject.MAX_STORED_PAYLOADS;
+    if (excess <= 0) return;
+    const toArchive = entry.payloads.slice(0, excess);
+    const storeId = this.sessionStoreId;
+    const results = await Promise.all(toArchive.map(async (payload) => {
       const sessionId = entry.archivedPayloads?.[payload.id]?.sessionId ?? entry.sessionId ?? entry.state.id;
       try {
-        const saved = await this.request<{ success: boolean }>(request(this.id, this.sessionStoreId, 'retainPayload', { sessionId, payload }));
-        if (!saved?.success) return;
-      } catch { return; } // Preserve evidence in the checkpoint if archival fails.
-      (entry.archivedPayloads ??= {})[payload.id] = { sessionId, chars: payload.text.length, kind: payload.kind };
-      entry.payloads!.shift();
+        const saved = await this.request<{ success: boolean }>(request(this.id, storeId, 'retainPayload', { sessionId, payload }));
+        return saved?.success ? { payload, sessionId } : null;
+      } catch {
+        return null; // Preserve evidence in the checkpoint if archival fails.
+      }
+    }));
+    const archivedIds = new Set<string>();
+    for (const r of results) {
+      if (!r) continue;
+      (entry.archivedPayloads ??= {})[r.payload.id] = { sessionId: r.sessionId, chars: r.payload.text.length, kind: r.payload.kind };
+      archivedIds.add(r.payload.id);
+    }
+    if (archivedIds.size > 0 && entry.payloads) {
+      entry.payloads = entry.payloads.filter(p => !archivedIds.has(p.id));
     }
   }
 
