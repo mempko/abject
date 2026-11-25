@@ -658,6 +658,23 @@ export class LLMObject extends Abject {
   private _paused = false;
   private readonly _MAX_CONTENT_CHARS = 10_000;
 
+  // ── Usage-manager resolution cache ───────────────────────────────────
+  // reserveUsageFor runs on every metered goal call. Cache:
+  //   Tier 1: WorkspaceManager id + callerId -> owning workspace registryId
+  //           (keyed strictly by msg.routing.from, never payload/onBehalfOf).
+  //   Tier 2: workspace registryId -> GoalManager id, populated ONLY after
+  //           subscribing to that registry so objectUnregistered / registration
+  //           events invalidate stale entries synchronously via FIFO mailbox
+  //           ordering. Negative (null) lookups are never cached.
+  private static readonly USAGE_CACHE_MAX_CALLERS = 2048;
+  private cachedWorkspaceManagerId?: AbjectId;
+  private callerWorkspaceRegistry = new Map<AbjectId, AbjectId>();
+  private goalManagerByRegistry = new Map<AbjectId, AbjectId>();
+  private subscribedUsageRegistries = new Set<AbjectId>();
+  private usageRegistrySubscribeInFlight = new Map<AbjectId, Promise<boolean>>();
+  private registryEventGen = new Map<AbjectId, number>();
+  private usageCacheStopped = false;
+
   // ── Prompt-cache keepalive (the "cache warmer") ───────────────────────
   // Distinct from the progress-heartbeat keepaliveTimer in complete/stream:
   // this one re-reads large prompt prefixes on a timer during agent pauses
@@ -1277,21 +1294,140 @@ export class LLMObject extends Abject {
     return this.usageContext.getStore()?.private === true;
   }
 
+  private rememberCallerWorkspace(callerId: AbjectId, registryId: AbjectId): void {
+    if (this.usageCacheStopped) return;
+    if (this.callerWorkspaceRegistry.has(callerId)) {
+      this.callerWorkspaceRegistry.delete(callerId);
+    } else if (this.callerWorkspaceRegistry.size >= LLMObject.USAGE_CACHE_MAX_CALLERS) {
+      const oldest = this.callerWorkspaceRegistry.keys().next().value;
+      if (oldest !== undefined) this.callerWorkspaceRegistry.delete(oldest);
+    }
+    this.callerWorkspaceRegistry.set(callerId, registryId);
+    this.checkInvariants();
+  }
+
+  private evictUsageRegistry(registryId: AbjectId): void {
+    this.goalManagerByRegistry.delete(registryId);
+    this.subscribedUsageRegistries.delete(registryId);
+    this.registryEventGen.delete(registryId);
+  }
+
+  private invalidateUsageManager(managerId: AbjectId, callerId?: AbjectId): void {
+    for (const [registryId, cachedId] of this.goalManagerByRegistry) {
+      if (cachedId === managerId) {
+        this.goalManagerByRegistry.delete(registryId);
+      }
+    }
+    if (callerId) {
+      this.callerWorkspaceRegistry.delete(callerId);
+    }
+  }
+
+  private async subscribeToUsageRegistry(registryId: AbjectId): Promise<boolean> {
+    if (this.usageCacheStopped) return false;
+    if (this.subscribedUsageRegistries.has(registryId)) return true;
+    const inflight = this.usageRegistrySubscribeInFlight.get(registryId);
+    if (inflight) return inflight;
+    let inFlightPromise: Promise<boolean> | undefined;
+    const promise = (async () => {
+      try {
+        await this.request(msg.request(this.id, registryId, 'subscribe', {}), 5000);
+        if (this.usageCacheStopped) {
+          void this.request(msg.request(this.id, registryId, 'unsubscribe', {}), 2000).catch(() => {});
+          return false;
+        }
+        this.subscribedUsageRegistries.add(registryId);
+        return true;
+      } catch {
+        return false;
+      } finally {
+        if (this.usageRegistrySubscribeInFlight.get(registryId) === inFlightPromise) {
+          this.usageRegistrySubscribeInFlight.delete(registryId);
+        }
+      }
+    })();
+    inFlightPromise = promise;
+    this.usageRegistrySubscribeInFlight.set(registryId, promise);
+    return promise;
+  }
+
+  private async resolveGoalManagerInRegistry(registryId: AbjectId): Promise<AbjectId | null> {
+    const cached = this.goalManagerByRegistry.get(registryId);
+    if (cached) return cached;
+    const subscribed = await this.subscribeToUsageRegistry(registryId);
+    const cachedAfterSub = this.goalManagerByRegistry.get(registryId);
+    if (cachedAfterSub) return cachedAfterSub;
+    const gen = this.registryEventGen.get(registryId) ?? 0;
+    const managers = await this.request<Array<{ id: AbjectId }>>(
+      msg.request(this.id, registryId, 'discover', { name: 'GoalManager' }),
+    );
+    const goalManagerId = managers[0]?.id ?? null;
+    if (
+      goalManagerId &&
+      subscribed &&
+      !this.usageCacheStopped &&
+      this.subscribedUsageRegistries.has(registryId) &&
+      (this.registryEventGen.get(registryId) ?? 0) === gen
+    ) {
+      this.goalManagerByRegistry.set(registryId, goalManagerId);
+      this.checkInvariants();
+    }
+    return goalManagerId;
+  }
+
+  private async listWorkspacesForUsage(): Promise<Array<{ registryId: AbjectId; childIds: AbjectId[] }> | null> {
+    let workspaceManager: AbjectId | null = this.cachedWorkspaceManagerId ?? null;
+    const fromCache = workspaceManager !== null;
+    if (!workspaceManager) {
+      workspaceManager = await this.discoverDep('WorkspaceManager');
+      if (!workspaceManager) return null;
+      if (!this.usageCacheStopped) {
+        this.cachedWorkspaceManagerId = workspaceManager;
+      }
+    }
+    try {
+      return await this.request<Array<{ registryId: AbjectId; childIds: AbjectId[] }>>(
+        msg.request(this.id, workspaceManager, 'listWorkspacesDetailed', {}),
+      );
+    } catch (err) {
+      if (!fromCache) throw err;
+      if (this.cachedWorkspaceManagerId === workspaceManager) {
+        this.cachedWorkspaceManagerId = undefined;
+      }
+      const refreshed = await this.discoverDep('WorkspaceManager');
+      if (!refreshed) return null;
+      if (!this.usageCacheStopped) {
+        this.cachedWorkspaceManagerId = refreshed;
+      }
+      return await this.request<Array<{ registryId: AbjectId; childIds: AbjectId[] }>>(
+        msg.request(this.id, refreshed, 'listWorkspacesDetailed', {}),
+      );
+    }
+  }
+
   private async usageManagerFor(callerId: AbjectId): Promise<AbjectId | null> {
     // LLM is global; GoalManager belongs to the requesting workspace. Resolve
     // ownership through WorkspaceManager, never through a payload's claimed
     // caller/onBehalfOf identity or a globally cached first GoalManager.
-    const workspaceManager = await this.discoverDep('WorkspaceManager');
-    if (workspaceManager) {
-      const workspaces = await this.request<Array<{ registryId: AbjectId; childIds: AbjectId[] }>>(
-        msg.request(this.id, workspaceManager, 'listWorkspacesDetailed', {}),
-      );
+    const cachedRegistryId = this.callerWorkspaceRegistry.get(callerId);
+    if (cachedRegistryId) {
+      this.callerWorkspaceRegistry.delete(callerId);
+      this.callerWorkspaceRegistry.set(callerId, cachedRegistryId);
+      try {
+        return await this.resolveGoalManagerInRegistry(cachedRegistryId);
+      } catch {
+        if (this.callerWorkspaceRegistry.get(callerId) === cachedRegistryId) {
+          this.callerWorkspaceRegistry.delete(callerId);
+        }
+        this.evictUsageRegistry(cachedRegistryId);
+      }
+    }
+    const workspaces = await this.listWorkspacesForUsage();
+    if (workspaces) {
       const owner = workspaces.find(workspace => workspace.childIds.includes(callerId));
       if (owner) {
-        const managers = await this.request<Array<{ id: AbjectId }>>(
-          msg.request(this.id, owner.registryId, 'discover', { name: 'GoalManager' }),
-        );
-        return managers[0]?.id ?? null;
+        this.rememberCallerWorkspace(callerId, owner.registryId);
+        return await this.resolveGoalManagerInRegistry(owner.registryId);
       }
     }
     // Standalone deployments may keep caller, LLM and goals in one registry.
@@ -1313,7 +1449,13 @@ export class LLMObject extends Abject {
     const operationId = `llm-${crypto.randomUUID()}`;
     const tokens = inputTokens + outputTokens;
     const estimate = estimateCostUsd(providerName, model, { inputTokens: tokens, outputTokens });
-    const receipt = await this.request<{ accepted: boolean; reason?: string }>(msg.request(this.id, manager, 'reserveUsage', { ...scope, operationId, tokens, costUsd: estimate }));
+    let receipt: { accepted: boolean; reason?: string };
+    try {
+      receipt = await this.request<{ accepted: boolean; reason?: string }>(msg.request(this.id, manager, 'reserveUsage', { ...scope, operationId, tokens, costUsd: estimate }));
+    } catch (err) {
+      this.invalidateUsageManager(manager, scope.callerId);
+      throw err;
+    }
     if (!receipt.accepted) throw new Error(receipt.reason ?? 'Goal budget unavailable');
     const settle: UsageSettle = async () => {
       const usage = settle.usage;
@@ -1352,6 +1494,41 @@ export class LLMObject extends Abject {
 
   private setupHandlers(): void {
     this.setupDecisionHandlers();
+    this.on('objectUnregistered', (m: AbjectMessage) => {
+      const registryId = m.routing.from;
+      if (!this.subscribedUsageRegistries.has(registryId) && !this.usageRegistrySubscribeInFlight.has(registryId)) return;
+      this.registryEventGen.set(registryId, (this.registryEventGen.get(registryId) ?? 0) + 1);
+      const objectId = typeof m.payload === 'string'
+        ? (m.payload as AbjectId)
+        : ((m.payload as { objectId?: AbjectId; id?: AbjectId } | undefined)?.objectId
+          ?? (m.payload as { id?: AbjectId } | undefined)?.id);
+      if (objectId) {
+        if (this.goalManagerByRegistry.get(registryId) === objectId) {
+          this.goalManagerByRegistry.delete(registryId);
+        }
+        if (this.callerWorkspaceRegistry.get(objectId) === registryId) {
+          this.callerWorkspaceRegistry.delete(objectId);
+        }
+        if (this.cachedWorkspaceManagerId === objectId) {
+          this.cachedWorkspaceManagerId = undefined;
+        }
+      } else {
+        this.goalManagerByRegistry.delete(registryId);
+      }
+    });
+    const onRegistryObjectChange = (m: AbjectMessage) => {
+      const registryId = m.routing.from;
+      if (!this.subscribedUsageRegistries.has(registryId) && !this.usageRegistrySubscribeInFlight.has(registryId)) return;
+      this.registryEventGen.set(registryId, (this.registryEventGen.get(registryId) ?? 0) + 1);
+      const reg = m.payload as { id?: AbjectId; name?: string; manifest?: { name?: string } } | undefined;
+      const name = reg?.name ?? reg?.manifest?.name;
+      if (name === 'GoalManager' || (reg?.id && this.goalManagerByRegistry.get(registryId) === reg.id)) {
+        this.goalManagerByRegistry.delete(registryId);
+      }
+    };
+    this.on('objectRegistered', onRegistryObjectChange);
+    this.on('objectUpdated', onRegistryObjectChange);
+    this.on('manifestUpdated', onRegistryObjectChange);
     this.on('getTaskUsage', msg=>{
       const {taskId,sessionId}=msg.payload as {taskId:string;sessionId?:string};
       const rows=this._ledger.filter(r=>{const t=r.taskId??this._privateTaskOf.get(r.id); return t===taskId || (sessionId && (t===sessionId || t?.startsWith(`${sessionId}:attempt-`)));});
@@ -2017,6 +2194,7 @@ export class LLMObject extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    this.usageCacheStopped = false;
     this.storageId = await this.discoverDep('Storage') ?? undefined;
     if (this.storageId) {
       // Order matters: the retention policy decides what the ledger load is
@@ -4397,9 +4575,34 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       invariant(e.timer !== undefined || e.pingInFlight, 'warm entry always has a pending timer or a ping in flight');
       invariant(e.policy.tauMs > 0 && e.policy.ttlMs > e.policy.tauMs, 'warm policy: 0 < τ* < TTL');
     }
+    invariant(
+      this.callerWorkspaceRegistry.size <= LLMObject.USAGE_CACHE_MAX_CALLERS,
+      `caller workspace cache bounded (${this.callerWorkspaceRegistry.size})`,
+    );
+    for (const registryId of this.goalManagerByRegistry.keys()) {
+      invariant(
+        this.subscribedUsageRegistries.has(registryId),
+        `cached GoalManager registry ${registryId} must be subscribed`,
+      );
+    }
   }
 
   protected override async onStop(): Promise<void> {
+    this.usageCacheStopped = true;
+    const subscribedRegistries = [...this.subscribedUsageRegistries];
+    this.cachedWorkspaceManagerId = undefined;
+    this.callerWorkspaceRegistry.clear();
+    this.goalManagerByRegistry.clear();
+    this.subscribedUsageRegistries.clear();
+    this.usageRegistrySubscribeInFlight.clear();
+    this.registryEventGen.clear();
+    if (subscribedRegistries.length > 0) {
+      await Promise.allSettled(
+        subscribedRegistries.map(registryId =>
+          this.request(msg.request(this.id, registryId, 'unsubscribe', {}), 2000).catch(() => {}),
+        ),
+      );
+    }
     this.dropAllWarmEntries('stopping');
     // Warm CLI sessions are live child processes holding pseudo-terminals;
     // without this they outlive the runtime that spawned them.
