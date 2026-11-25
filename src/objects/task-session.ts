@@ -112,7 +112,9 @@ const PRIVATE_SESSION_REFUSAL = 'A private task keeps no durable session';
  */
 export class TaskSession extends Abject {
   private storageId?: AbjectId;
+  private agentAbjectId?: AbjectId;
   private sessions = new Map<string, SessionRecord>();
+  private knownSessionIds = new Set<string>();
   /** Ids whose in-memory record is trimmed; the full record lives in Storage. */
   private trimmed = new Set<string>();
   private retentionTimer?: ReturnType<typeof setTimeout>;
@@ -213,7 +215,21 @@ export class TaskSession extends Abject {
     return `agent:payload:${encodeURIComponent(sessionId)}:${encodeURIComponent(id)}`;
   }
   private async runtimeOnly(sender: AbjectId): Promise<void> {
-    if (sender !== await this.discoverDep('AgentAbject')) throw new Error('Session mutation belongs to AgentAbject');
+    if (this.agentAbjectId && sender === this.agentAbjectId) return;
+    const discovered = await this.discoverDep('AgentAbject') ?? undefined;
+    if (discovered) this.agentAbjectId = discovered;
+    if (sender !== discovered) throw new Error('Session mutation belongs to AgentAbject');
+  }
+  private async updateSessionIndex(add?: string, remove?: string): Promise<void> {
+    if (!this.storageId) return;
+    await withKeyedLock(`${this.id}:session-index`, async () => {
+      let changed = false;
+      if (add && !this.knownSessionIds.has(add)) { this.knownSessionIds.add(add); changed = true; }
+      if (remove && this.knownSessionIds.has(remove)) { this.knownSessionIds.delete(remove); changed = true; }
+      if (changed) {
+        await this.request(request(this.id, this.storageId!, 'set', { key: 'agent:session-index', value: [...this.knownSessionIds] }));
+      }
+    });
   }
   /** The stored (compact) record, read back from Storage when only a trimmed copy is held. */
   private async full(id: string): Promise<SessionRecord | undefined> {
@@ -230,7 +246,7 @@ export class TaskSession extends Abject {
   }
   private async mutate(id: string, expected: number | undefined, change: (old?: SessionRecord) => SessionRecord): Promise<{ success: boolean; session?: SessionRecord; conflict?: boolean; revision?: number }> {
     if (!id) throw new Error('Session id required');
-    return withKeyedLock(`${this.id}:sessions`, async () => {
+    return withKeyedLock(`${this.id}:session:${id}`, async () => {
       const held = this.sessions.get(id);
       if (expected !== undefined && expected !== (held?.revision ?? 0)) return { success: false, conflict: true, revision: held?.revision ?? 0 };
       const old = held ? expand((await this.full(id)) ?? held) : undefined;
@@ -238,7 +254,7 @@ export class TaskSession extends Abject {
       if (!this.storageId) throw new Error('Storage unavailable; cannot acknowledge a durable session checkpoint');
       const stored = compact(next);
       // Index first: a crash can leave a missing record, but never an undiscoverable acknowledged record.
-      if (!held) await this.request(request(this.id, this.storageId, 'set', { key: 'agent:session-index', value: [...this.sessions.keys(), id] }));
+      if (!held) await this.updateSessionIndex(id);
       await this.request(request(this.id, this.storageId, 'set', { key: `agent:session:${id}`, value: stored }));
       this.hold(stored);
       if (settled(stored)) this.scheduleRetention();
@@ -269,9 +285,13 @@ export class TaskSession extends Abject {
     if (evict.length === 0) return;
     let payloadKeys: string[] = [];
     try { payloadKeys = (await this.request<string[]>(request(this.id, this.storageId, 'keys', {}))) ?? []; } catch { /* payload sweep is best effort */ }
+    const removed: string[] = [];
     for (const s of evict) {
-      await withKeyedLock(`${this.id}:sessions`, async () => {
+      await withKeyedLock(`${this.id}:session:${s.id}`, async () => {
+        const cur = this.sessions.get(s.id);
+        if (!cur) return;
         this.sessions.delete(s.id); this.trimmed.delete(s.id);
+        removed.push(s.id);
         await this.request(request(this.id, this.storageId!, 'delete', { key: `agent:session:${s.id}` }));
         const prefix = `agent:payload:${encodeURIComponent(s.id)}:`;
         for (const key of payloadKeys) if (key.startsWith(prefix)) {
@@ -279,8 +299,15 @@ export class TaskSession extends Abject {
         }
       });
     }
-    await this.request(request(this.id, this.storageId, 'set', { key: 'agent:session-index', value: [...this.sessions.keys()] }));
-    log.info(`retention: removed ${evict.length} settled or interrupted session(s); ${this.sessions.size} remain`);
+    if (removed.length > 0) {
+      await withKeyedLock(`${this.id}:session-index`, async () => {
+        for (const id of removed) {
+          if (!this.sessions.has(id)) this.knownSessionIds.delete(id);
+        }
+        await this.request(request(this.id, this.storageId!, 'set', { key: 'agent:session-index', value: [...this.knownSessionIds] }));
+      });
+    }
+    log.info(`retention: removed ${removed.length} settled or interrupted session(s); ${this.sessions.size} remain`);
   }
   protected override async onInit(): Promise<void> {
     this.storageId = await this.discoverDep('Storage') ?? undefined;
@@ -301,7 +328,8 @@ export class TaskSession extends Abject {
       }
       this.hold(rec);
     }
-    await this.request(request(this.id, this.storageId, 'set', { key: 'agent:session-index', value: [...this.sessions.keys()] }));
+    this.knownSessionIds = new Set(this.sessions.keys());
+    await this.request(request(this.id, this.storageId, 'set', { key: 'agent:session-index', value: [...this.knownSessionIds] }));
     if (compacted > 0) log.info(`compacted ${compacted} stored session(s)`);
     log.info(`${this.sessions.size} session(s) loaded, ${this.trimmed.size} settled and trimmed`);
     await this.enforceRetention();
