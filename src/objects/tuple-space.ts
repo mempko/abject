@@ -24,6 +24,11 @@ const log = new Log('TupleSpace');
 const TUPLE_SPACE_INTERFACE: InterfaceId = 'abjects:tuple-space';
 const CLAIM_TTL_MS = 5 * 60 * 1000; // 5 minutes — stale claims become reclaimable
 const STORAGE_KEY = 'tuple-space:namespaces';
+const PERSIST_DEBOUNCE_MS = 50;
+
+type PendingOp =
+  | { kind: 'set'; tuple: TupleEntry }
+  | { kind: 'delete' };
 
 function stateName(namespace: string): string {
   return `ts-${namespace}`;
@@ -59,6 +64,12 @@ export class TupleSpace extends Abject {
    * only by the owner, and its tuple events go to the owner alone.
    */
   private privateOwners = new Map<string, AbjectId>();
+  private namespaceCache = new Map<string, Map<string, TupleEntry>>();
+  private loadedNamespaces = new Set<string>();
+  private hydratePromises = new Map<string, Promise<Map<string, TupleEntry>>>();
+  private pendingWrites = new Map<string, Map<string, PendingOp>>();
+  private flushTimer?: ReturnType<typeof setTimeout>;
+  private flushInFlight: Promise<void> = Promise.resolve();
 
   constructor() {
     super({
@@ -209,6 +220,10 @@ export class TupleSpace extends Abject {
     }
   }
 
+  protected override async onStop(): Promise<void> {
+    await this.flushPendingWrites();
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## TupleSpace Usage Guide
 
@@ -297,6 +312,8 @@ namespace; peers see its tuples after subscribing to the same name.
     await this.request(request(this.id, this.sharedStateId, 'create', { name: ns, private: true }));
     await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
     this.privateOwners.set(ns, owner);
+    this.namespaceCache.set(ns, new Map());
+    this.loadedNamespaces.add(ns);
   }
 
   /** Whether the sender may use `namespace`: anyone for a normal one, the owner for a private one. */
@@ -337,18 +354,37 @@ namespace; peers see its tuples after subscribing to the same name.
   private async getAllTuples(namespace: string): Promise<Map<string, TupleEntry>> {
     if (!this.sharedStateId) return new Map();
     const ns = stateName(namespace);
-    // Ensure namespace exists before reading
-    await this.doEnsureNamespace(namespace);
-    const all = await this.request<Record<string, unknown>>(
-      request(this.id, this.sharedStateId, 'getAll', { name: ns })
-    );
-    const result = new Map<string, TupleEntry>();
-    for (const [key, value] of Object.entries(all)) {
-      if (value && typeof value === 'object' && 'id' in (value as object)) {
-        result.set(key, value as TupleEntry);
-      }
+    const cached = this.namespaceCache.get(ns);
+    if (cached && this.loadedNamespaces.has(ns)) return cached;
+
+    let inflight = this.hydratePromises.get(ns);
+    if (!inflight) {
+      inflight = (async () => {
+        // Ensure namespace exists before reading
+        await this.doEnsureNamespace(namespace);
+        const all = await this.request<Record<string, unknown>>(
+          request(this.id, this.sharedStateId!, 'getAll', { name: ns })
+        );
+        let map = this.namespaceCache.get(ns);
+        if (!map) {
+          map = new Map<string, TupleEntry>();
+          this.namespaceCache.set(ns, map);
+        }
+        const dirty = this.pendingWrites.get(ns);
+        for (const [key, value] of Object.entries(all)) {
+          if (dirty?.has(key)) continue;
+          if (value && typeof value === 'object' && 'id' in (value as object)) {
+            map.set(key, value as TupleEntry);
+          }
+        }
+        this.loadedNamespaces.add(ns);
+        return map;
+      })().finally(() => {
+        this.hydratePromises.delete(ns);
+      });
+      this.hydratePromises.set(ns, inflight);
     }
-    return result;
+    return inflight;
   }
 
   private matchesPattern(entry: TupleEntry, pattern: TuplePattern): boolean {
@@ -367,16 +403,85 @@ namespace; peers see its tuples after subscribing to the same name.
     return !entry.claimedBy || this.isClaimStale(entry);
   }
 
+  private queuePendingOp(ns: string, tupleId: string, op: PendingOp): void {
+    let entries = this.pendingWrites.get(ns);
+    if (!entries) {
+      entries = new Map<string, PendingOp>();
+      this.pendingWrites.set(ns, entries);
+    }
+    entries.set(tupleId, op);
+    this.scheduleFlush();
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined;
+      void this.flushPendingWrites();
+    }, PERSIST_DEBOUNCE_MS);
+    this.flushTimer.unref?.();
+  }
+
+  private flushPendingWrites(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+    const run = async (): Promise<void> => {
+      while (this.pendingWrites.size > 0 && this.sharedStateId) {
+        const batch = new Map(this.pendingWrites);
+        this.pendingWrites.clear();
+
+        const ops: Promise<void>[] = [];
+        for (const [ns, entries] of batch) {
+          if (!this.activeNamespaces.has(ns) && !this.privateOwners.has(ns)) continue;
+          for (const [tupleId, op] of entries) {
+            if (op.kind === 'set') {
+              ops.push(
+                this.request(request(this.id, this.sharedStateId, 'set', {
+                  name: ns,
+                  key: tupleId,
+                  value: op.tuple,
+                  persist: true,
+                })).then(() => undefined).catch((err) => {
+                  log.warn(`Debounced SharedState set failed (${ns}/${tupleId}): ${err}`);
+                })
+              );
+            } else {
+              ops.push(
+                this.request(request(this.id, this.sharedStateId, 'delete', {
+                  name: ns,
+                  key: tupleId,
+                })).then(() => undefined).catch((err) => {
+                  log.warn(`Debounced SharedState delete failed (${ns}/${tupleId}): ${err}`);
+                })
+              );
+            }
+          }
+        }
+        if (ops.length > 0) {
+          await Promise.all(ops);
+        }
+      }
+    };
+    this.flushInFlight = this.flushInFlight.then(run, run);
+    return this.flushInFlight;
+  }
+
   private async writeTuple(tuple: TupleEntry, namespace: string): Promise<void> {
     if (!this.sharedStateId) throw new Error('SharedState unavailable; tuple write not acknowledged');
     const ns = stateName(namespace);
-    await this.doEnsureNamespace(namespace);
-    await this.request(request(this.id, this.sharedStateId, 'set', {
-      name: ns,
-      key: tuple.id,
-      value: tuple,
-      persist: true,
-    }));
+    if (!this.activeNamespaces.has(ns) && !this.privateOwners.has(ns)) {
+      await this.doEnsureNamespace(namespace);
+    }
+    const snapshot: TupleEntry = { ...tuple, fields: { ...tuple.fields } };
+    let cache = this.namespaceCache.get(ns);
+    if (!cache) {
+      cache = new Map<string, TupleEntry>();
+      this.namespaceCache.set(ns, cache);
+    }
+    cache.set(tuple.id, snapshot);
+    this.queuePendingOp(ns, tuple.id, { kind: 'set', tuple: snapshot });
   }
 
   // ─── Handlers ───────────────────────────────────────────────────────
@@ -394,7 +499,7 @@ namespace; peers see its tuples after subscribing to the same name.
           if(existing.admissionFingerprint!==fingerprint)throw new Error('Conflicting tuple operation identity');
           return {tupleId:id,duplicate:true};
         }
-        const tuple:TupleEntry={id,fields,admissionFingerprint:fingerprint,createdAt:Date.now(),createdBy:this.localPeerId||this.id};
+        const tuple:TupleEntry={id,fields:{...fields},admissionFingerprint:fingerprint,createdAt:Date.now(),createdBy:this.localPeerId||this.id};
         await this.writeTuple(tuple,namespace);this.tell(namespace,'tuplePut',tuple);
         return {tupleId:id};
       });
@@ -430,13 +535,13 @@ namespace; peers see its tuples after subscribing to the same name.
       const {namespace,pattern}=msg.payload as {namespace:string;pattern:TuplePattern};
       requireNonEmpty(namespace,'namespace');
       if(!this.admits(namespace,msg))return null;
-      for(const candidate of (await this.getAllTuples(namespace)).values()){
+      for(const candidate of [...(await this.getAllTuples(namespace)).values()]){
         const result=await withKeyedLock(`${this.id}:${namespace}:${candidate.id}`,async()=>{
           const tuple=(await this.getAllTuples(namespace)).get(candidate.id);
           if(!tuple || !this.matchesPattern(tuple,pattern) || !this.isUnclaimed(tuple))return null;
-          tuple.claimedBy=this.localPeerId||this.id;tuple.claimedAt=Date.now();
-          await this.writeTuple(tuple,namespace);this.tell(namespace,'tupleClaimed',tuple);
-          return {tuple,claimed:true};
+          const updated:TupleEntry={...tuple,fields:{...tuple.fields},claimedBy:this.localPeerId||this.id,claimedAt:Date.now()};
+          await this.writeTuple(updated,namespace);this.tell(namespace,'tupleClaimed',updated);
+          return {tuple:updated,claimed:true};
         });
         if(result)return result;
       }
@@ -463,12 +568,16 @@ namespace; peers see its tuples after subscribing to the same name.
         return false;
       }
 
-      tuple.claimedBy = undefined;
-      tuple.claimedAt = undefined;
-      await this.writeTuple(tuple, namespace);
-      log.info(`RELEASED ${tupleId} status=${tuple.fields.status ?? '?'} attempts=${tuple.fields.attempts ?? 0}`);
+      const updated: TupleEntry = {
+        ...tuple,
+        fields: { ...tuple.fields },
+        claimedBy: undefined,
+        claimedAt: undefined,
+      };
+      await this.writeTuple(updated, namespace);
+      log.info(`RELEASED ${tupleId} status=${updated.fields.status ?? '?'} attempts=${updated.fields.attempts ?? 0}`);
       // Emit tupleUpdated so watchers (AgentAbject) can re-dispatch retried tasks
-      this.tell(namespace, 'tupleUpdated', tuple);
+      this.tell(namespace, 'tupleUpdated', updated);
       return true;
       });
     });
@@ -482,11 +591,10 @@ namespace; peers see its tuples after subscribing to the same name.
 
       if (!this.sharedStateId) return false;
       const ns = stateName(namespace);
-      await this.request(request(this.id, this.sharedStateId, 'delete', {
-        name: ns, key: tupleId,
-      }));
-      const tupleCount = (await this.getAllTuples(namespace)).size;
-      log.info(`REMOVED ${tupleId} (${tupleCount} remaining in ns=${namespace.slice(0, 8)})`);
+      this.namespaceCache.get(ns)?.delete(tupleId);
+      this.queuePendingOp(ns, tupleId, { kind: 'delete' });
+      const remaining = this.namespaceCache.get(ns)?.size;
+      log.info(`REMOVED ${tupleId} (${remaining ?? '?'} remaining in ns=${namespace.slice(0, 8)})`);
       this.tell(namespace, 'tupleRemoved', { tupleId });
       return true;
       });
@@ -508,10 +616,13 @@ namespace; peers see its tuples after subscribing to the same name.
       }
 
       if (expectedFields && Object.entries(expectedFields).some(([key, value]) => JSON.stringify(tuple.fields[key]) !== JSON.stringify(value))) return false;
-      Object.assign(tuple.fields, fields);
-      await this.writeTuple(tuple, namespace);
-      log.info(`UPDATED ${tupleId} status=${tuple.fields.status ?? '?'} attempts=${tuple.fields.attempts ?? 0} claimedBy=${tuple.claimedBy ?? 'none'}`);
-      this.tell(namespace, 'tupleUpdated', tuple);
+      const updated: TupleEntry = {
+        ...tuple,
+        fields: { ...tuple.fields, ...fields },
+      };
+      await this.writeTuple(updated, namespace);
+      log.info(`UPDATED ${tupleId} status=${updated.fields.status ?? '?'} attempts=${updated.fields.attempts ?? 0} claimedBy=${updated.claimedBy ?? 'none'}`);
+      this.tell(namespace, 'tupleUpdated', updated);
       return true;
       });
     });
@@ -536,12 +647,18 @@ namespace; peers see its tuples after subscribing to the same name.
         // Only the owner removes a private namespace, and its tuples go with it.
         if (!this.admits(namespace, msg)) return false;
         this.privateOwners.delete(ns);
+        this.pendingWrites.delete(ns);
+        this.namespaceCache.delete(ns);
+        this.loadedNamespaces.delete(ns);
         if (this.sharedStateId) {
           await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: ns }));
         }
         return true;
       }
       this.activeNamespaces.delete(ns);
+      this.pendingWrites.delete(ns);
+      this.namespaceCache.delete(ns);
+      this.loadedNamespaces.delete(ns);
       await this.saveNamespaceIndex();
       log.info(`Namespace removed: ${ns}`);
       return true;
@@ -552,13 +669,29 @@ namespace; peers see its tuples after subscribing to the same name.
       if (msg.routing.from === this.sharedStateId) {
         const { aspect, value } = msg.payload as { aspect: string; value: { name?: string; key?: string; value?: unknown } };
         if (aspect === 'stateChanged' && value?.name && (value.name as string).startsWith('ts-')) {
+          const ns = value.name;
+          const key = value.key;
           const entry = value.value as TupleEntry | undefined;
-          if (this.privateOwners.has(value.name)) {
-            // A private namespace: no log line with its contents, and only its owner hears.
-            if (entry) this.tell(this.namespaceOf(value.name), 'tupleUpdated', entry);
+          // Ignore stale echoes while a newer local mutation for this tuple is queued to flush.
+          if (key && this.pendingWrites.get(ns)?.has(key)) {
             return;
           }
-          log.info(`SHARED-STATE-CHANGE ns=${value.name} key=${value.key ?? '?'} status=${entry?.fields?.status ?? '?'} claimedBy=${entry?.claimedBy ?? 'none'}`);
+          if (key && this.loadedNamespaces.has(ns)) {
+            const cache = this.namespaceCache.get(ns);
+            if (cache) {
+              if (entry && typeof entry === 'object' && 'id' in entry) {
+                cache.set(key, entry);
+              } else if (entry === undefined) {
+                cache.delete(key);
+              }
+            }
+          }
+          if (this.privateOwners.has(ns)) {
+            // A private namespace: no log line with its contents, and only its owner hears.
+            if (entry) this.tell(this.namespaceOf(ns), 'tupleUpdated', entry);
+            return;
+          }
+          log.info(`SHARED-STATE-CHANGE ns=${ns} key=${key ?? '?'} status=${entry?.fields?.status ?? '?'} claimedBy=${entry?.claimedBy ?? 'none'}`);
           // Emit tupleUpdated so dependents (GoalManager) can react to remote status changes
           if (entry) {
             this.changed('tupleUpdated', entry);
