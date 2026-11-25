@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.16.18",
+    "date": "2026-11-25",
+    "title": "Quicker goals, lighter installs",
+    "summary": "This release is about speed: goals finish and report back sooner, agents waste less time between steps, and heavy background work no longer slows down the rest of your workspace. Nothing new to learn; things simply move faster.",
+    "highlights": [
+      "Background jobs now run on their own dedicated workers, so long computations no longer hold up your chats, agents and windows.",
+      "Agents decide their next step while the previous one is still finishing, and remember what they have already worked out about how to talk to other objects, so multi-step tasks move along faster.",
+      "Goals report back sooner when they finish; record-keeping that is not needed right away now happens afterwards.",
+      "Scheduled jobs each get their own queue, so one busy schedule no longer delays the others.",
+      "Several conversations in one workspace no longer wait on each other, because each task session now has its own lock.",
+      "Scripted abjects start faster: their prepared code is reused, and sandboxes are made ready before they are needed.",
+      "Shared state and the tuple space keep their data in memory and group writes together, which cuts disk traffic when many objects coordinate at once.",
+      "Tracking AI usage costs less per request now that each workspace's goal tracker is looked up once and remembered.",
+      "The desktop app download is smaller: it now ships only the audio and video components it actually uses for WebM."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.16.17",
     "date": "2026-11-24",
     "title": "Ctrl+C Reaches the Terminal Again",
