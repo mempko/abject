@@ -33,6 +33,16 @@ files:
   - node_modules/ajv/**/*
   - node_modules/yaml/**/*
   - package.json
+  # libav.js ships every variant (default, opus, flac, webm, ...) as wasm,
+  # threaded wasm and asm.js, plus its C sources: ~170 MB. The app loads
+  # only the WebM build, unthreaded, on the calling thread
+  # (src/objects/video-encoder.ts loadLibAv): libav-webm.mjs, which imports
+  # libav-<ver>-webm.wasm.mjs, which reads libav-<ver>-webm.wasm.wasm.
+  # libav-default.js stays because require.resolve('libav.js') resolves the
+  # package's main entry to find dist/.
+  - "!node_modules/libav.js/sources/**"
+  - "!node_modules/libav.js/docs/**"
+  - "!node_modules/libav.js/dist/!(libav-webm.mjs|libav-default.js|libav-*-webm.wasm.mjs|libav-*-webm.wasm.wasm)"
 
 # Bundled native (WASM) system packages, ingested at boot from
 # resources/native (see src/sandbox/extensions.ts findBuiltinNativeDir).

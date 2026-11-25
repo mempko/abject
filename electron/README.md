@@ -90,7 +90,12 @@ desktop edition of the Node backend (compiled to `dist-server/` by
 - **`electron-builder.yml`** (repository root): app id `world.abject.app`,
   product name Abject, output in `release/`. Its `files` list names
   `dist-electron`, `dist-server`, `dist-client`, `package.json`, and the
-  modules node-datachannel, `@lydell` (node-pty), ws, uuid, ajv and yaml. Extra resources:
+  modules node-datachannel, `@lydell` (node-pty), ws, uuid, ajv and yaml
+  (other production dependencies come in on their own). It trims libav.js
+  to the WebM build the VP8 encoder loads (`src/objects/video-encoder.ts`):
+  the package's other variants and its C sources were ~170 MB of a 250 MB
+  asar. A change to how `loadLibAv` loads it must keep those patterns in
+  step. Extra resources:
   `native/` (each package's `abject.json`, `.wasm` and `.md`), ingested at boot
   from `resources/native`, and `dist-cli/abject.mjs` as `resources/cli/abject.mjs`.
   Workers and native addons are unpacked from asar (worker threads and
