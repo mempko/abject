@@ -1798,7 +1798,9 @@ export class Chat extends Abject {
     this.clarificationPending = false;
     this.pendingQuestion = undefined;
     this.emitGoalActivity();
-    await this.persistActiveGoal(undefined);
+    // Start clearing the active-goal marker without delaying messageAdded
+    // delivery; await it after delivery so Storage finishes before we return.
+    const clearActiveGoal = this.persistActiveGoal(undefined);
     this.removeActivity();
     await this.deliverLateGoalOutcome({ status, result, error, goalId });
     // The person's next message may react to this result. A stop they asked
@@ -1813,6 +1815,7 @@ export class Chat extends Abject {
     if (status === 'completed') this.playEffect('burst');
     else if (!userStopped) this.playEffect('glitch');
     this.checkInvariants();
+    await clearActiveGoal;
   }
 
   /**

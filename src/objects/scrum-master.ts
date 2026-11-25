@@ -2478,9 +2478,11 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     if (assumed) synthesis = `${synthesis}\n\n${assumed}`;
 
     log.info(`complete_goal: ${goalId.slice(0, 8)} → DONE (${shown(synthesis.slice(0, 80), this.isPrivateGoal(goalId))})`);
-    await this.recordCompletionPlan(goalId, synthesis);
     await this.request(request(this.id, this.goalManagerId, 'completeGoal', { goalId, result: synthesis }));
     if (!this.isPrivateGoal(goalId)) this.changed('sprintCompleted', { goalId });
+    void this.recordCompletionPlan(goalId, synthesis).catch((err) => {
+      log.warn(`recordCompletionPlan failed for ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
   /**
@@ -3316,8 +3318,11 @@ ${record.length > 0
       resultText = result as string;
     }
 
-    await this.recordCompletionPlan(goalId, resultText);
     await this.request(request(this.id, this.goalManagerId, 'completeGoal', { goalId, result }));
+    // Non-critical bookkeeping: record the completion plan after the answer has been delivered.
+    void this.recordCompletionPlan(goalId, resultText).catch(err =>
+      log.warn(`recordCompletionPlan(${goalId.slice(0, 8)}) failed: ${err instanceof Error ? err.message : String(err)}`),
+    );
     log.info(`quick_dispatch complete: goal ${goalId.slice(0, 8)} finished in one task (no planning scrum)`);
     return true;
   }

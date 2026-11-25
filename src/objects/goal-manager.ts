@@ -817,6 +817,11 @@ export class GoalManager extends Abject {
   /** Goals adopted from a peer's catalog rather than created here. */
   private remoteGoalIds = new Set<string>();
 
+  /** Goals queued for coalesced background persistLearning. */
+  private learningPersistQueued = new Set<GoalId>();
+  /** Goals currently running a background persistLearning drain loop. */
+  private learningPersistRunning = new Set<GoalId>();
+
   /** A paused goal can still be failed (e.g. the user stops it mid-pause). */
   private async failGoalWith(goalId: GoalId, error?: string): Promise<void> {
     const goal = this.goals.get(goalId);
@@ -2792,6 +2797,38 @@ hear assumptionResolved and goalReaction.
     } catch { /* best effort */ }
   }
 
+  /**
+   * Persist goal learning records off the critical delivery path, coalescing
+   * back-to-back mutations per goal and logging any failure.
+   */
+  private schedulePersistLearning(goal: Goal): void {
+    const goalId = goal.id;
+    this.learningPersistQueued.add(goalId);
+    if (this.learningPersistRunning.has(goalId)) return;
+    this.learningPersistRunning.add(goalId);
+    void (async () => {
+      try {
+        await Promise.resolve();
+        while (this.learningPersistQueued.delete(goalId)) {
+          const current = this.goals.get(goalId);
+          if (!current) break;
+          try {
+            await this.persistLearning(current);
+          } catch (err) {
+            log.warn(`background persistLearning failed for goal ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      } finally {
+        this.learningPersistRunning.delete(goalId);
+        if (this.learningPersistQueued.has(goalId)) {
+          const current = this.goals.get(goalId);
+          if (current) this.schedulePersistLearning(current);
+          else this.learningPersistQueued.delete(goalId);
+        }
+      }
+    })();
+  }
+
   /** Snapshot learning records before publication; SharedState distributes the same owner state. */
   private async persistLearning(goal: Goal, required = false): Promise<void> {
     return withKeyedLock(`${this.id}:learning-persist:${goal.id}`, async () => {
@@ -4435,12 +4472,11 @@ hear assumptionResolved and goalReaction.
         goal.scratchpad[`tasks/${taskId}/acceptance`] = { evidence, at: Date.now() };
         goal.updatedAt = Date.now();
         await this.syncScratchKeyToSharedState(goal, `tasks/${taskId}/result`, result);
-        await this.syncGoalToSharedState(goal);
-        await this.persistLearning(goal);
         this.emittedTerminalTasks.add(taskId);
         this.notifyGoal(goalId, 'taskCompleted', { taskId, goalId, result, evidence });
         this.notifyGoal(goalId, 'taskUnblocked', { goalId, completedTaskId: taskId });
         this.maybeEmitGoalReadyForCompletion(goalId).catch(() => {});
+        this.schedulePersistLearning(goal);
         return { accepted: true };
       });
     });
@@ -4503,15 +4539,12 @@ hear assumptionResolved and goalReaction.
       this.emittedTerminalTasks.add(taskId);
       this.notifyGoal(goalId, 'taskPermanentlyFailed', { taskId, goalId, error, attempts });
       if (goalId) {
-        // Classify the failure for the planner first, bounded, so the review
-        // scrum this may trigger sees the class beside the error.
-        const classified = this.classifyTaskFailure(goalId as GoalId, taskId, error ?? '', currentFields).catch(() => undefined);
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        void Promise.race([classified, new Promise(resolve => { timer = setTimeout(resolve, GoalManager.FAILURE_CLASSIFY_WAIT_MS); })])
-          .finally(() => {
-            clearTimeout(timer);
-            this.maybeEmitGoalReadyForCompletion(goalId as GoalId).catch(() => { /* best effort */ });
-          });
+        // Emit readiness promptly without blocking on failure classification;
+        // attach the failure class asynchronously with safe error handling.
+        this.maybeEmitGoalReadyForCompletion(goalId as GoalId).catch(() => { /* best effort */ });
+        void this.classifyTaskFailure(goalId as GoalId, taskId, error ?? '', currentFields).catch((err) => {
+          log.warn(`classifyTaskFailure failed for task ${String(taskId).slice(0, 8)} (goal ${String(goalId).slice(0, 8)}): ${err instanceof Error ? err.message : String(err)}`);
+        });
       }
       return updateResult;
     });
