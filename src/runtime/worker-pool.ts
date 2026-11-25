@@ -61,6 +61,12 @@ export function workerIndexForId(objectId: AbjectId, workerCount: number): numbe
  */
 export class WorkerPool {
   private bridges: WorkerBridge[] = [];
+  /** Number of general pool workers (indices 0 .. generalWorkerCount - 1). */
+  private generalWorkerCount = 0;
+  /** Constructor names pinned to dedicated worker indices in `bridges`. */
+  private dedicatedByConstructor: Map<string, number[]> = new Map();
+  /** Custom worker factories for dedicated worker indices (defaults to config.workerFactory). */
+  private bridgeFactories: Map<number, () => WorkerLike> = new Map();
   private bus: MessageBus;
   private config: WorkerPoolConfig;
   private objectToBridge: Map<AbjectId, WorkerBridge> = new Map();
@@ -94,6 +100,7 @@ export class WorkerPool {
     for (let i = 0; i < this.config.workerCount; i++) {
       this.bridges.push(this.createBridge(i));
     }
+    this.generalWorkerCount = this.bridges.length;
 
     // Wait for all workers to report ready
     await Promise.all(this.bridges.map((b) => b.waitReady()));
@@ -112,8 +119,78 @@ export class WorkerPool {
     log.info(`${this.config.workerCount} workers ready (${this.bridges.length * (this.bridges.length - 1) / 2} peer channels)`);
   }
 
+  /**
+   * Spawn one or more dedicated pool workers for a specific constructor name
+   * (for example, isolating JobManager's sandbox execution from general agent
+   * and system workers). Dedicated workers join the same direct peer-port mesh
+   * and crash-recovery lifecycle as general pool workers, while keeping
+   * `workerCount` equal to the general pool size so UUID sharding for other
+   * constructors is unchanged.
+   */
+  async addDedicatedWorkers(
+    constructorName: string,
+    count = 1,
+    workerFactory?: () => WorkerLike,
+  ): Promise<number[]> {
+    require(this.started, 'WorkerPool not started');
+    require(constructorName.length > 0, 'constructorName must be non-empty');
+    require(Number.isInteger(count) && count > 0, 'count must be a positive integer');
+    require(
+      !this.dedicatedByConstructor.has(constructorName),
+      `Dedicated workers already registered for ${constructorName}`,
+    );
+
+    const baseIndex = this.bridges.length;
+    const indices: number[] = [];
+    const created: WorkerBridge[] = [];
+    for (let k = 0; k < count; k++) {
+      const idx = baseIndex + k;
+      if (workerFactory) this.bridgeFactories.set(idx, workerFactory);
+      indices.push(idx);
+      created.push(this.createBridge(idx));
+    }
+
+    try {
+      await Promise.all(created.map((b) => b.waitReady()));
+    } catch (err) {
+      for (const idx of indices) this.bridgeFactories.delete(idx);
+      for (const b of created) b.terminate();
+      throw err;
+    }
+
+    for (const b of created) {
+      this.bridges.push(b);
+    }
+
+    // Wire direct peer MessagePort channels between every new dedicated worker
+    // and all earlier workers (both general pool and earlier dedicated workers).
+    for (let i = baseIndex; i < this.bridges.length; i++) {
+      for (let j = 0; j < i; j++) {
+        const { port1, port2 } = new MessageChannel();
+        this.bridges[i].sendPeerPort(j, port1);
+        this.bridges[j].sendPeerPort(i, port2);
+      }
+    }
+
+    // Seed each new dedicated worker with existing placements, liveness, and proxy routes.
+    for (const idx of indices) {
+      const bridge = this.bridges[idx];
+      for (const [id, b] of this.objectToBridge) {
+        const at = this.bridges.indexOf(b);
+        if (at >= 0 && at !== idx) bridge.sendPeerPlace(id, at);
+      }
+      this.bus.announceLivenessTo(bridge);
+      this.bus.announceProxyRoutesTo(bridge);
+    }
+
+    this.dedicatedByConstructor.set(constructorName, indices);
+    log.info(`${count} dedicated worker(s) ready for ${constructorName} (slot${count > 1 ? 's' : ''} ${indices.join(', ')})`);
+    return [...indices];
+  }
+
   private createBridge(index: number): WorkerBridge {
-    const worker = this.config.workerFactory();
+    const factory = this.bridgeFactories.get(index) ?? this.config.workerFactory;
+    const worker = factory();
     const bridge = new WorkerBridge(worker, this.bus);
     // Objects constructed locally inside the worker (e.g. widgets newed up
     // by a worker-hosted WidgetManager) announce themselves via
@@ -177,6 +254,7 @@ export class WorkerPool {
    * somewhere alive; and the runtime is told what was lost so it can rebuild.
    */
   private async handleWorkerDeath(index: number, dead: WorkerBridge, code: number, lost: AbjectId[]): Promise<void> {
+    if (!this.started || this.bridges[index] !== dead) return;
     const lostIds = new Set<AbjectId>(lost);
     // Ids the bridge hosted but never announced back (spawned before it
     // could report) still route to it; sweep them too.
@@ -258,7 +336,10 @@ export class WorkerPool {
   }): Promise<void> {
     require(this.started, 'WorkerPool not started');
 
-    const index = workerIndexForId(objectId, this.bridges.length);
+    const dedicated = this.dedicatedByConstructor.get(constructorName);
+    const index = dedicated && dedicated.length > 0
+      ? dedicated[workerIndexForId(objectId, dedicated.length)]
+      : workerIndexForId(objectId, this.generalWorkerCount);
     const bridge = this.bridges[index];
 
     // Register route on the main bus BEFORE spawning so that messages sent
@@ -350,6 +431,9 @@ export class WorkerPool {
     }
 
     this.bridges = [];
+    this.generalWorkerCount = 0;
+    this.dedicatedByConstructor.clear();
+    this.bridgeFactories.clear();
     this.objectToBridge.clear();
     this.latestHeap.clear();
     this.started = false;
@@ -358,10 +442,28 @@ export class WorkerPool {
   }
 
   /**
-   * Get the number of workers.
+   * Get the number of general pool workers (used for default UUID sharding).
    */
   get workerCount(): number {
+    return this.generalWorkerCount;
+  }
+
+  /**
+   * Get the total number of pool workers, including constructor-dedicated workers.
+   */
+  get totalWorkerCount(): number {
     return this.bridges.length;
+  }
+
+  /**
+   * Get the number of dedicated workers registered for a specific constructor
+   * (or total dedicated workers across all constructors when omitted).
+   */
+  dedicatedWorkerCount(constructorName?: string): number {
+    if (constructorName !== undefined) {
+      return this.dedicatedByConstructor.get(constructorName)?.length ?? 0;
+    }
+    return this.bridges.length - this.generalWorkerCount;
   }
 
   /**

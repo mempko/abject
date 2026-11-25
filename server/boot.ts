@@ -257,9 +257,18 @@ export async function bootServer(options: BootOptions): Promise<void> {
   const envOverride = process.env.ABJECTS_WORKER_COUNT;
   const workerCount = envOverride !== undefined ? parseInt(envOverride, 10) : defaultWorkerCount;
   const workerEnabled = workerCount > 0;
-  // Heap ceilings are shared out over every worker thread: the pool and the
-  // dedicated P2P worker, plus the UI worker on a desktop.
-  planWorkerHeaps(workerCount + (DEDICATED_WORKERS ? (ui ? 2 : 1) : 0));
+  // Isolate JobManager onto dedicated pool worker(s) so synchronous sandbox
+  // compilation/execution never stalls agent or system workers. Override with
+  // ABJECTS_JOB_WORKERS=N (0 to keep JobManager in the general worker pool).
+  const jobWorkersEnv = process.env.ABJECTS_JOB_WORKERS;
+  const parsedJobWorkers = jobWorkersEnv !== undefined ? parseInt(jobWorkersEnv, 10) : 1;
+  const jobWorkerCount = workerEnabled && DEDICATED_WORKERS && Number.isFinite(parsedJobWorkers) && parsedJobWorkers > 0
+    ? parsedJobWorkers
+    : 0;
+  // Heap ceilings are shared out over every worker thread: the pool, any
+  // dedicated JobManager worker(s), and the dedicated P2P worker, plus the UI
+  // worker on a desktop.
+  planWorkerHeaps(workerCount + jobWorkerCount + (DEDICATED_WORKERS ? (ui ? 2 : 1) : 0));
 
   // What InstanceInfo and the health endpoint report.
   let serving = false;
@@ -272,7 +281,9 @@ export async function bootServer(options: BootOptions): Promise<void> {
   };
   const heapCageMb = sharedHeapCageMb();
   alog.info(`Abject ${instanceSource.version} (${options.edition}) on Node ${process.versions.node}; ` +
-    `${workerCount} pool worker(s), heap ceiling ${workerHeapMb()} MB each` +
+    `${workerCount} pool worker(s)` +
+    (jobWorkerCount > 0 ? ` + ${jobWorkerCount} dedicated JobManager worker(s)` : '') +
+    `, heap ceiling ${workerHeapMb()} MB each` +
     (heapCageMb !== undefined ? `, every thread sharing one ${heapCageMb} MB heap cage` : ''));
 
   // Create runtime
@@ -295,6 +306,9 @@ export async function bootServer(options: BootOptions): Promise<void> {
 
   // Start runtime (bootstraps Registry + Factory)
   await runtime.start();
+  if (jobWorkerCount > 0 && runtime.workerPool) {
+    await runtime.workerPool.addDedicatedWorkers('JobManager', jobWorkerCount);
+  }
   log.timed('runtime started');
 
   const bus = runtime.messageBus;
