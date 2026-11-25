@@ -399,7 +399,9 @@ export class Scheduler extends Abject {
         request(this.id, this.jobManagerId, 'submitJob', {
           description: `[Scheduled] ${description}`,
           code: entry.jobCode,
-          queue: entry.queue,
+          // Give each schedule its own default queue so unrelated scheduled
+          // jobs do not head-of-line block each other on JobManager's 'default'.
+          queue: entry.queue || `scheduler:${id}`,
           // Stops the job when this request gives up on it.
           timeoutMs: JOB_TIMEOUT_MS,
         }),
