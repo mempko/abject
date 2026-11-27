@@ -30,7 +30,11 @@ export { ProxyGenerator, PROXY_GENERATOR_ID } from './objects/proxy-generator.js
 export { Negotiator, NEGOTIATOR_ID } from './protocol/negotiator.js';
 export { HealthMonitor, HEALTH_MONITOR_ID } from './protocol/health-monitor.js';
 export { CassetteRecorder, CASSETTE_RECORDER_ID } from './objects/cassette-recorder.js';
-export type { Cassette } from './objects/cassette-recorder.js';
+export type { Cassette, InvocationCassette } from './objects/cassette-recorder.js';
+export { FitnessJudge, FITNESS_JUDGE_ID } from './objects/fitness-judge.js';
+export type { JudgeRequest } from './objects/fitness-judge.js';
+export { evaluate as evaluateFitness, replay as replayFitness } from './protocol/fitness.js';
+export type { Verdict as FitnessVerdict, ReplayResult, EvidenceStrength } from './protocol/fitness.js';
 export { Settings, SETTINGS_ID } from './objects/settings.js';
 export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { PeersViewer, PEERS_VIEWER_ID } from './objects/peers-viewer.js';
