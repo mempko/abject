@@ -773,6 +773,8 @@ export abstract class BaseLLMProvider implements LLMProvider {
     }
 
     let response: Response;
+    // Called once the body is read: the caller's abort reaches the body read too.
+    let release = () => {};
     if (fetchOptions?.timeout) {
       const abort = new AbortController();
       const timer = setTimeout(() => abort.abort(), fetchOptions.timeout);
@@ -780,41 +782,49 @@ export abstract class BaseLLMProvider implements LLMProvider {
       const signal = options.signal;
       const onStop = () => abort.abort();
       if (signal?.aborted) onStop(); else signal?.addEventListener('abort', onStop, { once: true });
+      release = () => signal?.removeEventListener('abort', onStop);
       try {
         response = await fetch(url, { ...options, signal: abort.signal });
       } catch (err) {
+        release();
         if (abort.signal.aborted && !signal?.aborted) {
           throw new Error(`LLM API request timed out after ${fetchOptions.timeout}ms`);
         }
         throw err;
       } finally {
         clearTimeout(timer);
-        signal?.removeEventListener('abort', onStop);
       }
     } else {
       response = await fetch(url, options);
     }
 
-    if (!response.ok) {
-      this.lastFetch = { ok: false, status: response.status };
-      const errorText = await response.text().catch(() => 'Unknown error');
-      throw new Error(`LLM API error (${response.status}): ${errorText}`);
+    try {
+      if (!response.ok) {
+        this.lastFetch = { ok: false, status: response.status };
+        const errorText = await response.text().catch((err) => {
+          if (options.signal?.aborted) throw err;
+          return 'Unknown error';
+        });
+        throw new Error(`LLM API error (${response.status}): ${errorText}`);
+      }
+
+      const headers: Record<string, string> = {};
+      response.headers.forEach((value, key) => {
+        headers[key] = value;
+      });
+
+      const body = await response.text();
+
+      return {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+        body,
+        ok: response.ok,
+      };
+    } finally {
+      release();
     }
-
-    const headers: Record<string, string> = {};
-    response.headers.forEach((value, key) => {
-      headers[key] = value;
-    });
-
-    const body = await response.text();
-
-    return {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
-      body,
-      ok: response.ok,
-    };
   }
 
   /**
